@@ -1,11 +1,13 @@
 #include "ble_scanner.h"
 
 #include <stdbool.h>
+#include <string.h>
 #include "esp_log.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
+#include "host/ble_store.h"
 
 static const char *TAG = "BLE_SCANNER";
 
@@ -74,9 +76,36 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
-            ESP_LOGI(TAG, "Connected — handle: %d", event->connect.conn_handle);
-            /* Trigger pairing — this prompts the user to accept on the camera */
-            ble_gap_security_initiate(event->connect.conn_handle);
+            uint16_t handle = event->connect.conn_handle;
+            ESP_LOGI(TAG, "Connected — handle: %d", handle);
+
+            /* Check bond store to log whether this is a first pair or reconnect.
+             * We try both peer_id_addr (resolved identity) and peer_ota_addr
+             * (on-air address) because the store key depends on which was used. */
+            struct ble_gap_conn_desc desc;
+            ble_gap_conn_find(handle, &desc);
+
+            struct ble_store_key_sec key;
+            struct ble_store_value_sec sec;
+            memset(&key, 0, sizeof(key));
+
+            key.peer_addr = desc.peer_id_addr;
+            bool bonded = (ble_store_read_peer_sec(&key, &sec) == 0);
+            if (!bonded) {
+                key.peer_addr = desc.peer_ota_addr;
+                bonded = (ble_store_read_peer_sec(&key, &sec) == 0);
+            }
+
+            if (bonded) {
+                ESP_LOGI(TAG, "Known camera — restoring encryption with saved keys");
+            } else {
+                ESP_LOGI(TAG, "New camera — initiating first-time pairing");
+            }
+
+            /* Always call security_initiate.
+             * If bonded: NimBLE uses the saved LTK (no camera prompt).
+             * If new:    NimBLE does full SMP pairing (camera shows prompt). */
+            ble_gap_security_initiate(handle);
         } else {
             ESP_LOGE(TAG, "Connection failed — status: %d", event->connect.status);
             s_connecting = false;
@@ -91,6 +120,17 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
             ESP_LOGE(TAG, "Pairing failed — status: %d", event->enc_change.status);
         }
         break;
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        /* Fired when the peer wants to pair but we already have a bond stored.
+         * Delete the stale bond and allow the new pairing to proceed — this
+         * handles the case where the GoPro was reset and lost its keys. */
+        ESP_LOGW(TAG, "Repeat pairing detected — deleting stale bond and re-pairing");
+        struct ble_gap_conn_desc rp_desc;
+        ble_gap_conn_find(event->repeat_pairing.conn_handle, &rp_desc);
+        ble_store_util_delete_peer(&rp_desc.peer_id_addr);
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "Disconnected — reason: %d", event->disconnect.reason);
@@ -174,6 +214,13 @@ void ble_scanner_init(void)
 
     ble_hs_cfg.sync_cb  = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
+
+    /* Security manager config — required for bonding to work correctly.
+     * Without these, NimBLE pairs but doesn't properly exchange or store keys. */
+    ble_hs_cfg.sm_io_cap         = BLE_SM_IO_CAP_NO_IO;               /* "Just Works" — no display or keyboard */
+    ble_hs_cfg.sm_bonding        = 1;                                  /* request key storage after pairing    */
+    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
     nimble_port_freertos_init(ble_host_task);
 }
