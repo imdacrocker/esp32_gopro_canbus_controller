@@ -1,5 +1,6 @@
 #include "ble_scanner.h"
 
+#include <stdbool.h>
 #include "esp_log.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -10,8 +11,12 @@ static const char *TAG = "BLE_SCANNER";
 
 /* Forward declarations */
 static int  scan_event_cb(struct ble_gap_event *event, void *arg);
+static int  connection_event_cb(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
 static void ble_host_task(void *param);
+
+/* True while a connection attempt is in progress — prevents duplicate connects */
+static bool s_connecting = false;
 
 /* --------------------------------------------------------------------------
  * NimBLE host task - runs the BLE stack on its own FreeRTOS task
@@ -61,6 +66,46 @@ static void start_scan(void)
 }
 
 /* --------------------------------------------------------------------------
+ * Connection event callback - called for connect, pairing, and disconnect
+ * -------------------------------------------------------------------------- */
+static int connection_event_cb(struct ble_gap_event *event, void *arg)
+{
+    switch (event->type) {
+
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            ESP_LOGI(TAG, "Connected — handle: %d", event->connect.conn_handle);
+            /* Trigger pairing — this prompts the user to accept on the camera */
+            ble_gap_security_initiate(event->connect.conn_handle);
+        } else {
+            ESP_LOGE(TAG, "Connection failed — status: %d", event->connect.status);
+            s_connecting = false;
+            start_scan();
+        }
+        break;
+
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        if (event->enc_change.status == 0) {
+            ESP_LOGI(TAG, "Paired successfully — handle: %d", event->enc_change.conn_handle);
+        } else {
+            ESP_LOGE(TAG, "Pairing failed — status: %d", event->enc_change.status);
+        }
+        break;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "Disconnected — reason: %d", event->disconnect.reason);
+        s_connecting = false;
+        start_scan();
+        break;
+
+    default:
+        break;
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
  * Scan event callback - called for each received advertisement
  * -------------------------------------------------------------------------- */
 static int scan_event_cb(struct ble_gap_event *event, void *arg)
@@ -69,13 +114,49 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
         return 0;
     }
 
-    const uint8_t *a = event->disc.addr.val;
+    /* Parse the advertisement payload */
+    struct ble_hs_adv_fields fields;
+    int rc = ble_hs_adv_parse_fields(&fields,
+                                     event->disc.data,
+                                     event->disc.length_data);
+    if (rc != 0) {
+        return 0;
+    }
 
-    /* NimBLE stores address bytes little-endian (byte 0 = LSB).
-     * Print MSB-first so it matches what you see in phone BLE scanners. */
-    ESP_LOGI(TAG, "ADDR: %02X:%02X:%02X:%02X:%02X:%02X  RSSI: %d dBm",
+    /* Filter: only process devices advertising GoPro service UUID 0xFEA6 */
+    bool is_gopro = false;
+    for (int i = 0; i < fields.num_uuids16; i++) {
+        if (ble_uuid_u16(&fields.uuids16[i].u) == 0xFEA6) {
+            is_gopro = true;
+            break;
+        }
+    }
+    if (!is_gopro) {
+        return 0;
+    }
+
+    /* Prevent duplicate connection attempts if multiple ad packets arrive */
+    if (s_connecting) {
+        return 0;
+    }
+    s_connecting = true;
+
+    const uint8_t *a = event->disc.addr.val;
+    ESP_LOGI(TAG, "GoPro found — ADDR: %02X:%02X:%02X:%02X:%02X:%02X  RSSI: %d dBm",
              a[5], a[4], a[3], a[2], a[1], a[0],
              event->disc.rssi);
+
+    /* Stop scanning and connect */
+    ble_gap_disc_cancel();
+
+    int rc2 = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &event->disc.addr,
+                              BLE_HS_FOREVER, NULL,
+                              connection_event_cb, NULL);
+    if (rc2 != 0) {
+        ESP_LOGE(TAG, "ble_gap_connect failed: %d", rc2);
+        s_connecting = false;
+        start_scan();
+    }
 
     return 0;
 }
