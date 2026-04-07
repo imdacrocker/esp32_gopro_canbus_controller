@@ -127,6 +127,21 @@ static const httpd_uri_t api_pair_uri = {
     .handler = api_pair_handler,
 };
 
+/* POST /api/reset-bonds — delete all stored BLE bonds */
+static esp_err_t api_reset_bonds_handler(httpd_req_t *req)
+{
+    ble_scanner_purge_unknown_bonds(NULL, 0);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"bonds cleared\"}");
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_reset_bonds_uri = {
+    .uri     = "/api/reset-bonds",
+    .method  = HTTP_POST,
+    .handler = api_reset_bonds_handler,
+};
+
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -137,6 +152,7 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_scan_uri);
         httpd_register_uri_handler(server, &api_cameras_uri);
         httpd_register_uri_handler(server, &api_pair_uri);
+        httpd_register_uri_handler(server, &api_reset_bonds_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");

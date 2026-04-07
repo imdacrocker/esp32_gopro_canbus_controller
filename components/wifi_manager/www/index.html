@@ -10,6 +10,9 @@
         #status  { color: #555; margin: 0.5em 0 1em; min-height: 1.2em; }
         #scan-btn { padding: 0.6em 1.4em; font-size: 1em; cursor: pointer; }
         #scan-btn:disabled { opacity: 0.5; cursor: default; }
+        #reset-btn { padding: 0.6em 1.4em; font-size: 1em; cursor: pointer;
+                     margin-left: 0.6em; background: #c0392b; color: #fff; border: none; border-radius: 3px; }
+        #reset-btn:disabled { opacity: 0.5; cursor: default; }
         #results { margin-top: 1.5em; }
         .camera  { display: flex; justify-content: space-between; align-items: center;
                    padding: 0.6em 0; border-bottom: 1px solid #ddd; }
@@ -22,6 +25,7 @@
     <h1>GoPro Controller</h1>
 
     <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
+    <button id="reset-btn" onclick="resetBonds()">Reset Bonds</button>
     <p id="status"></p>
     <div id="results"></div>
 
@@ -81,6 +85,17 @@
                       + '</div>';
             });
             div.innerHTML = html;
+        }
+
+        function resetBonds() {
+            if (!confirm('Delete all stored BLE bonds? Cameras will need to re-pair.')) return;
+            var btn = document.getElementById('reset-btn');
+            btn.disabled = true;
+            fetch('/api/reset-bonds', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function() { setStatus('All bonds cleared.'); })
+                .catch(function() { setStatus('Error clearing bonds.'); })
+                .finally(function() { btn.disabled = false; });
         }
 
         function pairCamera(addr, addrType) {
