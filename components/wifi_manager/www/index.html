@@ -4,9 +4,96 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>GoPro Controller</title>
+    <style>
+        body { font-family: sans-serif; max-width: 480px; margin: 2em auto; padding: 0 1em; }
+        h1   { font-size: 1.4em; }
+        #status  { color: #555; margin: 0.5em 0 1em; min-height: 1.2em; }
+        #scan-btn { padding: 0.6em 1.4em; font-size: 1em; cursor: pointer; }
+        #scan-btn:disabled { opacity: 0.5; cursor: default; }
+        #results { margin-top: 1.5em; }
+        .camera  { display: flex; justify-content: space-between; align-items: center;
+                   padding: 0.6em 0; border-bottom: 1px solid #ddd; }
+        .camera-info { font-size: 0.9em; color: #333; }
+        .camera-name { font-weight: bold; }
+        .pair-btn { padding: 0.4em 1em; cursor: pointer; }
+    </style>
 </head>
 <body>
     <h1>GoPro Controller</h1>
-    <p>Camera management coming soon.</p>
+
+    <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
+    <p id="status"></p>
+    <div id="results"></div>
+
+    <script>
+        var pollTimer = null;
+
+        function setStatus(msg) {
+            document.getElementById('status').textContent = msg;
+        }
+
+        function startScan() {
+            document.getElementById('scan-btn').disabled = true;
+            document.getElementById('results').innerHTML = '';
+            setStatus('Scanning... (30 seconds)');
+
+            fetch('/api/scan', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function() {
+                    pollTimer = setInterval(pollCameras, 1000);
+                    setTimeout(stopScan, 31000);
+                })
+                .catch(function() {
+                    setStatus('Error starting scan.');
+                    document.getElementById('scan-btn').disabled = false;
+                });
+        }
+
+        function stopScan() {
+            clearInterval(pollTimer);
+            pollCameras(); /* final poll */
+            setStatus('Scan complete.');
+            document.getElementById('scan-btn').disabled = false;
+        }
+
+        function pollCameras() {
+            fetch('/api/cameras')
+                .then(function(r) { return r.json(); })
+                .then(renderCameras)
+                .catch(function() {});
+        }
+
+        function renderCameras(cameras) {
+            var div = document.getElementById('results');
+            if (cameras.length === 0) {
+                div.innerHTML = '<p>No cameras found yet.</p>';
+                return;
+            }
+            var html = '';
+            cameras.forEach(function(cam) {
+                html += '<div class="camera">'
+                      + '<div class="camera-info">'
+                      + '<div class="camera-name">' + cam.name + '</div>'
+                      + '<div>' + cam.addr + '&nbsp;&nbsp;' + cam.rssi + ' dBm</div>'
+                      + '</div>'
+                      + '<button class="pair-btn" onclick="pairCamera(\''
+                      + cam.addr + '\',' + cam.addr_type + ')">Pair</button>'
+                      + '</div>';
+            });
+            div.innerHTML = html;
+        }
+
+        function pairCamera(addr, addrType) {
+            setStatus('Pairing with ' + addr + '...');
+            fetch('/api/pair', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ addr: addr, addr_type: addrType })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function() { setStatus('Pairing initiated. Check serial log for result.'); })
+            .catch(function() { setStatus('Error sending pair request.'); });
+        }
+    </script>
 </body>
 </html>
