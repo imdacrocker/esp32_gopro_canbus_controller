@@ -33,6 +33,77 @@ static struct ble_npl_event s_start_disc_event;
 static volatile bool s_connect_requested = false;
 static ble_addr_t    s_connect_addr;
 
+
+/* Bond purge — keep list populated by caller before posting the event */
+static struct {
+    ble_addr_t keep[CONFIG_BT_NIMBLE_MAX_BONDS];
+    int        keep_count;
+} s_purge_ctx;
+
+static struct ble_npl_event s_purge_event;
+
+/* --------------------------------------------------------------------------
+ * Bond count helper — iterates peer security store and returns the total.
+ * Must be called from the NimBLE host task.
+ * -------------------------------------------------------------------------- */
+static int count_bonds_cb(int obj_type, union ble_store_value *val, void *cookie)
+{
+    (*(int *)cookie)++;
+    return 0;
+}
+
+static void log_bond_count(void)
+{
+    int count = 0;
+    ble_store_iterate(BLE_STORE_OBJ_TYPE_PEER_SEC, count_bonds_cb, &count);
+    ESP_LOGI(TAG, "Stored bonds: %d / %d", count, CONFIG_BT_NIMBLE_MAX_BONDS);
+}
+
+/* --------------------------------------------------------------------------
+ * Bond purge callback — runs on the NimBLE host task.
+ * Deletes any peer security entry not present in s_purge_ctx.keep[].
+ * -------------------------------------------------------------------------- */
+
+/* Addresses collected during iteration; deleted after the walk completes. */
+static ble_addr_t s_delete_list[CONFIG_BT_NIMBLE_MAX_BONDS];
+static int        s_delete_count;
+
+static int collect_purge_cb(int obj_type, union ble_store_value *val, void *cookie)
+{
+    ble_addr_t *addr = &val->sec.peer_addr;
+
+    for (int i = 0; i < s_purge_ctx.keep_count; i++) {
+        if (memcmp(&s_purge_ctx.keep[i], addr, sizeof(ble_addr_t)) == 0) {
+            return 0; /* on the keep list */
+        }
+    }
+
+    if (s_delete_count < (int)(sizeof(s_delete_list) / sizeof(s_delete_list[0]))) {
+        s_delete_list[s_delete_count++] = *addr;
+    }
+    return 0;
+}
+
+static void purge_bonds_cb(struct ble_npl_event *ev)
+{
+    log_bond_count();
+
+    s_delete_count = 0;
+    ble_store_iterate(BLE_STORE_OBJ_TYPE_PEER_SEC, collect_purge_cb, NULL);
+
+    for (int i = 0; i < s_delete_count; i++) {
+        const uint8_t *a = s_delete_list[i].val;
+        ESP_LOGI(TAG, "Removing bond: %02X:%02X:%02X:%02X:%02X:%02X",
+                 a[5], a[4], a[3], a[2], a[1], a[0]);
+        ble_store_util_delete_peer(&s_delete_list[i]);
+    }
+
+    if (s_delete_count > 0) {
+        ESP_LOGI(TAG, "Purged %d bond(s)", s_delete_count);
+        log_bond_count();
+    }
+}
+
 /* --------------------------------------------------------------------------
  * NimBLE host-task callback — cancels the background scan and restarts it
  * with a 30-second timeout in discovery mode.
@@ -77,6 +148,7 @@ static void ble_host_task(void *param)
 static void on_sync(void)
 {
     ESP_LOGI(TAG, "BLE stack ready!");
+    log_bond_count();
     // start_scan();
 }
 
@@ -141,7 +213,10 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
                 ESP_LOGI(TAG, "New camera — initiating first-time pairing");
             }
 
-            ble_gap_security_initiate(handle);
+            int sec_rc = ble_gap_security_initiate(handle);
+            if (sec_rc != 0) {
+                ESP_LOGE(TAG, "Security initiate failed: %d", sec_rc);
+            }
 
             /* Reset connecting flag and restart scan so that:
              * - discovery mode can find more cameras while connected
@@ -176,6 +251,11 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "Disconnected — reason: %d", event->disconnect.reason);
         s_connecting = false;
         start_scan();
+        break;
+
+    case BLE_GAP_EVENT_PASSKEY_ACTION:
+        ESP_LOGW(TAG, "Passkey action requested — action: %d",
+                event->passkey.params.action);
         break;
 
     default:
@@ -264,6 +344,15 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
     if (s_connecting) {
         return 0;
     }
+
+    /* Skip if already connected to this address */
+    struct ble_gap_conn_desc existing;
+    if (ble_gap_conn_find_by_addr(&event->disc.addr, &existing) == 0) {
+        ESP_LOGI(TAG, "Already connected to %02X:%02X:%02X:%02X:%02X:%02X — skipping",
+                 a[5], a[4], a[3], a[2], a[1], a[0]);
+        return 0;
+    }
+
     s_connecting = true;
 
     ESP_LOGI(TAG, "Connecting — %02X:%02X:%02X:%02X:%02X:%02X  RSSI: %d dBm",
@@ -313,6 +402,7 @@ void ble_scanner_start_discovery(void)
      * start_discovery_cb() then calls the actual NimBLE APIs on the correct task. */
     ESP_LOGI(TAG, "Discovery mode requested");
     s_discovered_count = 0;
+
     ble_npl_event_init(&s_start_disc_event, start_discovery_cb, NULL);
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_start_disc_event);
 }
@@ -331,4 +421,17 @@ void ble_scanner_connect_by_addr(const ble_addr_t *addr)
     s_discovery_mode = false;
     memcpy(&s_connect_addr, addr, sizeof(ble_addr_t));
     s_connect_requested = true;
+}
+
+void ble_scanner_purge_unknown_bonds(const ble_addr_t *keep, int keep_count)
+{
+    int n = keep_count < CONFIG_BT_NIMBLE_MAX_BONDS ? keep_count : CONFIG_BT_NIMBLE_MAX_BONDS;
+    memset(&s_purge_ctx, 0, sizeof(s_purge_ctx));
+    for (int i = 0; i < n; i++) {
+        s_purge_ctx.keep[i] = keep[i];
+    }
+    s_purge_ctx.keep_count = n;
+
+    ble_npl_event_init(&s_purge_event, purge_bonds_cb, NULL);
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_purge_event);
 }

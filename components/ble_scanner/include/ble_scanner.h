@@ -38,3 +38,11 @@ int ble_scanner_get_discovered(gopro_device_t *out, int max_count);
  * and resume normal auto-reconnect scanning afterwards.
  */
 void ble_scanner_connect_by_addr(const ble_addr_t *addr);
+
+/**
+ * Delete any stored NimBLE bonds whose address is not in the keep list.
+ * Pass the MAC addresses of all known paired cameras to preserve them.
+ * Pass keep=NULL / keep_count=0 to delete all bonds.
+ * Safe to call from any task — executes on the NimBLE host task.
+ */
+void ble_scanner_purge_unknown_bonds(const ble_addr_t *keep, int keep_count);
