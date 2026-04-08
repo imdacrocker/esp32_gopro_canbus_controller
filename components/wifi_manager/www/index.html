@@ -7,6 +7,9 @@
     <style>
         body { font-family: sans-serif; max-width: 480px; margin: 2em auto; padding: 0 1em; }
         h1   { font-size: 1.4em; }
+        #camera-counts { display: flex; gap: 1.5em; margin-bottom: 0.8em; }
+        .count-box { background: #f0f0f0; border-radius: 6px; padding: 0.4em 0.9em; font-size: 0.9em; }
+        .count-box span { font-weight: bold; font-size: 1.2em; margin-right: 0.25em; }
         #status  { color: #555; margin: 0.5em 0 1em; min-height: 1.2em; }
         #scan-btn { padding: 0.6em 1.4em; font-size: 1em; cursor: pointer; }
         #scan-btn:disabled { opacity: 0.5; cursor: default; }
@@ -24,6 +27,11 @@
 <body>
     <h1>GoPro Controller</h1>
 
+    <div id="camera-counts">
+        <div class="count-box"><span id="remembered-count">—</span>Remembered</div>
+        <div class="count-box"><span id="connected-count">—</span>Connected</div>
+    </div>
+
     <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
     <button id="reset-btn" onclick="resetBonds()">Reset Bonds</button>
     <p id="status"></p>
@@ -35,6 +43,20 @@
         function setStatus(msg) {
             document.getElementById('status').textContent = msg;
         }
+
+        function refreshStatus() {
+            fetch('/api/status')
+                .then(function(r) { return r.json(); })
+                .then(function(s) {
+                    document.getElementById('remembered-count').textContent = s.remembered;
+                    document.getElementById('connected-count').textContent  = s.connected;
+                })
+                .catch(function() {});
+        }
+
+        /* Refresh counts on load and every 3 seconds */
+        refreshStatus();
+        setInterval(refreshStatus, 3000);
 
         function startScan() {
             document.getElementById('scan-btn').disabled = true;

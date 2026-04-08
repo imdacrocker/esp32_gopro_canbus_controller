@@ -9,6 +9,7 @@
 #include "esp_http_server.h"
 #include "lwip/ip4_addr.h"
 #include "ble_scanner.h"
+#include "gopro_manager.h"
 
 #define AP_CHANNEL   1
 #define AP_MAX_CONN  4
@@ -127,6 +128,24 @@ static const httpd_uri_t api_pair_uri = {
     .handler = api_pair_handler,
 };
 
+/* GET /api/status — return remembered and connected camera counts */
+static esp_err_t api_status_handler(httpd_req_t *req)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"remembered\":%d,\"connected\":%d}",
+             gopro_manager_remembered_count(),
+             gopro_manager_connected_count());
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_status_uri = {
+    .uri     = "/api/status",
+    .method  = HTTP_GET,
+    .handler = api_status_handler,
+};
+
 /* POST /api/reset-bonds — delete all stored BLE bonds */
 static esp_err_t api_reset_bonds_handler(httpd_req_t *req)
 {
@@ -149,6 +168,7 @@ static void start_http_server(void)
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &root_uri);
+        httpd_register_uri_handler(server, &api_status_uri);
         httpd_register_uri_handler(server, &api_scan_uri);
         httpd_register_uri_handler(server, &api_cameras_uri);
         httpd_register_uri_handler(server, &api_pair_uri);

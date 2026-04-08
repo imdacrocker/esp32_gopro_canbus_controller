@@ -73,3 +73,24 @@ esp_err_t gopro_manager_save(int slot);
  * Returns ESP_OK on success.
  */
 esp_err_t gopro_manager_remove(int slot);
+
+/**
+ * Return the number of slots that have is_paired == true.
+ */
+int gopro_manager_remembered_count(void);
+
+/**
+ * Return the number of slots that are currently connected (bt_handle != 0).
+ */
+int gopro_manager_connected_count(void);
+
+/**
+ * Record that the camera in the given slot is now connected with the given handle.
+ */
+void gopro_manager_set_connected(int slot, uint16_t handle);
+
+/**
+ * Clear the bt_handle for whichever slot holds the given connection handle.
+ * Safe to call with an unknown handle — does nothing if not found.
+ */
+void gopro_manager_set_disconnected(uint16_t handle);

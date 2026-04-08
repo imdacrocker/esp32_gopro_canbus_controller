@@ -46,3 +46,4 @@ void ble_scanner_connect_by_addr(const ble_addr_t *addr);
  * Safe to call from any task — executes on the NimBLE host task.
  */
 void ble_scanner_purge_unknown_bonds(const ble_addr_t *keep, int keep_count);
+

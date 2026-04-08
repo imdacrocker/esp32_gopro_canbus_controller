@@ -1,4 +1,5 @@
 #include "ble_scanner.h"
+#include "gopro_manager.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -19,6 +20,7 @@ static int  connection_event_cb(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
 static void ble_host_task(void *param);
 static void start_discovery_cb(struct ble_npl_event *ev);
+static void reconnect_next(void);
 
 /* Connection state */
 static bool s_connecting = false;
@@ -33,6 +35,11 @@ static struct ble_npl_event s_start_disc_event;
 static volatile bool s_connect_requested = false;
 static ble_addr_t    s_connect_addr;
 
+/* Boot reconnect — peers collected from bond store in on_sync, worked off one
+ * at a time via reconnect_next().  No manual whitelist needed. */
+static ble_addr_t s_pending_reconnect[CONFIG_BT_NIMBLE_MAX_BONDS];
+static int        s_pending_count = 0;
+static int        s_pending_idx   = 0;
 
 /* Bond purge — keep list populated by caller before posting the event */
 static struct {
@@ -143,13 +150,96 @@ static void ble_host_task(void *param)
 }
 
 /* --------------------------------------------------------------------------
+ * Boot reconnect helpers
+ *
+ * collect_bonded_peers_cb() walks the NimBLE peer-security store and builds
+ * a deduplicated list of peer addresses to reconnect to on startup.
+ *
+ * reconnect_next() works off that list one at a time, calling ble_gap_connect()
+ * directly — no scan phase required.  When all known peers have been attempted
+ * the function falls through to start_scan() for new-camera discovery.
+ * -------------------------------------------------------------------------- */
+static int collect_bonded_peers_cb(int obj_type, union ble_store_value *val, void *cookie)
+{
+    if (s_pending_count >= CONFIG_BT_NIMBLE_MAX_BONDS) {
+        return 0;
+    }
+
+    /* The bond store can hold both a master-sec and a peer-sec entry for the
+     * same device.  Deduplicate by address before adding to the list. */
+    for (int i = 0; i < s_pending_count; i++) {
+        if (memcmp(&s_pending_reconnect[i], &val->sec.peer_addr,
+                   sizeof(ble_addr_t)) == 0) {
+            return 0;
+        }
+    }
+
+    s_pending_reconnect[s_pending_count++] = val->sec.peer_addr;
+    return 0;
+}
+
+static void reconnect_next(void)
+{
+    if (s_pending_idx >= s_pending_count) {
+        /* All known peers have been attempted — start background scan so that
+         * new cameras can be discovered and any missed reconnects can be
+         * retried via gopro_manager_find_by_addr(). */
+        ESP_LOGI(TAG, "Boot reconnect phase complete — starting background scan");
+        start_scan();
+        return;
+    }
+
+    ble_addr_t *addr = &s_pending_reconnect[s_pending_idx++];
+    const uint8_t *a = addr->val;
+
+    /* Skip if this peer is already connected (shouldn't happen on boot, but
+     * be safe in case reconnect_next() is called more than once). */
+    struct ble_gap_conn_desc existing;
+    if (ble_gap_conn_find_by_addr(addr, &existing) == 0) {
+        ESP_LOGI(TAG, "Already connected to %02X:%02X:%02X:%02X:%02X:%02X — skipping",
+                 a[5], a[4], a[3], a[2], a[1], a[0]);
+        reconnect_next();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Boot reconnect %d/%d — %02X:%02X:%02X:%02X:%02X:%02X",
+             s_pending_idx, s_pending_count,
+             a[5], a[4], a[3], a[2], a[1], a[0]);
+
+    /* Connect directly — no scan required.  The BLE controller enters
+     * initiating state and connects as soon as this peer starts advertising.
+     * 10-second timeout; on failure connection_event_cb calls reconnect_next()
+     * to move on to the next peer. */
+    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, addr,
+                             10000, NULL, connection_event_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_connect failed: %d — skipping", rc);
+        reconnect_next();
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Sync callback — BLE stack is ready
  * -------------------------------------------------------------------------- */
 static void on_sync(void)
 {
     ESP_LOGI(TAG, "BLE stack ready!");
     log_bond_count();
-    // start_scan();
+
+    /* Collect all bonded peers and kick off the reconnect chain.
+     * ble_gap_connect() is used directly — no scan phase needed. */
+    s_pending_count = 0;
+    s_pending_idx   = 0;
+    ble_store_iterate(BLE_STORE_OBJ_TYPE_PEER_SEC, collect_bonded_peers_cb, NULL);
+
+    if (s_pending_count > 0) {
+        ESP_LOGI(TAG, "Found %d bonded peer(s) — starting reconnect chain",
+                 s_pending_count);
+        reconnect_next();
+    } else {
+        ESP_LOGI(TAG, "No bonded peers — starting background scan");
+        start_scan();
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -196,6 +286,12 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
             struct ble_gap_conn_desc desc;
             ble_gap_conn_find(handle, &desc);
 
+            /* Update runtime state in gopro_manager */
+            int cam_slot = gopro_manager_find_by_addr(&desc.peer_id_addr);
+            if (cam_slot >= 0) {
+                gopro_manager_set_connected(cam_slot, handle);
+            }
+
             struct ble_store_key_sec key;
             struct ble_store_value_sec sec;
             memset(&key, 0, sizeof(key));
@@ -217,18 +313,15 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
             if (sec_rc != 0) {
                 ESP_LOGE(TAG, "Security initiate failed: %d", sec_rc);
             }
-
-            /* Reset connecting flag and restart scan so that:
-             * - discovery mode can find more cameras while connected
-             * - additional cameras can be auto-connected later
-             * Connected cameras stop advertising, so we won't re-connect them. */
-            s_connecting = false;
-            start_scan();
         } else {
             ESP_LOGE(TAG, "Connection failed — status: %d", event->connect.status);
-            s_connecting = false;
-            start_scan();
         }
+
+        /* Advance the boot reconnect chain (or start background scan once all
+         * known peers have been attempted).  Safe to call after the chain is
+         * already complete — reconnect_next() becomes a no-op start_scan(). */
+        s_connecting = false;
+        reconnect_next();
         break;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
@@ -247,11 +340,27 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
         return BLE_GAP_REPEAT_PAIRING_RETRY;
     }
 
-    case BLE_GAP_EVENT_DISCONNECT:
+    case BLE_GAP_EVENT_DISCONNECT: {
         ESP_LOGI(TAG, "Disconnected — reason: %d", event->disconnect.reason);
+        gopro_manager_set_disconnected(event->disconnect.conn.conn_handle);
         s_connecting = false;
-        start_scan();
+
+        /* Attempt a direct reconnect to the camera that just dropped.
+         * 30-second timeout; if it expires connection_event_cb fires with
+         * failure → reconnect_next() → start_scan() as a fallback. */
+        const ble_addr_t *peer = &event->disconnect.conn.peer_id_addr;
+        const uint8_t *a = peer->val;
+        ESP_LOGI(TAG, "Attempting reconnect to %02X:%02X:%02X:%02X:%02X:%02X",
+                 a[5], a[4], a[3], a[2], a[1], a[0]);
+
+        int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, peer,
+                                 30000, NULL, connection_event_cb, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Post-disconnect reconnect failed: %d — scanning", rc);
+            start_scan();
+        }
         break;
+    }
 
     case BLE_GAP_EVENT_PASSKEY_ACTION:
         ESP_LOGW(TAG, "Passkey action requested — action: %d",
@@ -268,6 +377,15 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
 /* --------------------------------------------------------------------------
  * Scan event callback — runs on the NimBLE host task.
  * All BLE API calls stay here; the HTTP task only sets flags.
+ *
+ * During the background scan this callback handles two cases only:
+ *   1. Discovery mode  — collect GoPros, do not connect.
+ *   2. Targeted connect — connect to the explicitly requested address.
+ *
+ * Known-camera reconnects are handled via ble_gap_connect() directly (no
+ * scan required), so there is no whitelist check here.  As a safety net,
+ * if a known camera is seen advertising after a post-disconnect reconnect
+ * attempt times out, gopro_manager_find_by_addr() catches it and reconnects.
  * -------------------------------------------------------------------------- */
 static int scan_event_cb(struct ble_gap_event *event, void *arg)
 {
@@ -337,10 +455,16 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
         s_connect_requested = false;
         /* fall through to connect logic below */
     } else {
-        return 0; /* not in discovery mode and no pair request — do not auto-connect */
+        /* Safety net: a known camera is advertising, which means a post-disconnect
+         * ble_gap_connect() attempt timed out and we fell back to scanning.
+         * Reconnect it now. */
+        if (gopro_manager_find_by_addr(&event->disc.addr) < 0) {
+            return 0; /* unknown camera — ignore */
+        }
+        /* fall through to connect logic below */
     }
 
-    /* --- Normal / targeted connect --- */
+    /* --- Connect --- */
     if (s_connecting) {
         return 0;
     }

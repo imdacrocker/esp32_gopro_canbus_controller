@@ -78,6 +78,7 @@ static void load_slot(int slot)
 
 void gopro_manager_init(void)
 {
+    
     memset(s_cameras, 0, sizeof(s_cameras));
     for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
         load_slot(i);
@@ -172,4 +173,44 @@ esp_err_t gopro_manager_remove(int slot)
 
     ESP_LOGI(TAG, "slot %d removed", slot);
     return err;
+}
+
+/* -----------------------------------------------------------------------
+ * Runtime status helpers
+ * --------------------------------------------------------------------- */
+
+int gopro_manager_remembered_count(void)
+{
+    int count = 0;
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        if (s_cameras[i].is_paired) count++;
+    }
+    return count;
+}
+
+int gopro_manager_connected_count(void)
+{
+    int count = 0;
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        if (s_cameras[i].is_paired && s_cameras[i].bt_handle != 0) count++;
+    }
+    return count;
+}
+
+void gopro_manager_set_connected(int slot, uint16_t handle)
+{
+    if (slot < 0 || slot >= GOPRO_MAX_CAMERAS) return;
+    s_cameras[slot].bt_handle = handle;
+    ESP_LOGI(TAG, "slot %d connected — handle: %d", slot, handle);
+}
+
+void gopro_manager_set_disconnected(uint16_t handle)
+{
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        if (s_cameras[i].bt_handle == handle) {
+            s_cameras[i].bt_handle = 0;
+            ESP_LOGI(TAG, "slot %d disconnected", i);
+            return;
+        }
+    }
 }

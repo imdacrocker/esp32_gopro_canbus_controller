@@ -1,4 +1,4 @@
 idf_component_register(SRCS "wifi_manager.c"
                        INCLUDE_DIRS "include"
-                       REQUIRES esp_wifi esp_http_server esp_netif esp_event ble_scanner
+                       REQUIRES esp_wifi esp_http_server esp_netif esp_event ble_scanner gopro_manager
                        EMBED_TXTFILES "www/index.html")
