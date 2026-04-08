@@ -6,6 +6,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "host/ble_hs.h"   /* BLE_HS_CONN_HANDLE_NONE */
+#include "ble_scanner.h"   /* ble_scanner_gatt_write() */
 
 static const char *TAG = "gopro_manager";
 
@@ -257,4 +258,55 @@ void gopro_manager_set_gatt_ready(int slot, bool ready)
     if (slot < 0 || slot >= GOPRO_MAX_CAMERAS) return;
     s_cameras[slot].gatt_ready = ready;
     ESP_LOGI(TAG, "slot %d gatt_ready = %s", slot, ready ? "true" : "false");
+}
+
+/* -----------------------------------------------------------------------
+ * Generic TLV command broadcast
+ * --------------------------------------------------------------------- */
+int gopro_manager_send_command_all(uint8_t cmd_id, const uint8_t *params, uint8_t param_len)
+{
+    /* OpenGoPro TLV packet layout:
+     *   Byte 0: total length of remaining bytes  (1 [cmd_id] + 1 [param_len] + param_len)
+     *   Byte 1: command ID
+     *   Byte 2: parameter length
+     *   Bytes 3…: parameter value(s)
+     *
+     * Maximum supported payload is 17 parameter bytes so the whole packet
+     * fits within the 20-byte BLE ATT MTU limit.
+     */
+    if (param_len > 17) {
+        ESP_LOGE(TAG, "send_command_all: param_len %d exceeds 17", param_len);
+        return 0;
+    }
+
+    uint8_t pkt[20];
+    pkt[0] = (uint8_t)(2 + param_len);  /* length: cmd_id + param_len_field + params */
+    pkt[1] = cmd_id;
+    pkt[2] = param_len;
+    if (param_len > 0 && params != NULL) {
+        memcpy(&pkt[3], params, param_len);
+    }
+    uint16_t pkt_len = (uint16_t)(3 + param_len);
+
+    int dispatched = 0;
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        gopro_camera_t *cam = &s_cameras[i];
+        if (!cam->is_paired) continue;
+        if (cam->bt_handle == BLE_HS_CONN_HANDLE_NONE) continue;
+        if (!cam->gatt_ready) continue;
+        if (cam->gatt.cmd_write == 0) continue;
+
+        esp_err_t err = ble_scanner_gatt_write(cam->bt_handle,
+                                               cam->gatt.cmd_write,
+                                               pkt, pkt_len);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "slot %d: dispatched cmd 0x%02x", i, cmd_id);
+            dispatched++;
+        } else {
+            ESP_LOGW(TAG, "slot %d: gatt_write failed (%s)", i, esp_err_to_name(err));
+        }
+    }
+
+    ESP_LOGI(TAG, "send_command_all(0x%02x): dispatched to %d camera(s)", cmd_id, dispatched);
+    return dispatched;
 }

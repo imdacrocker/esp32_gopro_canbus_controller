@@ -16,6 +16,13 @@
         #reset-btn { padding: 0.6em 1.4em; font-size: 1em; cursor: pointer;
                      margin-left: 0.6em; background: #c0392b; color: #fff; border: none; border-radius: 3px; }
         #reset-btn:disabled { opacity: 0.5; cursor: default; }
+        #control-bar { display: flex; gap: 0.8em; margin: 1.2em 0 0.4em; }
+        #start-btn { padding: 0.7em 1.6em; font-size: 1.05em; font-weight: bold;
+                     background: #27ae60; color: #fff; border: none; border-radius: 4px; cursor: pointer; flex: 1; }
+        #start-btn:disabled { opacity: 0.5; cursor: default; }
+        #stop-btn  { padding: 0.7em 1.6em; font-size: 1.05em; font-weight: bold;
+                     background: #e74c3c; color: #fff; border: none; border-radius: 4px; cursor: pointer; flex: 1; }
+        #stop-btn:disabled  { opacity: 0.5; cursor: default; }
         #results { margin-top: 1.5em; }
         .camera  { display: flex; justify-content: space-between; align-items: center;
                    padding: 0.6em 0; border-bottom: 1px solid #ddd; }
@@ -34,6 +41,12 @@
 
     <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
     <button id="reset-btn" onclick="resetBonds()">Reset Bonds</button>
+
+    <div id="control-bar">
+        <button id="start-btn" onclick="sendShutter(true)">&#9654; Start Recording</button>
+        <button id="stop-btn"  onclick="sendShutter(false)">&#9632; Stop Recording</button>
+    </div>
+
     <p id="status"></p>
     <div id="results"></div>
 
@@ -130,6 +143,35 @@
             .then(function(r) { return r.json(); })
             .then(function() { setStatus('Pairing initiated. Check serial log for result.'); })
             .catch(function() { setStatus('Error sending pair request.'); });
+        }
+
+        function sendShutter(on) {
+            var startBtn = document.getElementById('start-btn');
+            var stopBtn  = document.getElementById('stop-btn');
+            startBtn.disabled = true;
+            stopBtn.disabled  = true;
+            setStatus((on ? 'Starting' : 'Stopping') + ' recording...');
+
+            fetch('/api/shutter', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ on: on })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                var n = data.dispatched || 0;
+                if (n === 0) {
+                    setStatus('No cameras ready — is any camera connected and GATT-set-up?');
+                } else {
+                    setStatus((on ? 'Record started' : 'Record stopped') +
+                              ' on ' + n + ' camera' + (n === 1 ? '' : 's') + '.');
+                }
+            })
+            .catch(function() { setStatus('Error sending shutter command.'); })
+            .finally(function() {
+                startBtn.disabled = false;
+                stopBtn.disabled  = false;
+            });
         }
     </script>
 </body>

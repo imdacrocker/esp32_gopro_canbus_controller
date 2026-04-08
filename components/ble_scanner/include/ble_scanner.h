@@ -47,3 +47,19 @@ void ble_scanner_connect_by_addr(const ble_addr_t *addr);
  */
 void ble_scanner_purge_unknown_bonds(const ble_addr_t *keep, int keep_count);
 
+/**
+ * Write raw bytes to a GATT characteristic on an already-connected camera.
+ * @param conn_handle  NimBLE connection handle for the target camera.
+ * @param attr_handle  ATT value handle of the characteristic to write.
+ * @param data         Bytes to send.
+ * @param len          Number of bytes.
+ * @return ESP_OK on success, ESP_FAIL if the NimBLE write call rejects the request.
+ *
+ * The write is fire-and-forget (no-response write).  The response notification
+ * arrives on the Command Response characteristic that was subscribed during GATT
+ * setup.  All GATT calls must originate on the NimBLE host task; this function
+ * schedules the write there and returns immediately.
+ */
+esp_err_t ble_scanner_gatt_write(uint16_t conn_handle, uint16_t attr_handle,
+                                  const uint8_t *data, uint16_t len);
+

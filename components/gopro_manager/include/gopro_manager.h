@@ -150,3 +150,17 @@ void gopro_manager_set_gatt_handles(int slot, const gopro_gatt_handles_t *handle
  * has completed for the given slot.
  */
 void gopro_manager_set_gatt_ready(int slot, bool ready);
+
+/**
+ * Send a TLV command to every camera that is currently connected and GATT-ready.
+ *
+ * The function builds the standard OpenGoPro TLV packet:
+ *   [length][cmd_id][param_len][param...]
+ * and writes it to each camera's Command characteristic (GP-0072).
+ *
+ * @param cmd_id    Command ID byte (e.g. 0x01 for Set Shutter).
+ * @param params    Optional parameter bytes.  May be NULL when param_len == 0.
+ * @param param_len Number of parameter bytes (0 for commands with no parameters).
+ * @return Number of cameras the command was dispatched to (0 = none connected/ready).
+ */
+int gopro_manager_send_command_all(uint8_t cmd_id, const uint8_t *params, uint8_t param_len);

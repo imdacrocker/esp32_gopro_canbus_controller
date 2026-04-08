@@ -161,6 +161,55 @@ static const httpd_uri_t api_reset_bonds_uri = {
     .handler = api_reset_bonds_handler,
 };
 
+/* POST /api/shutter — body: {"on":true} or {"on":false}
+ *
+ * Sends a Set Shutter TLV command (ID 0x01) to every connected camera.
+ * Responds with {"dispatched": N} where N is the number of cameras reached.
+ */
+static esp_err_t api_shutter_handler(httpd_req_t *req)
+{
+    char body[64] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+
+    /* Simple JSON parse — look for "on":true or "on":false */
+    bool shutter_on = false;
+    char *p = strstr(body, "\"on\":");
+    if (!p) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'on' field");
+        return ESP_FAIL;
+    }
+    p += 5; /* skip past "on": */
+    while (*p == ' ') p++;
+    if (strncmp(p, "true", 4) == 0) {
+        shutter_on = true;
+    } else if (strncmp(p, "false", 5) == 0) {
+        shutter_on = false;
+    } else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid 'on' value");
+        return ESP_FAIL;
+    }
+
+    /* Set Shutter: cmd_id=0x01, param=0x01 (on) or 0x00 (off) */
+    uint8_t param = shutter_on ? 0x01 : 0x00;
+    int dispatched = gopro_manager_send_command_all(0x01, &param, 1);
+
+    char resp[48];
+    snprintf(resp, sizeof(resp), "{\"dispatched\":%d}", dispatched);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_shutter_uri = {
+    .uri     = "/api/shutter",
+    .method  = HTTP_POST,
+    .handler = api_shutter_handler,
+};
+
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -173,6 +222,7 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_cameras_uri);
         httpd_register_uri_handler(server, &api_pair_uri);
         httpd_register_uri_handler(server, &api_reset_bonds_uri);
+        httpd_register_uri_handler(server, &api_shutter_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");

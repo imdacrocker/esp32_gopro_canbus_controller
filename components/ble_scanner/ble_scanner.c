@@ -985,3 +985,73 @@ void ble_scanner_purge_unknown_bonds(const ble_addr_t *keep, int keep_count)
     ble_npl_event_init(&s_purge_event, purge_bonds_cb, NULL);
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_purge_event);
 }
+
+/* --------------------------------------------------------------------------
+ * GATT write helper — public API
+ *
+ * The NimBLE GATT client APIs must be called from the NimBLE host task.
+ * This helper schedules the write on that task via the default event queue,
+ * exactly as ble_scanner_start_discovery() and ble_scanner_purge_unknown_bonds()
+ * do for their respective operations.
+ *
+ * At most one write can be pending at a time (static context).  For simple
+ * camera-control commands (shutter on/off) this is sufficient — the HTTP
+ * handler issues one command per button press and waits for the response
+ * notification before allowing further commands.
+ * -------------------------------------------------------------------------- */
+#define GATT_WRITE_MAX_LEN 20
+
+typedef struct {
+    uint16_t conn_handle;
+    uint16_t attr_handle;
+    uint8_t  data[GATT_WRITE_MAX_LEN];
+    uint16_t len;
+} gatt_write_ctx_t;
+
+static gatt_write_ctx_t      s_gatt_write_ctx;
+static struct ble_npl_event  s_gatt_write_event;
+
+static int gatt_write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                         struct ble_gatt_attr *attr, void *arg)
+{
+    if (error->status != 0) {
+        ESP_LOGW(TAG, "GATT write error on handle %d: status=%d",
+                 conn_handle, error->status);
+    } else {
+        ESP_LOGD(TAG, "GATT write ack — handle %d attr 0x%04x",
+                 conn_handle, attr ? attr->handle : 0);
+    }
+    return 0;
+}
+
+static void gatt_write_cb_event(struct ble_npl_event *ev)
+{
+    gatt_write_ctx_t *ctx = (gatt_write_ctx_t *)ble_npl_event_get_arg(ev);
+
+    int rc = ble_gattc_write_flat(ctx->conn_handle, ctx->attr_handle,
+                                  ctx->data, ctx->len,
+                                  gatt_write_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_write_flat failed: rc=%d (conn=%d attr=0x%04x)",
+                 rc, ctx->conn_handle, ctx->attr_handle);
+    }
+}
+
+esp_err_t ble_scanner_gatt_write(uint16_t conn_handle, uint16_t attr_handle,
+                                  const uint8_t *data, uint16_t len)
+{
+    if (len > GATT_WRITE_MAX_LEN) {
+        ESP_LOGE(TAG, "ble_scanner_gatt_write: payload too large (%d > %d)",
+                 len, GATT_WRITE_MAX_LEN);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    s_gatt_write_ctx.conn_handle = conn_handle;
+    s_gatt_write_ctx.attr_handle = attr_handle;
+    memcpy(s_gatt_write_ctx.data, data, len);
+    s_gatt_write_ctx.len = len;
+
+    ble_npl_event_init(&s_gatt_write_event, gatt_write_cb_event, &s_gatt_write_ctx);
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_gatt_write_event);
+    return ESP_OK;
+}
