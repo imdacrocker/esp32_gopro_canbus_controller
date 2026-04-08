@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "host/ble_hs.h"   /* BLE_HS_CONN_HANDLE_NONE */
 
 static const char *TAG = "gopro_manager";
 
@@ -78,8 +79,14 @@ static void load_slot(int slot)
 
 void gopro_manager_init(void)
 {
-    
     memset(s_cameras, 0, sizeof(s_cameras));
+
+    /* 0 is a valid NimBLE connection handle; use BLE_HS_CONN_HANDLE_NONE
+     * (0xFFFF) as the "not connected" sentinel for every slot. */
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        s_cameras[i].bt_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+
     for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
         load_slot(i);
     }
@@ -188,11 +195,22 @@ int gopro_manager_remembered_count(void)
     return count;
 }
 
+int gopro_manager_find_free_slot(void)
+{
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        if (!s_cameras[i].is_paired) return i;
+    }
+    return -1;
+}
+
 int gopro_manager_connected_count(void)
 {
     int count = 0;
     for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
-        if (s_cameras[i].is_paired && s_cameras[i].bt_handle != 0) count++;
+        if (s_cameras[i].is_paired &&
+            s_cameras[i].bt_handle != BLE_HS_CONN_HANDLE_NONE) {
+            count++;
+        }
     }
     return count;
 }
@@ -208,9 +226,35 @@ void gopro_manager_set_disconnected(uint16_t handle)
 {
     for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
         if (s_cameras[i].bt_handle == handle) {
-            s_cameras[i].bt_handle = 0;
+            s_cameras[i].bt_handle  = BLE_HS_CONN_HANDLE_NONE;
+            s_cameras[i].gatt_ready = false;
+            memset(&s_cameras[i].gatt, 0, sizeof(s_cameras[i].gatt));
             ESP_LOGI(TAG, "slot %d disconnected", i);
             return;
         }
     }
+}
+
+int gopro_manager_find_by_handle(uint16_t handle)
+{
+    if (handle == BLE_HS_CONN_HANDLE_NONE) return -1;
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        if (s_cameras[i].bt_handle == handle) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void gopro_manager_set_gatt_handles(int slot, const gopro_gatt_handles_t *handles)
+{
+    if (slot < 0 || slot >= GOPRO_MAX_CAMERAS || handles == NULL) return;
+    s_cameras[slot].gatt = *handles;
+}
+
+void gopro_manager_set_gatt_ready(int slot, bool ready)
+{
+    if (slot < 0 || slot >= GOPRO_MAX_CAMERAS) return;
+    s_cameras[slot].gatt_ready = ready;
+    ESP_LOGI(TAG, "slot %d gatt_ready = %s", slot, ready ? "true" : "false");
 }

@@ -21,13 +21,40 @@ typedef enum {
 } gopro_recording_status_t;
 
 /**
+ * GATT characteristic handles discovered after connection.
+ * All values are ATT value handles (the writable/readable/notifiable handle,
+ * not the characteristic declaration handle).  0 = not yet discovered.
+ *
+ * GoPro 128-bit UUID base: b5f9XXXX-aa8d-11e3-9046-0002a5d5c51b
+ */
+typedef struct {
+    /* Control & Query Service (FEA6) */
+    uint16_t cmd_write;              /* GP-0072  Command              (write)  */
+    uint16_t cmd_resp_notify;        /* GP-0073  Command Response     (notify) */
+    uint16_t settings_write;         /* GP-0074  Settings             (write)  */
+    uint16_t settings_resp_notify;   /* GP-0075  Settings Response    (notify) */
+    uint16_t query_write;            /* GP-0076  Query                (write)  */
+    uint16_t query_resp_notify;      /* GP-0077  Query Response       (notify) */
+
+    /* Camera Management Service (GP-0090) */
+    uint16_t net_mgmt_cmd_write;     /* GP-0091  Net Mgmt Command     (write)  */
+    uint16_t net_mgmt_resp_notify;   /* GP-0092  Net Mgmt Response    (notify) */
+
+    /* WiFi AP Service (GP-0001) */
+    uint16_t wifi_ssid_read;         /* GP-0002  WiFi AP SSID         (read)   */
+    uint16_t wifi_pass_read;         /* GP-0003  WiFi AP Password     (read)   */
+    uint16_t wifi_power_write;       /* GP-0004  WiFi AP Power        (write)  */
+    uint16_t wifi_state_indicate;    /* GP-0005  WiFi AP State        (indicate)*/
+} gopro_gatt_handles_t;
+
+/**
  * Full camera record.
  *
  * Persistent fields (saved to NVS):
  *   camera_name, camera_model, mac_address, is_paired
  *
  * Runtime fields (populated after connect, lost on restart):
- *   bt_handle, recording_status
+ *   bt_handle, recording_status, gatt, gatt_ready
  */
 typedef struct {
     /* --- Persistent --- */
@@ -37,9 +64,13 @@ typedef struct {
     bool      is_paired;           // true = this slot holds a valid camera
 
     /* --- Runtime only --- */
-    uint16_t  bt_handle;           // NimBLE connection handle; 0 = not connected
+    uint16_t  bt_handle;           // NimBLE connection handle; BLE_HS_CONN_HANDLE_NONE = not connected
     char      ip_address[16];      // "xxx.xxx.xxx.xxx\0"; cleared on init
     gopro_recording_status_t recording_status;
+
+    /* GATT handles populated during post-connect discovery */
+    gopro_gatt_handles_t gatt;
+    bool                 gatt_ready; // true once all notify subscriptions are set up
 } gopro_camera_t;
 
 /**
@@ -80,6 +111,12 @@ esp_err_t gopro_manager_remove(int slot);
 int gopro_manager_remembered_count(void);
 
 /**
+ * Return the index of the first slot where is_paired == false, or -1 if all
+ * slots are occupied.
+ */
+int gopro_manager_find_free_slot(void);
+
+/**
  * Return the number of slots that are currently connected (bt_handle != 0).
  */
 int gopro_manager_connected_count(void);
@@ -91,6 +128,25 @@ void gopro_manager_set_connected(int slot, uint16_t handle);
 
 /**
  * Clear the bt_handle for whichever slot holds the given connection handle.
+ * Also clears gatt_ready and all GATT handles for that slot.
  * Safe to call with an unknown handle — does nothing if not found.
  */
 void gopro_manager_set_disconnected(uint16_t handle);
+
+/**
+ * Find a connected camera by its NimBLE connection handle.
+ * Returns the slot index (0 – GOPRO_MAX_CAMERAS-1), or -1 if not found.
+ */
+int gopro_manager_find_by_handle(uint16_t handle);
+
+/**
+ * Store the discovered GATT characteristic handles for a given slot.
+ * Copies the provided handle map into the camera record.
+ */
+void gopro_manager_set_gatt_handles(int slot, const gopro_gatt_handles_t *handles);
+
+/**
+ * Mark whether GATT setup (service discovery + notification subscriptions)
+ * has completed for the given slot.
+ */
+void gopro_manager_set_gatt_ready(int slot, bool ready);
