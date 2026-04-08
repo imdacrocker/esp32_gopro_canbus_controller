@@ -8,8 +8,9 @@
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include "lwip/ip4_addr.h"
-#include "ble_scanner.h"
-#include "gopro_manager.h"
+#include "gopro_ble.h"
+#include "camera_manager.h"
+#include "ble_core.h"
 
 #define AP_CHANNEL   1
 #define AP_MAX_CONN  4
@@ -33,10 +34,10 @@ static const httpd_uri_t root_uri = {
     .handler = root_handler,
 };
 
-/* POST /api/scan — start a 10-second discovery scan */
+/* POST /api/scan — start a 30-second discovery scan */
 static esp_err_t api_scan_handler(httpd_req_t *req)
 {
-    ble_scanner_start_discovery();
+    gopro_ble_start_discovery();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"scanning\"}");
     return ESP_OK;
@@ -52,7 +53,7 @@ static const httpd_uri_t api_scan_uri = {
 static esp_err_t api_cameras_handler(httpd_req_t *req)
 {
     gopro_device_t devices[GOPRO_MAX_DISCOVERED];
-    int count = ble_scanner_get_discovered(devices, GOPRO_MAX_DISCOVERED);
+    int count = gopro_ble_get_discovered(devices, GOPRO_MAX_DISCOVERED);
 
     /* Build JSON: [{"name":"...","addr":"XX:XX:XX:XX:XX:XX","addr_type":N,"rssi":N}, ...] */
     char buf[1024];
@@ -115,7 +116,7 @@ static esp_err_t api_pair_handler(httpd_req_t *req)
     char *t = strstr(body, "\"addr_type\":");
     addr.type = t ? (uint8_t)atoi(t + 12) : BLE_ADDR_PUBLIC;
 
-    ble_scanner_connect_by_addr(&addr);
+    gopro_ble_connect_by_addr(&addr);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"pairing\"}");
@@ -128,13 +129,13 @@ static const httpd_uri_t api_pair_uri = {
     .handler = api_pair_handler,
 };
 
-/* GET /api/status — return remembered and connected camera counts */
+/* GET /api/status — remembered and connected camera counts */
 static esp_err_t api_status_handler(httpd_req_t *req)
 {
     char buf[64];
     snprintf(buf, sizeof(buf), "{\"remembered\":%d,\"connected\":%d}",
-             gopro_manager_remembered_count(),
-             gopro_manager_connected_count());
+             camera_manager_remembered_count(),
+             camera_manager_connected_count());
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
@@ -148,14 +149,13 @@ static const httpd_uri_t api_status_uri = {
 
 /* GET /api/paired-cameras — all remembered cameras with live status
  *
- * Returns a JSON array of every paired slot:
+ * Returns a JSON array of every configured slot:
  *   [{"index":N,"addr":"XX:XX:XX:XX:XX:XX","status":"<label>"},...]
  *
  * status values:
- *   "disconnected"  — paired but no active BLE connection
- *   "connected"     — connected; recording state not yet known
- *   "recording"     — GOPRO_RECORDING_ACTIVE
- *   "not_recording" — GOPRO_RECORDING_IDLE
+ *   "disconnected"  — configured but no active BLE connection
+ *   "not_recording" — connected, idle or recording state not yet known
+ *   "recording"     — connected and actively recording
  */
 static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
 {
@@ -165,21 +165,18 @@ static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
 
     pos += snprintf(buf + pos, sizeof(buf) - pos, "[");
 
-    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
-        gopro_camera_t *cam = gopro_manager_get(i);
-        if (!cam || !cam->is_paired) continue;
+    for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
+        camera_slot_info_t info = camera_manager_get_slot_info(i);
+        if (!info.is_configured) continue;
 
-        const uint8_t *v = cam->mac_address.val;
-        const char    *status;
+        const uint8_t *v = info.mac_address.val;
+        const char    *status_str;
 
-        if (cam->bt_handle == BLE_HS_CONN_HANDLE_NONE) {
-            status = "disconnected";
-        } else if (cam->recording_status == GOPRO_RECORDING_ACTIVE) {
-            status = "recording";
-        } else if (cam->recording_status == GOPRO_RECORDING_IDLE) {
-            status = "not_recording";
-        } else {
-            status = "connected"; /* connected but recording state not yet polled */
+        switch (info.status) {
+            case CAMERA_STATUS_RECORDING:    status_str = "recording";     break;
+            case CAMERA_STATUS_CONNECTED:    status_str = "not_recording"; break;
+            case CAMERA_STATUS_DISCONNECTED: status_str = "disconnected";  break;
+            default:                         status_str = "unknown";        break;
         }
 
         if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
@@ -191,7 +188,7 @@ static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
             "\"status\":\"%s\"}",
             i,
             v[5], v[4], v[3], v[2], v[1], v[0],
-            status);
+            status_str);
     }
 
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
@@ -210,7 +207,7 @@ static const httpd_uri_t api_paired_cameras_uri = {
 /* POST /api/reset-bonds — delete all stored BLE bonds */
 static esp_err_t api_reset_bonds_handler(httpd_req_t *req)
 {
-    ble_scanner_purge_unknown_bonds(NULL, 0);
+    ble_core_purge_unknown_bonds(NULL, 0);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"bonds cleared\"}");
     return ESP_OK;
@@ -224,7 +221,7 @@ static const httpd_uri_t api_reset_bonds_uri = {
 
 /* POST /api/shutter — body: {"on":true} or {"on":false}
  *
- * Sends a Set Shutter TLV command (ID 0x01) to every connected camera.
+ * Sends a start/stop recording command to every connected, GATT-ready camera.
  * Responds with {"dispatched": N} where N is the number of cameras reached.
  */
 static esp_err_t api_shutter_handler(httpd_req_t *req)
@@ -237,7 +234,6 @@ static esp_err_t api_shutter_handler(httpd_req_t *req)
     }
 
     /* Simple JSON parse — look for "on":true or "on":false */
-    bool shutter_on = false;
     char *p = strstr(body, "\"on\":");
     if (!p) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'on' field");
@@ -245,6 +241,8 @@ static esp_err_t api_shutter_handler(httpd_req_t *req)
     }
     p += 5; /* skip past "on": */
     while (*p == ' ') p++;
+
+    bool shutter_on;
     if (strncmp(p, "true", 4) == 0) {
         shutter_on = true;
     } else if (strncmp(p, "false", 5) == 0) {
@@ -254,9 +252,9 @@ static esp_err_t api_shutter_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    /* Set Shutter: cmd_id=0x01, param=0x01 (on) or 0x00 (off) */
-    uint8_t param = shutter_on ? 0x01 : 0x00;
-    int dispatched = gopro_manager_send_command_all(0x01, &param, 1);
+    int dispatched = shutter_on
+                   ? camera_manager_start_recording_all()
+                   : camera_manager_stop_recording_all();
 
     char resp[48];
     snprintf(resp, sizeof(resp), "{\"dispatched\":%d}", dispatched);
