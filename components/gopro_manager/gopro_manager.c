@@ -3,6 +3,7 @@
 #include <string.h>
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "host/ble_hs.h"   /* BLE_HS_CONN_HANDLE_NONE */
@@ -12,6 +13,9 @@ static const char *TAG = "gopro_manager";
 
 /* NVS key used within each camera namespace to store the blob */
 #define NVS_CAMERA_KEY   "camera"
+
+/* Forward declaration — defined in the "Recording-status polling" section below */
+static void start_status_poll_timer(void);
 
 /* NVS namespace for a given slot — built on demand so it scales with
  * CONFIG_BT_NIMBLE_MAX_BONDS without needing a hardcoded list. */
@@ -91,6 +95,8 @@ void gopro_manager_init(void)
     for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
         load_slot(i);
     }
+
+    start_status_poll_timer();
 }
 
 gopro_camera_t *gopro_manager_get(int slot)
@@ -258,6 +264,114 @@ void gopro_manager_set_gatt_ready(int slot, bool ready)
     if (slot < 0 || slot >= GOPRO_MAX_CAMERAS) return;
     s_cameras[slot].gatt_ready = ready;
     ESP_LOGI(TAG, "slot %d gatt_ready = %s", slot, ready ? "true" : "false");
+}
+
+/* -----------------------------------------------------------------------
+ * Recording-status polling
+ *
+ * OpenGoPro Query Service (GP-0076 write / GP-0077 notify):
+ *   Request  – [0x02][0x13][0x08]
+ *                       ^Get Status  ^Status ID 8 = encoding_active
+ *   Response – [len][0x13][result][0x08][value_len][value]
+ *                                             ^0x00=idle  0x01=recording
+ * --------------------------------------------------------------------- */
+
+/* Query packet written to GP-0076 to ask for encoding_active status */
+static const uint8_t k_status_query_pkt[] = { 0x02, 0x13, 0x08 };
+#define GP_QUERY_GET_STATUS  0x13
+#define GP_STATUS_ID_ENCODING 0x08
+
+static esp_timer_handle_t s_status_poll_timer = NULL;
+
+static void status_poll_timer_cb(void *arg)
+{
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        gopro_camera_t *cam = &s_cameras[i];
+        if (!cam->is_paired)                              continue;
+        if (cam->bt_handle == BLE_HS_CONN_HANDLE_NONE)   continue;
+        if (!cam->gatt_ready)                             continue;
+        if (cam->gatt.query_write == 0)                   continue;
+
+        esp_err_t err = ble_scanner_gatt_write(cam->bt_handle,
+                                               cam->gatt.query_write,
+                                               k_status_query_pkt,
+                                               sizeof(k_status_query_pkt));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "slot %d: status query write failed (%s)",
+                     i, esp_err_to_name(err));
+        }
+    }
+}
+
+static void start_status_poll_timer(void)
+{
+    if (s_status_poll_timer != NULL) {
+        return; /* Already running */
+    }
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = status_poll_timer_cb,
+        .arg      = NULL,
+        .name     = "gopro_status_poll",
+    };
+
+    esp_err_t err = esp_timer_create(&timer_args, &s_status_poll_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create status poll timer: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_timer_start_periodic(s_status_poll_timer,
+                                   (uint64_t)STATUS_POLL_INTERVAL_MS * 1000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start status poll timer: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Status poll timer started — interval %d ms", STATUS_POLL_INTERVAL_MS);
+    }
+}
+
+void gopro_manager_handle_query_response(int slot, const uint8_t *data, uint16_t len)
+{
+    /* Minimum valid packet: [len][query_id][result][status_id][val_len][val] = 6 bytes */
+    if (slot < 0 || slot >= GOPRO_MAX_CAMERAS || data == NULL || len < 6) {
+        return;
+    }
+
+    uint8_t query_id = data[1];
+    uint8_t result   = data[2];
+
+    if (query_id != GP_QUERY_GET_STATUS) {
+        return; /* Not a response we care about yet */
+    }
+
+    if (result != 0x00) {
+        ESP_LOGW(TAG, "slot %d: status query returned error 0x%02x", slot, result);
+        return;
+    }
+
+    /* Walk the packed TLV status entries that follow the header */
+    uint16_t idx = 3;
+    while (idx + 2 <= len) {
+        uint8_t status_id  = data[idx++];
+        uint8_t value_len  = data[idx++];
+
+        if (idx + value_len > len) {
+            break; /* Truncated packet */
+        }
+
+        if (status_id == GP_STATUS_ID_ENCODING && value_len >= 1) {
+            gopro_recording_status_t new_status =
+                data[idx] ? GOPRO_RECORDING_ACTIVE : GOPRO_RECORDING_IDLE;
+
+            if (s_cameras[slot].recording_status != new_status) {
+                s_cameras[slot].recording_status = new_status;
+                ESP_LOGI(TAG, "slot %d: recording status → %s", slot,
+                         new_status == GOPRO_RECORDING_ACTIVE ? "RECORDING" : "IDLE");
+            }
+        }
+
+        idx += value_len;
+    }
 }
 
 /* -----------------------------------------------------------------------

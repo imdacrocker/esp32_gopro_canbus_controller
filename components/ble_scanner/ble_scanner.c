@@ -786,6 +786,28 @@ static int connection_event_cb(struct ble_gap_event *event, void *arg)
         break;
     }
 
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        uint16_t conn_h = event->notify_rx.conn_handle;
+        uint16_t attr_h = event->notify_rx.attr_handle;
+
+        int slot = gopro_manager_find_by_handle(conn_h);
+        if (slot < 0) break;
+
+        gopro_camera_t *cam = gopro_manager_get(slot);
+        if (!cam || !cam->gatt_ready) break;
+
+        if (attr_h == cam->gatt.query_resp_notify) {
+            struct os_mbuf *om = event->notify_rx.om;
+            uint16_t pkt_len  = OS_MBUF_PKTLEN(om);
+            if (pkt_len > 0 && pkt_len <= 64) {
+                uint8_t buf[64];
+                os_mbuf_copydata(om, 0, pkt_len, buf);
+                gopro_manager_handle_query_response(slot, buf, pkt_len);
+            }
+        }
+        break;
+    }
+
     case BLE_GAP_EVENT_PASSKEY_ACTION:
         ESP_LOGW(TAG, "Passkey action requested — action: %d",
                 event->passkey.params.action);

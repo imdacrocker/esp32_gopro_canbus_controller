@@ -7,9 +7,6 @@
     <style>
         body { font-family: sans-serif; max-width: 480px; margin: 2em auto; padding: 0 1em; }
         h1   { font-size: 1.4em; }
-        #camera-counts { display: flex; gap: 1.5em; margin-bottom: 0.8em; }
-        .count-box { background: #f0f0f0; border-radius: 6px; padding: 0.4em 0.9em; font-size: 0.9em; }
-        .count-box span { font-weight: bold; font-size: 1.2em; margin-right: 0.25em; }
         #status  { color: #555; margin: 0.5em 0 1em; min-height: 1.2em; }
         #scan-btn { padding: 0.6em 1.4em; font-size: 1em; cursor: pointer; }
         #scan-btn:disabled { opacity: 0.5; cursor: default; }
@@ -29,15 +26,25 @@
         .camera-info { font-size: 0.9em; color: #333; }
         .camera-name { font-weight: bold; }
         .pair-btn { padding: 0.4em 1em; cursor: pointer; }
+
+        /* Camera status panel */
+        #cam-status-section { margin-top: 2em; border-top: 2px solid #ddd; padding-top: 1em; }
+        #cam-status-section h2 { font-size: 1em; margin: 0 0 0.6em; color: #333; }
+        .cam-row { display: flex; justify-content: space-between; align-items: center;
+                   padding: 0.5em 0; border-bottom: 1px solid #eee; font-size: 0.9em; }
+        .cam-id  { color: #888; margin-right: 0.5em; }
+        .cam-addr { font-family: monospace; }
+        .cam-badge { padding: 0.2em 0.6em; border-radius: 4px; font-size: 0.85em;
+                     font-weight: bold; white-space: nowrap; }
+        .badge-disconnected { background: #ddd;    color: #555; }
+        .badge-connected    { background: #d4eaff; color: #1a6aac; }
+        .badge-recording    { background: #e74c3c; color: #fff; }
+        .badge-not_recording{ background: #eaf5ea; color: #2e7d32; }
+        #cam-status-empty   { color: #888; font-size: 0.9em; }
     </style>
 </head>
 <body>
     <h1>GoPro Controller</h1>
-
-    <div id="camera-counts">
-        <div class="count-box"><span id="remembered-count">—</span>Remembered</div>
-        <div class="count-box"><span id="connected-count">—</span>Connected</div>
-    </div>
 
     <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
     <button id="reset-btn" onclick="resetBonds()">Reset Bonds</button>
@@ -50,6 +57,11 @@
     <p id="status"></p>
     <div id="results"></div>
 
+    <div id="cam-status-section">
+        <h2>Camera Status</h2>
+        <div id="cam-status-list"><p id="cam-status-empty">No cameras paired.</p></div>
+    </div>
+
     <script>
         var pollTimer = null;
 
@@ -57,19 +69,39 @@
             document.getElementById('status').textContent = msg;
         }
 
-        function refreshStatus() {
-            fetch('/api/status')
+        var BADGE_LABEL = {
+            disconnected:  'Disconnected',
+            connected:     'Connected',
+            recording:     'Recording',
+            not_recording: 'Not recording'
+        };
+
+        function refreshCameraStatus() {
+            fetch('/api/paired-cameras')
                 .then(function(r) { return r.json(); })
-                .then(function(s) {
-                    document.getElementById('remembered-count').textContent = s.remembered;
-                    document.getElementById('connected-count').textContent  = s.connected;
+                .then(function(cameras) {
+                    var list = document.getElementById('cam-status-list');
+                    if (cameras.length === 0) {
+                        list.innerHTML = '<p id="cam-status-empty">No cameras paired.</p>';
+                        return;
+                    }
+                    var html = '';
+                    cameras.forEach(function(cam) {
+                        var label = BADGE_LABEL[cam.status] || cam.status;
+                        html += '<div class="cam-row">'
+                              + '<div><span class="cam-id">#' + cam.index + '</span>'
+                              + '<span class="cam-addr">' + cam.addr + '</span></div>'
+                              + '<div class="cam-badge badge-' + cam.status + '">' + label + '</div>'
+                              + '</div>';
+                    });
+                    list.innerHTML = html;
                 })
                 .catch(function() {});
         }
 
-        /* Refresh counts on load and every 3 seconds */
-        refreshStatus();
-        setInterval(refreshStatus, 3000);
+        /* Refresh camera status on load and every 3 seconds */
+        refreshCameraStatus();
+        setInterval(refreshCameraStatus, 3000);
 
         function startScan() {
             document.getElementById('scan-btn').disabled = true;

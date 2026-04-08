@@ -146,6 +146,67 @@ static const httpd_uri_t api_status_uri = {
     .handler = api_status_handler,
 };
 
+/* GET /api/paired-cameras — all remembered cameras with live status
+ *
+ * Returns a JSON array of every paired slot:
+ *   [{"index":N,"addr":"XX:XX:XX:XX:XX:XX","status":"<label>"},...]
+ *
+ * status values:
+ *   "disconnected"  — paired but no active BLE connection
+ *   "connected"     — connected; recording state not yet known
+ *   "recording"     — GOPRO_RECORDING_ACTIVE
+ *   "not_recording" — GOPRO_RECORDING_IDLE
+ */
+static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
+{
+    char buf[512];
+    int  pos   = 0;
+    bool first = true;
+
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "[");
+
+    for (int i = 0; i < GOPRO_MAX_CAMERAS; i++) {
+        gopro_camera_t *cam = gopro_manager_get(i);
+        if (!cam || !cam->is_paired) continue;
+
+        const uint8_t *v = cam->mac_address.val;
+        const char    *status;
+
+        if (cam->bt_handle == BLE_HS_CONN_HANDLE_NONE) {
+            status = "disconnected";
+        } else if (cam->recording_status == GOPRO_RECORDING_ACTIVE) {
+            status = "recording";
+        } else if (cam->recording_status == GOPRO_RECORDING_IDLE) {
+            status = "not_recording";
+        } else {
+            status = "connected"; /* connected but recording state not yet polled */
+        }
+
+        if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+        first = false;
+
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "{\"index\":%d,"
+            "\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+            "\"status\":\"%s\"}",
+            i,
+            v[5], v[4], v[3], v[2], v[1], v[0],
+            status);
+    }
+
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_paired_cameras_uri = {
+    .uri     = "/api/paired-cameras",
+    .method  = HTTP_GET,
+    .handler = api_paired_cameras_handler,
+};
+
 /* POST /api/reset-bonds — delete all stored BLE bonds */
 static esp_err_t api_reset_bonds_handler(httpd_req_t *req)
 {
@@ -223,6 +284,7 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_pair_uri);
         httpd_register_uri_handler(server, &api_reset_bonds_uri);
         httpd_register_uri_handler(server, &api_shutter_uri);
+        httpd_register_uri_handler(server, &api_paired_cameras_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");

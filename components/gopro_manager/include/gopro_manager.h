@@ -8,6 +8,13 @@
 /* Max cameras equals the NimBLE bond limit — one bond per camera.
  * Change CONFIG_BT_NIMBLE_MAX_BONDS in sdkconfig to adjust both. */
 #define GOPRO_MAX_CAMERAS   CONFIG_BT_NIMBLE_MAX_BONDS
+
+/**
+ * How often (in milliseconds) the ESP32 polls each connected camera for its
+ * recording status.  Adjust this value to trade off responsiveness vs. BLE
+ * traffic.  5 000 ms (5 seconds) is a reasonable default.
+ */
+#define STATUS_POLL_INTERVAL_MS  5000
 #define GOPRO_NAME_LEN      32
 #define GOPRO_MODEL_LEN     32
 
@@ -164,3 +171,19 @@ void gopro_manager_set_gatt_ready(int slot, bool ready);
  * @return Number of cameras the command was dispatched to (0 = none connected/ready).
  */
 int gopro_manager_send_command_all(uint8_t cmd_id, const uint8_t *params, uint8_t param_len);
+
+/**
+ * Parse a raw Query Response notification (from GP-0077) for the given slot
+ * and update that camera's recording_status.
+ *
+ * Called by ble_scanner.c on every BLE_GAP_EVENT_NOTIFY_RX event whose
+ * attribute handle matches query_resp_notify.
+ *
+ * Expected packet layout (OpenGoPro TLV):
+ *   [length][query_id=0x13][result=0x00][status_id][value_len][value...]
+ *
+ * @param slot  Camera slot index (0 – GOPRO_MAX_CAMERAS-1).
+ * @param data  Raw notification payload.
+ * @param len   Number of bytes in @p data.
+ */
+void gopro_manager_handle_query_response(int slot, const uint8_t *data, uint16_t len);
