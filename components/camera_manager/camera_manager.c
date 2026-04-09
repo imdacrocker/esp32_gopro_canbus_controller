@@ -53,6 +53,52 @@ static int s_registry_count = 0;
 
 static esp_timer_handle_t s_tick_timer = NULL;
 
+static camera_state_change_fn_t s_state_cb     = NULL;
+static void                    *s_state_cb_ctx = NULL;
+
+void camera_manager_register_state_change_callback(camera_state_change_fn_t cb, void *ctx)
+{
+    s_state_cb     = cb;
+    s_state_cb_ctx = ctx;
+}
+
+/* -----------------------------------------------------------------------
+ * State helpers
+ * --------------------------------------------------------------------- */
+
+/**
+ * Derive the CAMERA_STATUS_* value for a slot from its current in-RAM state.
+ * This mirrors the logic in camera_manager_get_slot_info() but returns a
+ * plain int so callers don't need to allocate a full info struct.
+ */
+static int compute_slot_status(int i)
+{
+    camera_slot_t *slot = &s_slots[i];
+
+    if (!slot->is_configured) {
+        return CAMERA_STATUS_NOT_CONFIGURED;
+    }
+    if (slot->bt_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return CAMERA_STATUS_DISCONNECTED;
+    }
+    if (!slot->driver || !slot->gatt_ready) {
+        /* Connected at the BLE level but GATT not yet set up. */
+        return CAMERA_STATUS_CONNECTED;
+    }
+    camera_recording_status_t rec =
+        slot->driver->get_recording_status(slot->driver_ctx);
+    return (rec == CAMERA_RECORDING_ACTIVE) ? CAMERA_STATUS_RECORDING
+                                             : CAMERA_STATUS_CONNECTED;
+}
+
+/** Notify the registered callback with the current status of slot i. */
+static void notify_slot_state(int i)
+{
+    if (s_state_cb) {
+        s_state_cb(i, compute_slot_status(i), s_state_cb_ctx);
+    }
+}
+
 /* -----------------------------------------------------------------------
  * NVS Storage
  * --------------------------------------------------------------------- */
@@ -192,6 +238,12 @@ static void camera_manager_tick(void *arg)
             }
         }
     }
+
+    /* Publish current status for every slot (including unconfigured ones) so
+     * the CAN status broadcast always reflects the latest state. */
+    for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
+        notify_slot_state(i);
+    }
 }
 
 static void start_tick_timer(void)
@@ -281,6 +333,7 @@ void camera_manager_on_connected(int slot, uint16_t conn_handle)
     if (slot < 0 || slot >= CAMERA_MAX_SLOTS) return;
     s_slots[slot].bt_handle = conn_handle;
     ESP_LOGI(TAG, "slot %d connected — handle: %d", slot, conn_handle);
+    notify_slot_state(slot);
 }
 
 void camera_manager_on_disconnected(uint16_t conn_handle)
@@ -290,6 +343,7 @@ void camera_manager_on_disconnected(uint16_t conn_handle)
             s_slots[i].bt_handle = BLE_HS_CONN_HANDLE_NONE;
             s_slots[i].gatt_ready = false;
             ESP_LOGI(TAG, "slot %d disconnected", i);
+            notify_slot_state(i);
             return;
         }
     }
@@ -300,6 +354,7 @@ void camera_manager_set_gatt_ready(int slot, bool ready)
     if (slot < 0 || slot >= CAMERA_MAX_SLOTS) return;
     s_slots[slot].gatt_ready = ready;
     ESP_LOGI(TAG, "slot %d gatt_ready = %s", slot, ready ? "true" : "false");
+    notify_slot_state(slot);
 }
 
 int camera_manager_register_new(const ble_addr_t *addr, const char *name,

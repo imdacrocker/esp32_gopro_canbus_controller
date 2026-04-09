@@ -49,3 +49,27 @@ bool camera_manager_is_known_addr(const ble_addr_t *addr);
 void camera_manager_register_driver(camera_type_t type,
                                      const camera_driver_t *driver,
                                      void *(*create_ctx)(void));
+
+/**
+ * @brief Callback fired when a camera slot's derived status changes.
+ *
+ * Invoked from camera_manager_tick() (every 2 s) and immediately from
+ * on_connected / on_disconnected / set_gatt_ready so that the CAN status
+ * broadcast stays current without polling.
+ *
+ * @param slot    Camera slot index (0-based).
+ * @param status  One of the CAMERA_STATUS_* constants defined above.
+ * @param ctx     Opaque context registered with the callback.
+ */
+typedef void (*camera_state_change_fn_t)(int slot, int status, void *ctx);
+
+/**
+ * @brief Register a callback to receive camera slot state changes.
+ *
+ * Call before camera_manager_init() so that no transitions are missed
+ * during the initial slot load.  Only one callback is supported at a time.
+ *
+ * @param cb   Callback function.
+ * @param ctx  Opaque context pointer passed to the callback unchanged.
+ */
+void camera_manager_register_state_change_callback(camera_state_change_fn_t cb, void *ctx);

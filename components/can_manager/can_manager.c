@@ -1,0 +1,435 @@
+#include "can_manager.h"
+
+#include <string.h>
+#include <inttypes.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "esp_twai.h"
+#include "esp_twai_onchip.h"
+#include "hal/twai_types.h"
+
+static const char *TAG = "can_manager";
+
+/* ============================================================
+ * Private state
+ * ============================================================ */
+
+static twai_node_handle_t   s_node      = NULL;
+static QueueHandle_t        s_rx_queue  = NULL;
+static TaskHandle_t         s_rx_task   = NULL;
+
+/* Raw frame callback (optional, used for debugging/sniffing). */
+static can_rx_frame_cb_t    s_rx_cb     = NULL;
+static void                *s_rx_cb_ctx = NULL;
+
+/* Logging-state callback, fired only when the value changes. */
+static can_logging_state_cb_t s_logging_cb     = NULL;
+static void                  *s_logging_cb_ctx = NULL;
+static bool                   s_last_logging   = false;   /* tracks previous state */
+
+/* Camera states broadcast in 0x601.  Written from any task, read from the
+ * processing task.  Single-byte writes are atomic on ESP32-S3 Xtensa LX7,
+ * so volatile is sufficient here — no mutex needed. */
+static volatile uint8_t s_camera_states[CAN_MANAGER_MAX_CAMERAS];  /* all 0 on start */
+
+/* TX frame and data buffer for the 0x601 broadcast.
+ *
+ * IMPORTANT: These MUST be static (module lifetime), not stack-allocated.
+ * The v6.0 TWAI driver queues a *pointer* to twai_frame_t, not a copy.
+ * The ISR dereferences that pointer later when the hardware is ready to
+ * transmit.  A stack-allocated frame becomes invalid the moment the
+ * function that created it returns, causing a LoadProhibited crash when
+ * the ISR fires.  Static storage guarantees the pointer is always valid. */
+static uint8_t      s_tx_buf[8];
+static twai_frame_t s_tx_frame;
+
+/* Flags set from ISR, consumed from the processing task. */
+static volatile bool     s_bus_off     = false;
+static volatile uint32_t s_error_count = 0;
+
+/* ============================================================
+ * ISR Callbacks
+ * Running in ISR context — no blocking calls, no ESP_LOG.
+ * ============================================================ */
+
+/**
+ * Called by the TWAI driver ISR each time a frame is ready to read.
+ * We copy it into a fully self-contained struct and push it to the
+ * task queue via xQueueSendFromISR.
+ */
+static bool on_rx_done(twai_node_handle_t handle,
+                       const twai_rx_done_event_data_t *edata,
+                       void *user_ctx)
+{
+    uint8_t raw_buf[TWAI_FRAME_MAX_LEN] = {0};
+    twai_frame_t rx_frame = {
+        .buffer     = raw_buf,
+        .buffer_len = sizeof(raw_buf),
+    };
+
+    if (twai_node_receive_from_isr(handle, &rx_frame) != ESP_OK) {
+        return false;
+    }
+
+    uint16_t raw_len = twaifd_dlc2len(rx_frame.header.dlc);
+    uint8_t  data_len = (raw_len > TWAI_FRAME_MAX_LEN)
+                        ? (uint8_t)TWAI_FRAME_MAX_LEN
+                        : (uint8_t)raw_len;
+
+    can_frame_t frame = {
+        .id          = rx_frame.header.id,
+        .dlc         = (uint8_t)rx_frame.header.dlc,
+        .data_len    = data_len,
+        .is_extended = (bool)rx_frame.header.ide,
+        .is_rtr      = (bool)rx_frame.header.rtr,
+    };
+    memcpy(frame.data, raw_buf, data_len);
+
+    BaseType_t higher_prio_task_woken = pdFALSE;
+    xQueueSendFromISR(s_rx_queue, &frame, &higher_prio_task_woken);
+    return (higher_prio_task_woken == pdTRUE);
+}
+
+/** Called on CAN error state transitions.  We flag bus-off for the task. */
+static bool on_state_change(twai_node_handle_t handle,
+                            const twai_state_change_event_data_t *edata,
+                            void *user_ctx)
+{
+    if (edata->new_sta == TWAI_ERROR_BUS_OFF) {
+        s_bus_off = true;
+    }
+    return false;
+}
+
+/** Called on bus errors.  We tally for periodic task-side reporting. */
+static bool on_error(twai_node_handle_t handle,
+                     const twai_error_event_data_t *edata,
+                     void *user_ctx)
+{
+    s_error_count++;
+    return false;
+}
+
+/* ============================================================
+ * Internal — Protocol Handlers (task context)
+ * ============================================================ */
+
+/**
+ * Process a received 0x600 frame (RaceCapture → ESP32 commands).
+ * Byte 0: isLogging (0 or 1).  Only fires the callback when the value changes.
+ */
+static void handle_rc_command(const can_frame_t *frame)
+{
+    if (frame->data_len < 1) {
+        ESP_LOGW(TAG, "0x600 frame too short (len=%u), ignoring", frame->data_len);
+        return;
+    }
+
+    bool is_logging = (frame->data[0] != 0);
+
+    if (is_logging == s_last_logging) {
+        return;     /* no change — nothing to do */
+    }
+
+    /* DBG: log only when the value actually changes. */
+    ESP_LOGI(TAG, "0x600 RX: byte0=0x%02X  isLogging=%d  (prev=%d)",
+             frame->data[0], (int)is_logging, (int)s_last_logging);
+
+    s_last_logging = is_logging;
+    ESP_LOGI(TAG, "RaceCapture logging: %s", is_logging ? "STARTED" : "STOPPED");
+
+    if (s_logging_cb) {
+        s_logging_cb(is_logging, s_logging_cb_ctx);
+    }
+}
+
+/**
+ * Build and transmit the 0x601 camera status frame.
+ * Called at 5 Hz from the processing task.
+ *
+ * Frame layout:
+ *   Byte 0: Camera 0 state (camera_state_t)
+ *   Byte 1: Camera 1 state
+ *   Byte 2: Camera 2 state
+ *   Byte 3: Camera 3 state
+ *   Bytes 4–7: reserved (0x00)
+ */
+static void broadcast_camera_status(void)
+{
+    /* Update the persistent buffer with current camera states.
+     * s_tx_frame.buffer already points to s_tx_buf (set in can_manager_init). */
+    s_tx_buf[0] = s_camera_states[0];
+    s_tx_buf[1] = s_camera_states[1];
+    s_tx_buf[2] = s_camera_states[2];
+    s_tx_buf[3] = s_camera_states[3];
+    /* bytes 4-7 stay 0x00 (set once during init, never written) */
+
+    esp_err_t ret = twai_node_transmit(s_node, &s_tx_frame, 0 /* non-blocking */);
+    if (ret == ESP_ERR_TIMEOUT) {
+        /* TX queue full (bus is down).  Skip this cycle — the queue already
+         * holds our frame pointer and will drain when the bus recovers. */
+        ESP_LOGD(TAG, "0x601 TX skipped (queue full)");
+    } else if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "0x601 TX failed: %s", esp_err_to_name(ret));
+    }
+
+    /* DBG: log a TX heartbeat every 5 s (25 calls × 200 ms = 5 s).
+     * Shows what values are being broadcast and confirms TX is running.
+     * Remove once communication is confirmed working. */
+    static uint32_t s_tx_call_count = 0;
+    if (++s_tx_call_count % 25 == 1) {
+        ESP_LOGI(TAG, "0x601 TX heartbeat #%"PRIu32": cam=[%u %u %u %u]  ret=%s",
+                 s_tx_call_count,
+                 s_tx_buf[0], s_tx_buf[1], s_tx_buf[2], s_tx_buf[3],
+                 esp_err_to_name(ret));
+    }
+}
+
+/* ============================================================
+ * Processing Task
+ * ============================================================ */
+
+static void can_rx_task(void *arg)
+{
+    can_frame_t frame;
+    uint32_t    last_logged_errors = 0;
+    int         diag_tick = 0;  /* counts 100 ms ticks for 5 s diagnostics */
+    int         tx_tick   = 0;  /* counts 100 ms ticks for 5 Hz TX */
+
+    const int tx_ticks   = (int)(CAN_MANAGER_TX_INTERVAL_MS / 100U); /* = 2 */
+    const int diag_ticks = 50;                                         /* = 5 s */
+
+    ESP_LOGI(TAG, "Processing task started");
+
+    while (1) {
+        /* Block up to 100 ms waiting for an RX frame.  The short timeout lets
+         * the loop also handle TX, bus-off recovery, and diagnostics reliably
+         * even during periods of silence on the bus. */
+        if (xQueueReceive(s_rx_queue, &frame, pdMS_TO_TICKS(100)) == pdTRUE) {
+
+            /* ---- Dispatch known protocol messages --------------------- */
+            if (frame.id == CAN_ID_RC_COMMAND && !frame.is_extended) {
+                handle_rc_command(&frame);
+            } else {
+                /* DBG: log any frame we don't recognise.  Helps confirm
+                 * the bus is active and shows what else RaceCapture sends.
+                 * Remove once communication is confirmed working. */
+                ESP_LOGI(TAG, "CAN RX unknown: ID=0x%03"PRIX32"%s len=%u "
+                         "[%02X %02X %02X %02X %02X %02X %02X %02X]",
+                         frame.id,
+                         frame.is_extended ? "(ext)" : "",
+                         frame.data_len,
+                         frame.data[0], frame.data[1],
+                         frame.data[2], frame.data[3],
+                         frame.data[4], frame.data[5],
+                         frame.data[6], frame.data[7]);
+            }
+
+            /* ---- Forward all frames to raw callback (debug/sniff) ----- */
+            if (s_rx_cb) {
+                s_rx_cb(&frame, s_rx_cb_ctx);
+            }
+        }
+
+        /* ---- Periodic TX: broadcast camera status at 5 Hz ------------ */
+        if (++tx_tick >= tx_ticks) {
+            tx_tick = 0;
+            broadcast_camera_status();
+        }
+
+        /* ---- Bus-off recovery ---------------------------------------- */
+        if (s_bus_off) {
+            s_bus_off = false;
+            ESP_LOGW(TAG, "Bus-off detected — initiating recovery");
+            esp_err_t ret = twai_node_recover(s_node);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Recovery failed: %s", esp_err_to_name(ret));
+            }
+        }
+
+        /* ---- Periodic diagnostics (every 5 s) ------------------------ */
+        if (++diag_tick >= diag_ticks) {
+            diag_tick = 0;
+            uint32_t errs = s_error_count;
+            if (errs != last_logged_errors) {
+                ESP_LOGW(TAG, "CAN bus errors since boot: %" PRIu32, errs);
+                last_logged_errors = errs;
+            }
+        }
+    }
+}
+
+/* ============================================================
+ * Public API
+ * ============================================================ */
+
+esp_err_t can_manager_register_rx_callback(can_rx_frame_cb_t cb, void *user_ctx)
+{
+    if (cb == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_rx_cb     = cb;
+    s_rx_cb_ctx = user_ctx;
+    return ESP_OK;
+}
+
+esp_err_t can_manager_register_logging_callback(can_logging_state_cb_t cb, void *user_ctx)
+{
+    if (cb == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_logging_cb     = cb;
+    s_logging_cb_ctx = user_ctx;
+    return ESP_OK;
+}
+
+esp_err_t can_manager_set_camera_state(uint8_t camera_idx, camera_state_t state)
+{
+    if (camera_idx >= CAN_MANAGER_MAX_CAMERAS) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if ((uint8_t)state > (uint8_t)CAMERA_STATE_RECORDING) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* Single-byte write — atomic on Xtensa LX7 without a mutex. */
+    s_camera_states[camera_idx] = (uint8_t)state;
+    return ESP_OK;
+}
+
+esp_err_t can_manager_init(void)
+{
+    esp_err_t ret;
+
+    /* Camera states default to 0 (UNDEFINED) via static initialisation.
+     * Explicitly set here for clarity in case of a future re-init path. */
+    memset((void *)s_camera_states, CAMERA_STATE_UNDEFINED,
+           sizeof(s_camera_states));
+
+    /* Initialise the persistent TX frame once.  The driver stores a pointer
+     * to this struct, so it must never move — static storage guarantees that. */
+    memset(s_tx_buf,   0x00, sizeof(s_tx_buf));
+    memset(&s_tx_frame, 0x00, sizeof(s_tx_frame));
+    s_tx_frame.header.id  = CAN_ID_CAM_STATUS;
+    s_tx_frame.header.dlc = 8;
+    /* ide/rtr/fdf all remain 0: standard 11-bit data frame, classic CAN. */
+    s_tx_frame.buffer     = s_tx_buf;
+    s_tx_frame.buffer_len = sizeof(s_tx_buf);
+
+    /* --- Create the software receive queue ----------------------------- */
+    s_rx_queue = xQueueCreate(CAN_MANAGER_RX_QUEUE_DEPTH, sizeof(can_frame_t));
+    if (s_rx_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create RX queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* --- Configure and create the on-chip TWAI node -------------------- */
+    twai_onchip_node_config_t node_cfg = {
+        .io_cfg = {
+            .tx               = CAN_MANAGER_TX_GPIO,
+            .rx               = CAN_MANAGER_RX_GPIO,
+            .quanta_clk_out   = GPIO_NUM_NC,
+            .bus_off_indicator = GPIO_NUM_NC,
+        },
+        .bit_timing = {
+            .bitrate = CAN_MANAGER_BITRATE_BPS,
+            /* sp_permill = 0: driver selects an optimal sample point. */
+        },
+        .tx_queue_depth = CAN_MANAGER_TX_QUEUE_DEPTH,
+        /* fail_retry_cnt: how many times the hardware retries a frame on TX
+         * error before giving up and calling on_tx_done(is_tx_success=false).
+         *
+         * -1 (retry forever) caused an error storm when the bus was
+         * disconnected: the hardware retried the first queued frame
+         * indefinitely, fired on_error ~7000 times/second, and prevented
+         * the queue from draining.  5 retries is enough for normal CAN
+         * arbitration and transient errors while avoiding infinite loops. */
+        .fail_retry_cnt = 5,
+        /* flags all 0: normal mode — participates on bus, sends ACKs, can TX. */
+    };
+
+    ret = twai_new_node_onchip(&node_cfg, &s_node);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create TWAI node: %s", esp_err_to_name(ret));
+        goto cleanup_queue;
+    }
+
+    /* --- Register ISR event callbacks ---------------------------------- */
+    twai_event_callbacks_t cbs = {
+        .on_rx_done      = on_rx_done,
+        .on_tx_done      = NULL,
+        .on_state_change = on_state_change,
+        .on_error        = on_error,
+    };
+
+    ret = twai_node_register_event_callbacks(s_node, &cbs, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register callbacks: %s", esp_err_to_name(ret));
+        goto cleanup_node;
+    }
+
+    /* --- Start the processing task ------------------------------------- */
+    BaseType_t task_ret = xTaskCreate(can_rx_task,
+                                       "can_rx",
+                                       4096,
+                                       NULL,
+                                       CAN_MANAGER_TASK_PRIORITY,
+                                       &s_rx_task);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create processing task");
+        ret = ESP_ERR_NO_MEM;
+        goto cleanup_node;
+    }
+
+    /* --- Enable the node (begin active participation on the bus) ------- */
+    ret = twai_node_enable(s_node);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable TWAI node: %s", esp_err_to_name(ret));
+        goto cleanup_task;
+    }
+
+    ESP_LOGI(TAG, "CAN manager ready — TX GPIO %d, RX GPIO %d, %" PRIu32 " bps",
+             CAN_MANAGER_TX_GPIO, CAN_MANAGER_RX_GPIO,
+             (uint32_t)CAN_MANAGER_BITRATE_BPS);
+    return ESP_OK;
+
+cleanup_task:
+    vTaskDelete(s_rx_task);
+    s_rx_task = NULL;
+cleanup_node:
+    twai_node_delete(s_node);
+    s_node = NULL;
+cleanup_queue:
+    vQueueDelete(s_rx_queue);
+    s_rx_queue = NULL;
+    return ret;
+}
+
+esp_err_t can_manager_deinit(void)
+{
+    esp_err_t ret = ESP_OK;
+
+    if (s_node != NULL) {
+        ret = twai_node_disable(s_node);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "twai_node_disable: %s", esp_err_to_name(ret));
+        }
+        twai_node_delete(s_node);
+        s_node = NULL;
+    }
+
+    if (s_rx_task != NULL) {
+        vTaskDelete(s_rx_task);
+        s_rx_task = NULL;
+    }
+
+    if (s_rx_queue != NULL) {
+        vQueueDelete(s_rx_queue);
+        s_rx_queue = NULL;
+    }
+
+    ESP_LOGI(TAG, "CAN manager stopped");
+    return ret;
+}
