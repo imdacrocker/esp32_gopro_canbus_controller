@@ -1,0 +1,758 @@
+# API Reference
+
+This document covers all three API layers of the ESP32 GoPro CAN Bus Controller:
+
+1. [HTTP REST API](#http-rest-api) — served by the built-in Wi-Fi management interface.
+2. [CAN Bus Protocol](#can-bus-protocol) — the binary frame protocol used between the controller and RaceCapture.
+3. [C Component APIs](#c-component-apis) — the public C headers for each firmware component.
+
+---
+
+## HTTP REST API
+
+The controller runs a Wi-Fi access point (SSID `HERO-RC-XXXXXX`, IP `10.71.79.1`) and an HTTP server on port 80. All API endpoints return `application/json`.
+
+### Base URL
+
+```
+http://10.71.79.1
+```
+
+---
+
+### `GET /`
+
+Serves the embedded web management UI (`index.html`). Open this in a browser after connecting to the controller's Wi-Fi network.
+
+**Response:** `text/html` — the single-page management application.
+
+---
+
+### `GET /api/status`
+
+Returns the count of remembered (paired) and currently connected cameras.
+
+**Response**
+
+```json
+{
+  "remembered": 2,
+  "connected": 1
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `remembered` | integer | Number of cameras stored in NVS (persist across reboots). |
+| `connected` | integer | Number of cameras with an active BLE connection right now. |
+
+---
+
+### `POST /api/scan`
+
+Starts a 30-second BLE discovery scan for nearby GoPro cameras. Only devices advertising the GoPro service UUID `0xFEA6` are added to the discovery list.
+
+**Request body:** none
+
+**Response**
+
+```json
+{ "status": "scanning" }
+```
+
+Poll `GET /api/cameras` every second after calling this endpoint to retrieve discovered cameras as they appear.
+
+---
+
+### `GET /api/cameras`
+
+Returns the list of GoPro cameras discovered during the most recent scan.
+
+**Response** — array of discovered camera objects (may be empty):
+
+```json
+[
+  {
+    "name": "GoPro HERO11 Black",
+    "addr": "AA:BB:CC:DD:EE:FF",
+    "addr_type": 0,
+    "rssi": -62
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Advertised device name. Falls back to `GoPro XXYY` if no name is present. |
+| `addr` | string | BLE MAC address in `XX:XX:XX:XX:XX:XX` format. |
+| `addr_type` | integer | BLE address type: `0` = public, `1` = random. Required by `/api/pair`. |
+| `rssi` | integer | Signal strength in dBm at time of discovery. |
+
+---
+
+### `POST /api/pair`
+
+Initiates a BLE connection and pairing sequence with a specific camera. The camera must be advertising (powered on with Bluetooth enabled) when this call is made.
+
+On success, the camera is registered with `camera_manager`, bonded, and persisted to NVS. It will reconnect automatically on every subsequent boot.
+
+**Request body** (`Content-Type: application/json`):
+
+```json
+{
+  "addr": "AA:BB:CC:DD:EE:FF",
+  "addr_type": 0
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `addr` | string | Yes | Camera BLE address from `/api/cameras`. |
+| `addr_type` | integer | No | Address type from `/api/cameras`. Defaults to `0` (public) if omitted. |
+
+**Response**
+
+```json
+{ "status": "pairing" }
+```
+
+The response is returned immediately; pairing happens asynchronously in the background. Watch the serial log or poll `/api/paired-cameras` for the result.
+
+**Error responses**
+
+| HTTP status | Body | Cause |
+|-------------|------|-------|
+| 400 | `Empty body` | Request body was missing. |
+| 400 | `Missing addr` | JSON field `"addr"` was not found. |
+| 400 | `Bad addr format` | MAC address could not be parsed. |
+
+---
+
+### `GET /api/paired-cameras`
+
+Returns all configured camera slots with their current live status.
+
+**Response** — array of configured camera slot objects. Unconfigured slots are omitted.
+
+```json
+[
+  {
+    "index": 0,
+    "addr": "AA:BB:CC:DD:EE:FF",
+    "status": "recording"
+  },
+  {
+    "index": 1,
+    "addr": "11:22:33:44:55:66",
+    "status": "disconnected"
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `index` | integer | Camera slot index (0-based, up to `CAMERA_MAX_SLOTS - 1`). |
+| `addr` | string | BLE MAC address of the paired camera. |
+| `status` | string | Live status string (see table below). |
+
+**Status values**
+
+| Value | Meaning |
+|-------|---------|
+| `"disconnected"` | Camera is paired but no active BLE connection. |
+| `"not_recording"` | Connected and GATT-ready, but not currently recording. |
+| `"recording"` | Connected and actively recording. |
+
+---
+
+### `POST /api/shutter`
+
+Manually sends a start or stop recording command to all currently connected, GATT-ready cameras.
+
+This command does **not** change the desired recording state tracked by `camera_manager`. Use this for manual overrides only; the CAN-driven flow (via `0x600`) is the primary control path in normal operation.
+
+**Request body** (`Content-Type: application/json`):
+
+```json
+{ "on": true }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `on` | boolean | `true` to start recording; `false` to stop. |
+
+**Response**
+
+```json
+{ "dispatched": 2 }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `dispatched` | integer | Number of cameras that received the command. `0` means no cameras were ready. |
+
+**Error responses**
+
+| HTTP status | Body | Cause |
+|-------------|------|-------|
+| 400 | `Empty body` | Request body was missing. |
+| 400 | `Missing 'on' field` | JSON field `"on"` was not found. |
+| 400 | `Invalid 'on' value` | `"on"` was not `true` or `false`. |
+
+---
+
+### `POST /api/reset-bonds`
+
+Deletes all stored BLE bonds from the NimBLE bond store. Cameras will need to be re-paired via `/api/scan` and `/api/pair`.
+
+> **Warning:** This is irreversible. All paired cameras will need to go through the pairing process again.
+
+**Request body:** none
+
+**Response**
+
+```json
+{ "status": "bonds cleared" }
+```
+
+---
+
+## CAN Bus Protocol
+
+The controller communicates with RaceCapture over a **1 Mbps CAN bus** using **standard 11-bit frame IDs** and classic (non-FD) 8-byte data frames.
+
+### Physical layer
+
+| Parameter | Value |
+|-----------|-------|
+| Bitrate | 1 Mbps (`CAN_MANAGER_BITRATE_BPS`) |
+| Frame format | Standard 11-bit IDs |
+| Data length | 8 bytes |
+| Termination | Hardware jumper (120 Ω at each bus end) |
+
+### Message IDs
+
+| Direction | CAN ID (hex) | CAN ID (decimal) | Rate |
+|-----------|-------------|-----------------|------|
+| RaceCapture → ESP32 | `0x600` | 1536 | ~10 Hz |
+| ESP32 → RaceCapture | `0x601` | 1537 | 5 Hz (fixed) |
+
+---
+
+### `0x600` — RaceCapture → ESP32 (Command frame)
+
+Sent by RaceCapture to command the controller's logging state. The controller fires its internal `on_logging_state_changed` callback only when `isLogging` changes value — repeated identical frames are silently ignored.
+
+| Byte | Field | Type | Values |
+|------|-------|------|--------|
+| 0 | `isLogging` | uint8 | `0` = not logging, `1` = logging |
+| 1–7 | Reserved | — | `0x00` |
+
+---
+
+### `0x601` — ESP32 → RaceCapture (Camera status frame)
+
+Broadcast by the controller at 5 Hz regardless of whether the bus is active. Each byte reports the state of one camera slot.
+
+| Byte | Field | Type | Values |
+|------|-------|------|--------|
+| 0 | Camera slot 0 state | uint8 | See `camera_state_t` below |
+| 1 | Camera slot 1 state | uint8 | See `camera_state_t` below |
+| 2 | Camera slot 2 state | uint8 | See `camera_state_t` below |
+| 3 | Camera slot 3 state | uint8 | See `camera_state_t` below |
+| 4–7 | Reserved | — | `0x00` |
+
+### `camera_state_t` enumeration
+
+```c
+typedef enum {
+    CAMERA_STATE_UNDEFINED    = 0,  // Slot not configured / no information yet
+    CAMERA_STATE_DISCONNECTED = 1,  // Camera not found or connection lost
+    CAMERA_STATE_IDLE         = 2,  // Connected, not recording
+    CAMERA_STATE_RECORDING    = 3,  // Connected and actively recording
+} camera_state_t;
+```
+
+### RaceCapture Direct CAN Mapping (0x601)
+
+Configure one channel per camera slot in the RaceCapture **Direct CAN Mapping** page:
+
+| Parameter | Value |
+|-----------|-------|
+| CAN ID | 1537 (decimal) |
+| Source Type | Unsigned |
+| Length | 1 byte |
+| Offset | 0 (Cam1), 1 (Cam2), 2 (Cam3), 3 (Cam4) |
+| Multiplier | 1 |
+| Adder | 0 |
+| Min | 0 |
+| Max | 3 |
+
+> **Lua index note:** RaceCapture Lua arrays are 1-indexed. `data[1]` corresponds to CAN byte offset 0. The Direct CAN Mapping page uses 0-indexed offsets directly.
+
+---
+
+## C Component APIs
+
+All public headers use Doxygen-compatible `/** ... */` comment blocks. The sections below summarise each component's interface; refer to the header files for the authoritative parameter and return-value documentation.
+
+---
+
+### `ble_core`
+
+**Header:** `components/ble_core/include/ble_core.h`
+
+NimBLE stack abstraction. Manages scanning, connection lifecycle, encryption, and GATT writes. Camera-agnostic — all camera-specific logic is handled via registered callbacks.
+
+#### Types
+
+**`ble_core_callbacks_t`** — aggregated event callback table.
+
+```c
+typedef struct {
+    ble_core_on_disc_cb_t          on_disc;        // advertisement seen during discovery
+    ble_core_on_connected_cb_t     on_connected;   // connection established
+    ble_core_on_encrypted_cb_t     on_encrypted;   // link encrypted — safe to use GATT
+    ble_core_on_disconnected_cb_t  on_disconnected;// connection dropped
+    ble_core_on_notify_rx_cb_t     on_notify_rx;   // ATT notification received
+    ble_core_is_known_addr_cb_t    is_known_addr;  // returns true for registered cameras
+} ble_core_callbacks_t;
+```
+
+All fields are optional; set unused callbacks to `NULL`.
+
+#### Functions
+
+```c
+void ble_core_register_callbacks(const ble_core_callbacks_t *cbs);
+```
+Register the callback table. Must be called before `ble_core_init()`. Copies the struct by value.
+
+---
+
+```c
+void ble_core_init(void);
+```
+Initialise the NimBLE stack, configure the security manager for bonding (no I/O / Just Works), and launch the host task. On `on_sync`, automatically attempts to reconnect all stored bonds, then falls back to a passive background scan.
+
+---
+
+```c
+void ble_core_start_discovery(void);
+```
+Start a 30-second passive scan that surfaces all advertisement packets to `on_disc`. Deduplication is disabled. Safe to call from any task.
+
+---
+
+```c
+void ble_core_stop_discovery(void);
+```
+Cancel a running discovery scan and resume the background scan.
+
+---
+
+```c
+void ble_core_connect_by_addr(const ble_addr_t *addr);
+```
+Request a connection to a specific BLE address. The connection is initiated the next time the device is seen advertising. Safe to call from any task.
+
+---
+
+```c
+void ble_core_purge_unknown_bonds(const ble_addr_t *keep, int keep_count);
+```
+Delete all NimBLE bonds except those in the `keep` array. Pass `NULL` / `0` to delete all bonds.
+
+---
+
+```c
+esp_err_t ble_core_gatt_write(uint16_t conn_handle, uint16_t attr_handle,
+                               const uint8_t *data, uint16_t len);
+```
+Send an ATT Write Without Response command. Returns `ESP_OK` on success.
+
+---
+
+### `gopro_ble`
+
+**Header:** `components/gopro_ble/include/gopro_ble.h`
+
+GoPro-specific BLE driver implementing the [OpenGoPro BLE 2.0](https://gopro.github.io/OpenGoPro/ble_2_0) protocol. Registers a `camera_driver_t` vtable with `camera_manager` and handles all GATT service discovery, notification parsing, and TLV command encoding.
+
+#### Types
+
+**`gopro_device_t`** — a camera found during a scan.
+
+```c
+typedef struct {
+    char       name[32];   // Advertised device name
+    ble_addr_t addr;       // BLE address (6 bytes + type)
+    int8_t     rssi;       // Signal strength in dBm
+} gopro_device_t;
+```
+
+**`gopro_gatt_handles_t`** — GATT attribute handles discovered per camera.
+
+```c
+typedef struct {
+    uint16_t cmd_write;             // GP-0072: command write
+    uint16_t cmd_resp_notify;       // GP-0073: command response notifications
+    uint16_t settings_write;        // GP-0074: settings write
+    uint16_t settings_resp_notify;  // GP-0075: settings response notifications
+    uint16_t query_write;           // GP-0076: query write
+    uint16_t query_resp_notify;     // GP-0077: query response notifications
+    uint16_t net_mgmt_cmd_write;    // GP-0078: network management command
+    uint16_t net_mgmt_resp_notify;  // GP-0079: network management response
+    uint16_t wifi_ssid_read;        // GP-0002: Wi-Fi AP SSID
+    uint16_t wifi_pass_read;        // GP-0003: Wi-Fi AP password
+    uint16_t wifi_power_write;      // GP-0001: Wi-Fi AP power
+    uint16_t wifi_state_indicate;   // GP-0004: Wi-Fi AP state indications
+} gopro_gatt_handles_t;
+```
+
+#### Functions
+
+```c
+void gopro_ble_init(void);
+```
+Initialise the GoPro BLE component. Registers the `camera_driver_t` vtable with `camera_manager`, registers BLE event callbacks with `ble_core`, and starts the recording-status poll timer. Must be called before `camera_manager_init()` and `ble_core_init()`.
+
+---
+
+```c
+void gopro_ble_start_discovery(void);
+```
+Clear the discovery list and start a 30-second BLE scan. Cameras are filtered by service UUID `0xFEA6` (GoPro). Safe to call from any task.
+
+---
+
+```c
+int gopro_ble_get_discovered(gopro_device_t *out, int max_count);
+```
+Copy up to `max_count` discovered cameras into `out`. Returns the number of entries written.
+
+---
+
+```c
+void gopro_ble_connect_by_addr(const ble_addr_t *addr);
+```
+Initiate connection and pairing with a specific camera address. Safe to call from any task.
+
+---
+
+```c
+const camera_driver_t *gopro_ble_get_driver(void);
+```
+Return a pointer to the static GoPro `camera_driver_t` vtable.
+
+---
+
+```c
+void *gopro_ble_create_driver_ctx(void);
+```
+Allocate and return a new, zeroed `gopro_ble_ctx_t` per-camera context. Returns `NULL` on OOM.
+
+---
+
+### `camera_manager`
+
+**Header:** `components/camera_manager/include/camera_manager.h`
+
+Camera slot state machine. Persists camera records to NVS. Runs a 2-second tick timer that retries recording commands and fires state-change callbacks.
+
+#### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `CAMERA_MAX_SLOTS` | `CONFIG_BT_NIMBLE_MAX_BONDS` | Maximum number of simultaneous paired cameras. |
+| `CAMERA_NAME_LEN` | `32` | Maximum camera name length including null terminator. |
+| `CAMERA_STATUS_NOT_CONFIGURED` | `-1` | Slot is empty — no camera assigned. |
+| `CAMERA_STATUS_DISCONNECTED` | `0` | Camera paired but not connected. |
+| `CAMERA_STATUS_CONNECTED` | `1` | Connected; GATT ready or not yet ready. |
+| `CAMERA_STATUS_RECORDING` | `2` | Connected and actively recording. |
+
+#### Types
+
+**`camera_slot_info_t`** — snapshot of a camera slot, returned by `camera_manager_get_slot_info()`.
+
+```c
+typedef struct {
+    int        index;                       // Slot index (0-based)
+    char       name[CAMERA_NAME_LEN];       // Camera name
+    ble_addr_t mac_address;                 // BLE MAC address
+    bool       is_configured;               // false if this slot is empty
+    int        status;                      // One of the CAMERA_STATUS_* constants
+} camera_slot_info_t;
+```
+
+**`camera_state_change_fn_t`** — callback fired on slot status changes.
+
+```c
+typedef void (*camera_state_change_fn_t)(int slot, int status, void *ctx);
+```
+
+`slot` is the 0-based camera slot index; `status` is one of the `CAMERA_STATUS_*` constants.
+
+#### Functions
+
+```c
+void camera_manager_init(void);
+```
+Load all camera records from NVS into RAM and start the 2-second tick timer. Must be called after all drivers have been registered with `camera_manager_register_driver()`.
+
+---
+
+```c
+void camera_manager_register_state_change_callback(camera_state_change_fn_t cb, void *ctx);
+```
+Register a callback invoked whenever a slot's derived status changes. Call before `camera_manager_init()` so no transitions are missed during the initial slot load. Only one callback is supported.
+
+---
+
+```c
+void camera_manager_register_driver(camera_type_t type,
+                                     const camera_driver_t *driver,
+                                     void *(*create_ctx)(void));
+```
+Register a camera driver vtable and its factory function. The factory is called once per camera slot of the matching type when loading from NVS or registering a new camera. Up to 4 driver types may be registered.
+
+---
+
+```c
+int camera_manager_register_new(const ble_addr_t *addr, const char *name,
+                                  const camera_driver_t *driver, void *driver_ctx,
+                                  camera_type_t type);
+```
+Register a newly paired camera. Returns the assigned slot index, or `-1` if all slots are full. Idempotent — returns the existing slot if `addr` is already registered.
+
+---
+
+```c
+esp_err_t camera_manager_save_slot(int slot);
+```
+Persist the camera record for `slot` to NVS. Returns `ESP_OK` on success.
+
+---
+
+```c
+esp_err_t camera_manager_remove_slot(int slot);
+```
+Clear a camera slot in RAM and erase its NVS record. Returns `ESP_OK` on success.
+
+---
+
+```c
+camera_slot_info_t camera_manager_get_slot_info(int slot);
+```
+Return a snapshot of the given slot's current state. Returns a zeroed struct with `is_configured = false` for an empty or out-of-range slot.
+
+---
+
+```c
+int  camera_manager_find_by_addr(const ble_addr_t *addr);
+int  camera_manager_find_by_handle(uint16_t conn_handle);
+int  camera_manager_find_free_slot(void);
+```
+Lookup helpers. Return the matching slot index, or `-1` if not found.
+
+---
+
+```c
+int  camera_manager_remembered_count(void);
+int  camera_manager_connected_count(void);
+```
+Return the number of configured slots and the number with an active BLE connection, respectively.
+
+---
+
+```c
+void camera_manager_on_connected(int slot, uint16_t conn_handle);
+void camera_manager_on_disconnected(uint16_t conn_handle);
+void camera_manager_set_gatt_ready(int slot, bool ready);
+```
+Called by `gopro_ble` to update slot state on BLE lifecycle events. Each fires the state-change callback immediately.
+
+---
+
+```c
+uint16_t camera_manager_get_handle(int slot);
+bool     camera_manager_is_gatt_ready(int slot);
+void    *camera_manager_get_driver_ctx(int slot);
+```
+Slot accessors used by `gopro_ble` to route GATT operations to the correct per-camera context.
+
+---
+
+```c
+void camera_manager_set_desired_recording(bool recording);
+```
+Set the target recording state for all slots. The 2-second tick timer retries `start_recording` on any connected, GATT-ready camera that is not yet recording when `desired = true`.
+
+---
+
+```c
+int camera_manager_start_recording_all(void);
+int camera_manager_stop_recording_all(void);
+```
+Immediately dispatch a start/stop command to all connected, GATT-ready cameras. Returns the number of cameras that received the command.
+
+---
+
+```c
+bool camera_manager_is_known_addr(const ble_addr_t *addr);
+```
+Returns `true` if `addr` matches any configured slot. Used by `ble_core` as the `is_known_addr` callback to decide whether to auto-reconnect an advertising device.
+
+---
+
+### `can_manager`
+
+**Header:** `components/can_manager/include/can_manager.h`
+
+ESP-IDF v6.0 TWAI (CAN) driver wrapper. Manages the on-chip TWAI node, a FreeRTOS processing task, ISR-driven RX, periodic 5 Hz TX, and automatic bus-off recovery.
+
+> **ESP-IDF version note:** This component uses `esp_twai.h` / `esp_twai_onchip.h` from ESP-IDF v6.0. The legacy `driver/twai.h` API is not used and is deprecated in v6.0.
+
+#### Configuration macros (in `can_manager.h`)
+
+| Macro | Default | Description |
+|-------|---------|-------------|
+| `CAN_MANAGER_BITRATE_BPS` | `1000000` | Bus bitrate. |
+| `CAN_MANAGER_TX_GPIO` | `GPIO_NUM_7` | CAN TX pin. |
+| `CAN_MANAGER_RX_GPIO` | `GPIO_NUM_6` | CAN RX pin. |
+| `CAN_MANAGER_RX_QUEUE_DEPTH` | `32` | Software RX queue depth. |
+| `CAN_MANAGER_TX_QUEUE_DEPTH` | `8` | Hardware TX queue depth. |
+| `CAN_MANAGER_TASK_PRIORITY` | `5` | FreeRTOS task priority. |
+| `CAN_MANAGER_TX_INTERVAL_MS` | `200` | Camera status broadcast interval. |
+| `CAN_MANAGER_MAX_CAMERAS` | `4` | Maximum camera slots in the `0x601` frame. |
+| `CAN_ID_RC_COMMAND` | `0x600` | Frame ID for RaceCapture commands. |
+| `CAN_ID_CAM_STATUS` | `0x601` | Frame ID for camera status broadcast. |
+
+#### Types
+
+**`camera_state_t`** — camera state values encoded in `0x601` frames.
+
+```c
+typedef enum {
+    CAMERA_STATE_UNDEFINED    = 0,
+    CAMERA_STATE_DISCONNECTED = 1,
+    CAMERA_STATE_IDLE         = 2,
+    CAMERA_STATE_RECORDING    = 3,
+} camera_state_t;
+```
+
+**`can_frame_t`** — self-contained received CAN frame delivered to the raw RX callback.
+
+```c
+typedef struct {
+    uint32_t id;          // CAN identifier
+    uint8_t  data[8];     // Frame payload
+    uint8_t  data_len;    // Actual payload length (derived from DLC)
+    uint8_t  dlc;         // Raw DLC value as received
+    bool     is_extended; // true = 29-bit extended ID
+    bool     is_rtr;      // true = remote transmission request
+} can_frame_t;
+```
+
+**`can_rx_frame_cb_t`** — raw frame callback (all IDs, task context).
+
+```c
+typedef void (*can_rx_frame_cb_t)(const can_frame_t *frame, void *user_ctx);
+```
+
+**`can_logging_state_cb_t`** — callback fired when RaceCapture logging state changes.
+
+```c
+typedef void (*can_logging_state_cb_t)(bool is_logging, void *user_ctx);
+```
+
+#### Functions
+
+```c
+esp_err_t can_manager_init(void);
+```
+Initialise the TWAI node, register ISR callbacks, create the processing task, and begin the 5 Hz camera status broadcast. Returns `ESP_OK` on success. Non-fatal from `app_main` — the system continues without CAN if this fails.
+
+---
+
+```c
+esp_err_t can_manager_deinit(void);
+```
+Disable the TWAI node, delete the processing task and RX queue, and release all resources. Returns `ESP_OK` on success.
+
+---
+
+```c
+esp_err_t can_manager_register_rx_callback(can_rx_frame_cb_t cb, void *user_ctx);
+```
+Register a raw frame callback invoked for every received frame. Optional — primarily for development and bus sniffing. Returns `ESP_ERR_INVALID_ARG` if `cb` is `NULL`.
+
+---
+
+```c
+esp_err_t can_manager_register_logging_callback(can_logging_state_cb_t cb, void *user_ctx);
+```
+Register a callback fired when the RaceCapture `isLogging` value in `0x600` frames changes. The callback is only invoked on state transitions, not on every frame. Returns `ESP_ERR_INVALID_ARG` if `cb` is `NULL`.
+
+---
+
+```c
+esp_err_t can_manager_set_camera_state(uint8_t camera_idx, camera_state_t state);
+```
+Update the recorded state for camera slot `camera_idx` (0-based). The new state is included in the next `0x601` broadcast within 200 ms. Thread-safe — may be called from any task. Returns `ESP_ERR_INVALID_ARG` if `camera_idx >= CAN_MANAGER_MAX_CAMERAS` or `state` is out of range.
+
+---
+
+### `wifi_manager`
+
+**Header:** `components/wifi_manager/include/wifi_manager.h`
+
+Wi-Fi soft-AP and HTTP server. Serves the embedded web UI and all `/api/*` endpoints.
+
+#### Functions
+
+```c
+void wifi_manager_init(void);
+```
+Initialise the Wi-Fi AP interface, assign static IP `10.71.79.1`, start the DHCP server, bring up the AP (SSID `HERO-RC-XXXXXX`, open auth), and register all HTTP URI handlers. Call once from `app_main()` after `camera_manager_init()` and `ble_core_init()`.
+
+---
+
+### `camera_driver` (interface)
+
+**Header:** `components/camera_manager/include/camera_driver.h`
+
+Driver vtable interface used by `camera_manager` to control cameras without coupling to any specific protocol.
+
+#### Types
+
+**`camera_recording_status_t`**
+
+```c
+typedef enum {
+    CAMERA_RECORDING_UNKNOWN = 0,  // Status not yet known
+    CAMERA_RECORDING_IDLE,         // Connected, not recording
+    CAMERA_RECORDING_ACTIVE,       // Actively recording
+} camera_recording_status_t;
+```
+
+**`camera_type_t`**
+
+```c
+typedef enum {
+    CAMERA_TYPE_NONE      = 0,  // Unconfigured slot
+    CAMERA_TYPE_GOPRO_BLE,      // GoPro via BLE (gopro_ble component)
+} camera_type_t;
+```
+
+**`camera_driver_t`** — vtable struct.
+
+```c
+struct camera_driver {
+    esp_err_t (*start_recording)(void *ctx);
+    esp_err_t (*stop_recording)(void *ctx);
+    camera_recording_status_t (*get_recording_status)(void *ctx);
+};
+```
+
+All three function pointers receive the per-camera `ctx` allocated by the driver's factory function. `get_recording_status` must be non-blocking and return a cached value. `start_recording` and `stop_recording` dispatch commands asynchronously and return `ESP_OK` if the command was sent, or `ESP_ERR_INVALID_STATE` if the camera is not ready.
