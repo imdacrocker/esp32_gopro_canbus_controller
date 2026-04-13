@@ -241,6 +241,18 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
 
         s_connecting = false;
 
+        /* Only reconnect if this address is still known to the higher layer
+         * (e.g. it was not removed via a bond reset).  is_known_addr is
+         * implemented by camera_manager_is_known_addr() but kept here as a
+         * callback so ble_core stays camera-agnostic. */
+        if (g_ble_core_cbs.is_known_addr && !g_ble_core_cbs.is_known_addr(peer)) {
+            const uint8_t *a = peer->val;
+            ESP_LOGI(TAG, "Disconnected peer %02X:%02X:%02X:%02X:%02X:%02X is no longer "
+                     "known — skipping reconnect", a[5], a[4], a[3], a[2], a[1], a[0]);
+            start_scan();
+            break;
+        }
+
         /* Cancel any active scan — ble_gap_connect() returns BLE_HS_EBUSY
          * if a scan is already running. */
         ble_gap_disc_cancel();
