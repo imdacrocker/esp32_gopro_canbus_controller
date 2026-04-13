@@ -12,7 +12,8 @@
 #include "camera_manager.h"
 #include "ble_core.h"
 
-#define AP_CHANNEL   1
+#define AP_CHANNEL   6   /* ch.6 is the 2.4 GHz center channel; avoids HT40+
+                          * regulatory issues that ch.1 has with iOS clients */
 #define AP_MAX_CONN  4
 
 static const char *TAG = "WIFI_MGR";
@@ -333,6 +334,10 @@ void wifi_manager_init(void)
             .channel        = AP_CHANNEL,
             .max_connection = AP_MAX_CONN,
             .authmode       = WIFI_AUTH_OPEN,
+            /* Explicitly disable PMF on the open AP.  With WPA3/SAE compiled
+             * into the firmware, capability bits can bleed into beacon frames
+             * and cause iOS to attempt (and fail) a WPA3/OWE handshake. */
+            .pmf_cfg        = { .required = false },
         },
     };
     memcpy(wifi_config.ap.ssid, ap_ssid, strlen(ap_ssid));
@@ -340,6 +345,12 @@ void wifi_manager_init(void)
 
     esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
     esp_wifi_start();
+
+    /* Force HT20 (20 MHz channel width).  The ESP-IDF v6 default is HT40,
+     * which on channel 1 extends into channel 5.  Most regulatory domains
+     * disallow ch.1 HT40+, and iOS enforces this strictly — causing
+     * "unsuccessful auth/assoc, AID=0" failures during association. */
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20);
 
     ESP_LOGI(TAG, "WiFi AP started — SSID: %s  IP: 10.71.79.1", ap_ssid);
 

@@ -175,17 +175,6 @@ static void broadcast_camera_status(void)
     } else if (ret != ESP_OK) {
         ESP_LOGW(TAG, "0x601 TX failed: %s", esp_err_to_name(ret));
     }
-
-    /* DBG: log a TX heartbeat every 5 s (25 calls × 200 ms = 5 s).
-     * Shows what values are being broadcast and confirms TX is running.
-     * Remove once communication is confirmed working. */
-    static uint32_t s_tx_call_count = 0;
-    if (++s_tx_call_count % 25 == 1) {
-        ESP_LOGI(TAG, "0x601 TX heartbeat #%"PRIu32": cam=[%u %u %u %u]  ret=%s",
-                 s_tx_call_count,
-                 s_tx_buf[0], s_tx_buf[1], s_tx_buf[2], s_tx_buf[3],
-                 esp_err_to_name(ret));
-    }
 }
 
 /* ============================================================
@@ -195,12 +184,12 @@ static void broadcast_camera_status(void)
 static void can_rx_task(void *arg)
 {
     can_frame_t frame;
-    uint32_t    last_logged_errors = 0;
-    int         diag_tick = 0;  /* counts 100 ms ticks for 5 s diagnostics */
+    // uint32_t    last_logged_errors = 0;
+    // int         diag_tick = 0;  /* counts 100 ms ticks for 5 s diagnostics */
     int         tx_tick   = 0;  /* counts 100 ms ticks for 5 Hz TX */
 
     const int tx_ticks   = (int)(CAN_MANAGER_TX_INTERVAL_MS / 100U); /* = 2 */
-    const int diag_ticks = 50;                                         /* = 5 s */
+    // const int diag_ticks = 50;                                         /* = 5 s */
 
     ESP_LOGI(TAG, "Processing task started");
 
@@ -213,20 +202,20 @@ static void can_rx_task(void *arg)
             /* ---- Dispatch known protocol messages --------------------- */
             if (frame.id == CAN_ID_RC_COMMAND && !frame.is_extended) {
                 handle_rc_command(&frame);
-            } else {
-                /* DBG: log any frame we don't recognise.  Helps confirm
-                 * the bus is active and shows what else RaceCapture sends.
-                 * Remove once communication is confirmed working. */
-                ESP_LOGI(TAG, "CAN RX unknown: ID=0x%03"PRIX32"%s len=%u "
-                         "[%02X %02X %02X %02X %02X %02X %02X %02X]",
-                         frame.id,
-                         frame.is_extended ? "(ext)" : "",
-                         frame.data_len,
-                         frame.data[0], frame.data[1],
-                         frame.data[2], frame.data[3],
-                         frame.data[4], frame.data[5],
-                         frame.data[6], frame.data[7]);
-            }
+            } //else {
+            //     /* DBG: log any frame we don't recognise.  Helps confirm
+            //      * the bus is active and shows what else RaceCapture sends.
+            //      * Remove once communication is confirmed working. */
+            //     ESP_LOGI(TAG, "CAN RX unknown: ID=0x%03"PRIX32"%s len=%u "
+            //              "[%02X %02X %02X %02X %02X %02X %02X %02X]",
+            //              frame.id,
+            //              frame.is_extended ? "(ext)" : "",
+            //              frame.data_len,
+            //              frame.data[0], frame.data[1],
+            //              frame.data[2], frame.data[3],
+            //              frame.data[4], frame.data[5],
+            //              frame.data[6], frame.data[7]);
+            // }
 
             /* ---- Forward all frames to raw callback (debug/sniff) ----- */
             if (s_rx_cb) {
@@ -251,14 +240,14 @@ static void can_rx_task(void *arg)
         }
 
         /* ---- Periodic diagnostics (every 5 s) ------------------------ */
-        if (++diag_tick >= diag_ticks) {
-            diag_tick = 0;
-            uint32_t errs = s_error_count;
-            if (errs != last_logged_errors) {
-                ESP_LOGW(TAG, "CAN bus errors since boot: %" PRIu32, errs);
-                last_logged_errors = errs;
-            }
-        }
+        // if (++diag_tick >= diag_ticks) {
+        //     diag_tick = 0;
+        //     uint32_t errs = s_error_count;
+        //     if (errs != last_logged_errors) {
+        //         ESP_LOGW(TAG, "CAN bus errors since boot: %" PRIu32, errs);
+        //         last_logged_errors = errs;
+        //     }
+        // }
     }
 }
 

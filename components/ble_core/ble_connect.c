@@ -107,6 +107,15 @@ static void log_bond_count(void)
 
 static void purge_bonds_cb(struct ble_npl_event *ev)
 {
+    /* Cancel any in-flight ble_gap_connect() so the camera cannot slip in and
+     * connect between now and the bond deletion below.  ble_gap_connect_cancel()
+     * is a no-op if no connection attempt is pending.  If it does cancel one,
+     * NimBLE fires BLE_GAP_EVENT_CONNECT with a non-zero status, which our
+     * handler treats as a failure and calls reconnect_next() / start_scan()
+     * without re-entering the connect loop (camera_manager will have been
+     * cleared already by the time that event fires). */
+    ble_gap_conn_cancel();
+
     log_bond_count();
 
     s_delete_count = 0;
