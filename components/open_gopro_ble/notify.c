@@ -1,10 +1,10 @@
-#include "gopro_ble_internal.h"
+#include "open_gopro_ble_internal.h"
 
 #include <string.h>
 #include "esp_log.h"
 #include "camera_manager.h"
 
-static const char *TAG = "gopro_ble";
+static const char *TAG = "open_gopro_ble";
 
 #define GP_QUERY_GET_STATUS   0x13
 #define GP_STATUS_ID_ENCODING 0x08

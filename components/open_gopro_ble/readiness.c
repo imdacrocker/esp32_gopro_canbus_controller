@@ -1,5 +1,5 @@
 /*
- * gopro_readiness.c
+ * readiness.c — OpenGoPro BLE Readiness Polling
  *
  * Implements the OpenGoPro "Wait for Camera BLE Readiness" procedure.
  *
@@ -10,8 +10,8 @@
  * sending any other commands.
  *
  * Flow:
- *   1. gopro_readiness_start() is called by gopro_gatt.c once CCCD
- *      subscriptions are complete (replacing the direct set_gatt_ready call).
+ *   1. gopro_readiness_start() is called by gatt.c once CCCD subscriptions
+ *      are complete (replacing the direct set_gatt_ready call).
  *   2. A GetHardwareInfo command is written to GP-0072 immediately.
  *   3. A periodic 500 ms timer retries the command while the camera returns
  *      status 2 (not ready) or no response is received.
@@ -30,11 +30,11 @@
  *   esp_timer_delete() must NOT be called from within a timer callback.
  *   The timeout path therefore only calls esp_timer_stop() and clears the
  *   active flag; the handle is fully cleaned up by gopro_readiness_free()
- *   which is called from the BLE disconnect handler or the success path,
- *   both of which run outside the timer callback.
+ *   which is called from the BLE disconnect handler (pairing.c) or the
+ *   success path, both of which run outside the timer callback.
  */
 
-#include "gopro_ble_internal.h"
+#include "open_gopro_ble_internal.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -43,7 +43,7 @@
 #include "camera_manager.h"
 #include "ble_core.h"
 
-static const char *TAG = "gopro_ble";
+static const char *TAG = "open_gopro_ble";
 
 /* -------------------------------------------------------------------------
  * Constants
@@ -164,7 +164,7 @@ static void readiness_retry_cb(void *arg)
 
         /* Cannot call esp_timer_delete() from within a timer callback — only stop.
          * gopro_readiness_free() will delete the handle when called from the
-         * disconnect path (which runs outside the timer callback). */
+         * disconnect path in pairing.c (which runs outside the timer callback). */
         esp_timer_stop(ctx->timer);
         ctx->active = false;
         return;
@@ -397,7 +397,7 @@ void gopro_readiness_start(uint16_t conn_handle)
  *     Not parsed here — MTU negotiation avoids multi-fragment responses.
  *
  * Note on query responses (GP-0077): they are always short (< 32 bytes) so
- * the handle_query_response() function in gopro_notify.c implicitly handles
+ * the handle_query_response() function in notify.c implicitly handles
  * the single-byte header correctly by treating data[0] as the length and
  * data[1] as the first payload byte — which is exactly what frame_type=000
  * produces.

@@ -32,7 +32,6 @@ Known bugs:
  - Wifi and BLE are fighting each other on the chip.  This may need to be smoothed out
 
  Features:
- - Send KeepAlive every 3 seconds
  - Faster triggering of multiple cameras
 
 ---
@@ -75,11 +74,12 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
          │ driver vtable
          ▼
 ┌─────────────────┐
-│   gopro_ble     │
+│ open_gopro_ble  │
 │  (OpenGoPro     │
 │   BLE protocol, │
 │   GATT handles, │
-│   status poll)  │
+│   status poll,  │
+│   keep-alive)   │
 └────────┬────────┘
          │ BLE callbacks
          ▼
@@ -103,8 +103,8 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 1. RaceCapture sends a `0x600` CAN frame with `isLogging = 1`.
 2. `can_manager` detects the state change and calls the registered logging callback.
 3. `app_main`'s callback sets the desired recording state on `camera_manager` and immediately dispatches a start command to all GATT-ready cameras.
-4. `gopro_ble` sends the OpenGoPro `shutter start` TLV over BLE to each camera.
-5. `gopro_ble`'s status poll timer queries each camera for `encoding_active` every 5 seconds and updates the recording status in the driver context.
+4. `open_gopro_ble` sends the OpenGoPro `shutter start` TLV over BLE to each camera.
+5. `open_gopro_ble`'s status poll timer queries each camera for `encoding_active` every 5 seconds and updates the recording status in the driver context. A separate keep-alive command is sent to every connected camera every 3 seconds to prevent the camera from auto-sleeping.
 6. `camera_manager`'s tick timer (2 s) reads the recording status from each driver, fires the state-change callback, and retries the start command if a camera is still not recording.
 7. `app_main`'s state-change callback maps the internal status to a `camera_state_t` and calls `can_manager_set_camera_state()`.
 8. `can_manager` broadcasts the updated `0x601` status frame to RaceCapture at 5 Hz.
@@ -116,7 +116,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 | Component | Purpose |
 |-----------|---------|
 | `ble_core` | NimBLE stack wrapper. Owns scan, connect, encrypt, GATT write, and bond management. Camera-agnostic. |
-| `gopro_ble` | GoPro-specific BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding, BLE readiness polling). After GATT subscription the camera is polled with `GetHardwareInfo` until it reports ready before any other commands are sent. Provides a `camera_driver_t` vtable to `camera_manager`. |
+| `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding, BLE readiness polling). After GATT subscription the camera is polled with `GetHardwareInfo` until it reports ready before any other commands are sent. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
 | `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. |
 | `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` frames, broadcasts `0x601` frames at 5 Hz. Thread-safe camera state updates. |
 | `wifi_manager` | Soft-AP + HTTP server. Serves the embedded web UI and all `/api/*` endpoints. |
@@ -185,12 +185,13 @@ All user-configurable values are defined as compile-time constants in the releva
 | `CAN_ID_RC_COMMAND` | `0x600` | CAN ID for RaceCapture → ESP32 commands. |
 | `CAN_ID_CAM_STATUS` | `0x601` | CAN ID for ESP32 → RaceCapture status. |
 
-### GoPro BLE (`components/gopro_ble/include/gopro_ble.h`)
+### OpenGoPro BLE (`components/open_gopro_ble/include/open_gopro_ble.h`)
 
 | Macro | Default | Description |
 |-------|---------|-------------|
 | `GOPRO_MAX_DISCOVERED` | `10` | Maximum cameras held in the discovery list. |
 | `STATUS_POLL_INTERVAL_MS` | `5000` | Interval for querying recording status from each connected camera. |
+| `KEEP_ALIVE_INTERVAL_MS` | `3000` | Interval for sending the keep-alive command (ID `0x5B`) to each connected camera. |
 
 ### Camera slots (`components/camera_manager/include/camera_manager.h`)
 
@@ -303,13 +304,14 @@ esp32_gopro_canbus_controller/
 │   │   ├── ble_scan.c          # Scan, connect, scan event callback
 │   │   ├── ble_connect.c       # Connection event handler, encryption
 │   │   └── ble_gatt_write.c    # ATT write command helper
-│   ├── gopro_ble/              # GoPro BLE driver (OpenGoPro protocol)
-│   │   ├── include/gopro_ble.h
-│   │   │   ├── gopro_driver.c      # camera_driver_t vtable, status poll timer
-│   │   ├── gopro_gatt.c        # GATT service discovery, MTU negotiation, CCCD subscription
-│   │   ├── gopro_notify.c      # GATT notification handler (recording status)
-│   │   ├── gopro_readiness.c   # OpenGoPro BLE readiness polling (GetHardwareInfo 0x3C)
-│   │   └── gopro_pairing.c     # Connected/encrypted/disconnected callbacks
+│   ├── open_gopro_ble/         # OpenGoPro BLE driver
+│   │   ├── include/open_gopro_ble.h
+│   │   ├── control.c           # Recording commands, status poll timer (5 s), keep-alive timer (3 s)
+│   │   ├── driver.c            # camera_driver_t vtable, context alloc, discovery list, init
+│   │   ├── gatt.c              # GATT service discovery, MTU negotiation, CCCD subscription
+│   │   ├── notify.c            # GATT notification handler (recording status)
+│   │   ├── readiness.c         # OpenGoPro BLE readiness polling (GetHardwareInfo 0x3C)
+│   │   └── pairing.c           # Connected/encrypted/disconnected callbacks
 │   ├── camera_manager/         # Camera slot state machine
 │   │   ├── include/
 │   │   │   ├── camera_manager.h

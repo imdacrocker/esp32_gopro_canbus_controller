@@ -1,4 +1,4 @@
-#include "gopro_ble_internal.h"
+#include "open_gopro_ble_internal.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -6,7 +6,7 @@
 #include "camera_manager.h"
 #include "ble_core.h"
 
-static const char *TAG = "gopro_ble";
+static const char *TAG = "open_gopro_ble";
 
 void gopro_on_connected_cb(uint16_t conn_handle, const ble_addr_t *addr)
 {
@@ -35,9 +35,9 @@ void gopro_on_encrypted_cb(uint16_t conn_handle, const ble_addr_t *addr)
         char name[CAMERA_NAME_LEN];
         snprintf(name, sizeof(name), "GoPro %02X%02X", a[1], a[0]);
 
-        void *driver_ctx = gopro_ble_create_driver_ctx();
+        void *driver_ctx = open_gopro_ble_create_driver_ctx();
         slot = camera_manager_register_new(addr, name,
-                                            gopro_ble_get_driver(),
+                                            open_gopro_ble_get_driver(),
                                             driver_ctx,
                                             CAMERA_TYPE_GOPRO_BLE);
         if (slot < 0) {

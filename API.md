@@ -373,11 +373,22 @@ Send an ATT Write Without Response command. Returns `ESP_OK` on success.
 
 ---
 
-### `gopro_ble`
+### `open_gopro_ble`
 
-**Header:** `components/gopro_ble/include/gopro_ble.h`
+**Header:** `components/open_gopro_ble/include/open_gopro_ble.h`
 
-GoPro-specific BLE driver implementing the [OpenGoPro BLE 2.0](https://gopro.github.io/OpenGoPro/ble_2_0) protocol. Registers a `camera_driver_t` vtable with `camera_manager` and handles all GATT service discovery, notification parsing, and TLV command encoding.
+OpenGoPro BLE driver implementing the [OpenGoPro BLE 2.0](https://gopro.github.io/OpenGoPro/ble_2_0) protocol. Registers a `camera_driver_t` vtable with `camera_manager` and handles all GATT service discovery, notification parsing, TLV command encoding, keep-alive, and recording-status polling.
+
+#### Internal file layout
+
+| File | Responsibility |
+|------|---------------|
+| `control.c` | Camera control commands (start/stop recording), status poll timer (5 s), keep-alive timer (3 s) |
+| `driver.c` | `camera_driver_t` vtable, per-camera context allocation, discovery list, component init |
+| `gatt.c` | GATT service/characteristic discovery, MTU negotiation, CCCD subscription |
+| `pairing.c` | BLE lifecycle callbacks: connected, encrypted, disconnected |
+| `notify.c` | ATT notification routing (recording status, readiness responses) |
+| `readiness.c` | OpenGoPro BLE readiness polling — polls `GetHardwareInfo` until camera confirms ready |
 
 #### Types
 
@@ -397,12 +408,12 @@ typedef struct {
 typedef struct {
     uint16_t cmd_write;             // GP-0072: command write
     uint16_t cmd_resp_notify;       // GP-0073: command response notifications
-    uint16_t settings_write;        // GP-0074: settings write
+    uint16_t settings_write;        // GP-0074: settings write (also used for Keep Alive)
     uint16_t settings_resp_notify;  // GP-0075: settings response notifications
     uint16_t query_write;           // GP-0076: query write
     uint16_t query_resp_notify;     // GP-0077: query response notifications
-    uint16_t net_mgmt_cmd_write;    // GP-0078: network management command
-    uint16_t net_mgmt_resp_notify;  // GP-0079: network management response
+    uint16_t net_mgmt_cmd_write;    // GP-0091: network management command
+    uint16_t net_mgmt_resp_notify;  // GP-0092: network management response
     uint16_t wifi_ssid_read;        // GP-0002: Wi-Fi AP SSID
     uint16_t wifi_pass_read;        // GP-0003: Wi-Fi AP password
     uint16_t wifi_power_write;      // GP-0001: Wi-Fi AP power
@@ -410,65 +421,82 @@ typedef struct {
 } gopro_gatt_handles_t;
 ```
 
+#### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `GOPRO_MAX_DISCOVERED` | `10` | Maximum cameras held in the discovery list. |
+| `STATUS_POLL_INTERVAL_MS` | `5000` | Interval for querying recording status from each connected camera. |
+| `KEEP_ALIVE_INTERVAL_MS` | `3000` | Interval for sending the Keep Alive command to each connected camera. |
+
 #### Functions
 
 ```c
-void gopro_ble_init(void);
+void open_gopro_ble_init(void);
 ```
-Initialise the GoPro BLE component. Registers the `camera_driver_t` vtable with `camera_manager`, registers BLE event callbacks with `ble_core`, and starts the recording-status poll timer. Must be called before `camera_manager_init()` and `ble_core_init()`.
+Initialise the OpenGoPro BLE component. Registers the `camera_driver_t` vtable with `camera_manager`, registers BLE event callbacks with `ble_core`, and starts the recording-status poll timer (5 s) and keep-alive timer (3 s). Must be called before `camera_manager_init()` and `ble_core_init()`.
 
 ---
 
 ```c
-void gopro_ble_start_discovery(void);
+void open_gopro_ble_start_discovery(void);
 ```
 Clear the discovery list and start a 30-second BLE scan. Cameras are filtered by service UUID `0xFEA6` (GoPro). Safe to call from any task.
 
 ---
 
 ```c
-int gopro_ble_get_discovered(gopro_device_t *out, int max_count);
+int open_gopro_ble_get_discovered(gopro_device_t *out, int max_count);
 ```
 Copy up to `max_count` discovered cameras into `out`. Returns the number of entries written.
 
 ---
 
 ```c
-void gopro_ble_connect_by_addr(const ble_addr_t *addr);
+void open_gopro_ble_connect_by_addr(const ble_addr_t *addr);
 ```
 Initiate connection and pairing with a specific camera address. Safe to call from any task.
 
 ---
 
 ```c
-const camera_driver_t *gopro_ble_get_driver(void);
+const camera_driver_t *open_gopro_ble_get_driver(void);
 ```
 Return a pointer to the static GoPro `camera_driver_t` vtable.
 
 ---
 
 ```c
-void *gopro_ble_create_driver_ctx(void);
+void *open_gopro_ble_create_driver_ctx(void);
 ```
-Allocate and return a new, zeroed `gopro_ble_ctx_t` per-camera context. Returns `NULL` on OOM.
+Allocate and return a new, zeroed per-camera context. Returns `NULL` on OOM.
 
 ---
 
-#### BLE readiness polling (`gopro_readiness.c`)
+#### Keep-alive (`control.c`)
 
-The OpenGoPro spec requires the client to confirm the camera's BLE command stack is initialised before sending any commands — particularly important when the camera resumes from a low-power state. This is implemented internally in `gopro_readiness.c` and is not part of the public API, but the behaviour is relevant to anyone debugging connection timing.
+The OpenGoPro spec requires a Keep Alive packet to be sent every 3 seconds after a connection is established to prevent the camera from auto-sleeping. This is implemented as a global `esp_timer` in `control.c`.
+
+- **Characteristic:** GP-0074 (`settings_write` handle)
+- **Packet:** `{ 0x03, 0x5B, 0x01, 0x42 }` — TLV encoding: `[length=3][setting_id=0x5B][param_len=1][value=0x42]`
+- **Fire-and-forget:** the camera's ACK response on GP-0075 is intentionally ignored. BLE disconnect handling covers connection loss.
+- **Gating:** the timer fires every 3 seconds and iterates all camera slots. It only sends to slots where `camera_manager_is_gatt_ready()` returns true — no explicit start/stop per connection is required.
+
+#### BLE readiness polling (`readiness.c`)
+
+The OpenGoPro spec requires the client to confirm the camera's BLE command stack is initialised before sending any commands — particularly important when the camera resumes from a low-power state. This is implemented internally in `readiness.c` and is not part of the public API.
 
 **Flow:**
 
-1. When all CCCD subscriptions are complete (`gopro_gatt.c`), `gopro_readiness_start()` is called instead of setting `gatt_ready` directly.
+1. When all CCCD subscriptions are complete (`gatt.c`), `gopro_readiness_start()` is called instead of setting `gatt_ready` directly.
 2. `GetHardwareInfo` (command `0x3C` on GP-0072) is written to the camera immediately, then retried every 500 ms.
 3. The camera's `cmd_resp_notify` (GP-0073) is routed to the readiness handler *before* the `gatt_ready` guard, so responses arrive even though the slot is not yet usable.
-4. When the camera returns status `0x00` (success), `camera_manager_set_gatt_ready()` is called and the slot becomes available for normal commands.
+4. When the camera returns status `0x00` (success), `camera_manager_set_gatt_ready()` is called and the slot becomes available for normal commands. The keep-alive timer will begin sending to this slot on its next 3-second fire.
 5. If no success is received within 30 seconds (60 attempts), polling stops. The slot never becomes ready and no commands are sent to it.
 
 **GPBS fragmentation note:** `GetHardwareInfoRsp` is approximately 91 bytes. The camera sends this as multiple ATT notifications using GPBS (General Purpose Byte Stream) application-layer fragmentation, regardless of the negotiated ATT MTU. The readiness module reassembles continuation fragments before parsing the hardware info fields (model number, model name, firmware version, serial number, AP SSID, AP MAC address).
 
-**ATT MTU:** `gopro_gatt.c` negotiates the maximum ATT MTU (`BLE_ATT_MTU_MAX` = 527 in ESP-IDF v6.0) immediately before GATT service discovery. The negotiated MTU is logged at INFO level. Despite this, GPBS-level fragmentation still occurs because it is controlled by the camera firmware, not the ATT layer.
+**ATT MTU:** `gatt.c` negotiates the maximum ATT MTU (`BLE_ATT_MTU_MAX` = 527 in ESP-IDF v6.0) immediately before GATT service discovery. The negotiated MTU is logged at INFO level. Despite this, GPBS-level fragmentation still occurs because it is controlled by the camera firmware, not the ATT layer.
 
 ---
 
@@ -588,7 +616,7 @@ void camera_manager_on_connected(int slot, uint16_t conn_handle);
 void camera_manager_on_disconnected(uint16_t conn_handle);
 void camera_manager_set_gatt_ready(int slot, bool ready);
 ```
-Called by `gopro_ble` to update slot state on BLE lifecycle events. Each fires the state-change callback immediately.
+Called by `open_gopro_ble` to update slot state on BLE lifecycle events. Each fires the state-change callback immediately.
 
 ---
 
@@ -597,7 +625,7 @@ uint16_t camera_manager_get_handle(int slot);
 bool     camera_manager_is_gatt_ready(int slot);
 void    *camera_manager_get_driver_ctx(int slot);
 ```
-Slot accessors used by `gopro_ble` to route GATT operations to the correct per-camera context.
+Slot accessors used by `open_gopro_ble` to route GATT operations to the correct per-camera context.
 
 ---
 
@@ -759,7 +787,7 @@ typedef enum {
 ```c
 typedef enum {
     CAMERA_TYPE_NONE      = 0,  // Unconfigured slot
-    CAMERA_TYPE_GOPRO_BLE,      // GoPro via BLE (gopro_ble component)
+    CAMERA_TYPE_GOPRO_BLE,      // GoPro via BLE (open_gopro_ble component)
 } camera_type_t;
 ```
 

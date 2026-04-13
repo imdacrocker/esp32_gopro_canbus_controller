@@ -1,7 +1,7 @@
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "ble_core.h"
-#include "gopro_ble.h"
+#include "open_gopro_ble.h"
 #include "camera_manager.h"
 #include "wifi_manager.h"
 #include "can_manager.h"
@@ -91,7 +91,7 @@ void app_main(void)
     /* Register camera drivers BEFORE camera_manager_init() loads NVS so that
      * the driver factory is available when stored camera records are rehydrated
      * into driver contexts. */
-    gopro_ble_init();
+    open_gopro_ble_init();
 
     /* Register the camera-state → CAN bridge BEFORE camera_manager_init() so
      * that the initial slot-load notifications (if any) are not missed. */

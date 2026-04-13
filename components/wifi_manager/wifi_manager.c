@@ -8,7 +8,7 @@
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include "lwip/ip4_addr.h"
-#include "gopro_ble.h"
+#include "open_gopro_ble.h"
 #include "camera_manager.h"
 #include "ble_core.h"
 
@@ -37,7 +37,7 @@ static const httpd_uri_t root_uri = {
 /* POST /api/scan — start a 30-second discovery scan */
 static esp_err_t api_scan_handler(httpd_req_t *req)
 {
-    gopro_ble_start_discovery();
+    open_gopro_ble_start_discovery();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"scanning\"}");
     return ESP_OK;
@@ -53,7 +53,7 @@ static const httpd_uri_t api_scan_uri = {
 static esp_err_t api_cameras_handler(httpd_req_t *req)
 {
     gopro_device_t devices[GOPRO_MAX_DISCOVERED];
-    int count = gopro_ble_get_discovered(devices, GOPRO_MAX_DISCOVERED);
+    int count = open_gopro_ble_get_discovered(devices, GOPRO_MAX_DISCOVERED);
 
     /* Build JSON: [{"name":"...","addr":"XX:XX:XX:XX:XX:XX","addr_type":N,"rssi":N}, ...] */
     char buf[1024];
@@ -116,7 +116,7 @@ static esp_err_t api_pair_handler(httpd_req_t *req)
     char *t = strstr(body, "\"addr_type\":");
     addr.type = t ? (uint8_t)atoi(t + 12) : BLE_ADDR_PUBLIC;
 
-    gopro_ble_connect_by_addr(&addr);
+    open_gopro_ble_connect_by_addr(&addr);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"pairing\"}");
@@ -204,10 +204,21 @@ static const httpd_uri_t api_paired_cameras_uri = {
     .handler = api_paired_cameras_handler,
 };
 
-/* POST /api/reset-bonds — delete all stored BLE bonds */
+/* POST /api/reset-bonds — delete all stored BLE bonds and camera slots */
 static esp_err_t api_reset_bonds_handler(httpd_req_t *req)
 {
+    /* Remove every camera slot from camera_manager (RAM + NVS).
+     * Without this, the Camera Status panel still shows cameras as paired
+     * after the reset because /api/paired-cameras reads from camera_manager,
+     * not from NimBLE's bond store. */
+    for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
+        camera_manager_remove_slot(i);
+    }
+
+    /* Purge BLE bonds from NimBLE's peer-security store (NVS).
+     * This is posted asynchronously to the NimBLE event queue. */
     ble_core_purge_unknown_bonds(NULL, 0);
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"bonds cleared\"}");
     return ESP_OK;

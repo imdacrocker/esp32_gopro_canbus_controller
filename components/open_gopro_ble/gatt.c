@@ -1,4 +1,4 @@
-#include "gopro_ble_internal.h"
+#include "open_gopro_ble_internal.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -8,7 +8,7 @@
 #include "camera_manager.h"
 #include "ble_core.h"
 
-static const char *TAG = "gopro_ble";
+static const char *TAG = "open_gopro_ble";
 
 /* GoPro 128-bit UUID definitions */
 #define GP_UUID128_DECLARE(xxxx)                                           \
@@ -150,7 +150,7 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
     } else {
         /* All subscriptions done — push handles into driver context, then start
          * the OpenGoPro BLE readiness poll.  gatt_ready is NOT set here;
-         * gopro_readiness.c will call camera_manager_set_gatt_ready(slot, true)
+         * readiness.c will call camera_manager_set_gatt_ready(slot, true)
          * only after GetHardwareInfo returns status 0 (camera ready). */
         int slot = camera_manager_find_by_handle(conn_handle);
         if (slot >= 0) {
