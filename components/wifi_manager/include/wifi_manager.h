@@ -36,7 +36,7 @@ extern "C" {
  *  1. Initialises esp_netif and creates the default Wi-Fi AP interface.
  *  2. Assigns static IP 10.71.79.1/24 and starts the DHCP server.
  *  3. Configures and starts the Wi-Fi AP (SSID derived from MAC, open auth).
- *  4. Starts the ESP-IDF HTTP server and registers all /api/* URI handlers.
+ *  4. Starts the ESP-IDF HTTP server and registers all /api/ URI handlers.
  *
  * Call once from app_main() after camera_manager_init() and ble_core_init(),
  * as the HTTP handlers call into both of those components.

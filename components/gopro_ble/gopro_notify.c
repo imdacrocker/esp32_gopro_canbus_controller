@@ -70,13 +70,22 @@ void gopro_on_notify_rx_cb(uint16_t conn_handle, uint16_t attr_handle,
     int slot = camera_manager_find_by_handle(conn_handle);
     if (slot < 0) return;
 
-    if (!camera_manager_is_gatt_ready(slot)) return;
-
     gopro_ble_ctx_t *ctx = (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
     if (!ctx) return;
+
+    /* Command responses are needed during the BLE readiness poll, which runs
+     * BEFORE gatt_ready is set.  Route cmd_resp_notify first, before the
+     * gatt_ready guard below. */
+    if (attr_handle == ctx->gatt.cmd_resp_notify) {
+        gopro_readiness_handle_response(conn_handle, data, len);
+        return;
+    }
+
+    /* All other notifications are only valid once the camera is fully ready. */
+    if (!camera_manager_is_gatt_ready(slot)) return;
 
     if (attr_handle == ctx->gatt.query_resp_notify) {
         handle_query_response(slot, data, len);
     }
-    /* Future: handle cmd_resp_notify, settings_resp_notify, etc. */
+    /* Future: handle settings_resp_notify, net_mgmt_resp_notify, etc. */
 }

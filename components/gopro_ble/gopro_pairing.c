@@ -84,5 +84,9 @@ void gopro_on_disconnected_cb(uint16_t conn_handle, const ble_addr_t *addr, int 
     camera_manager_on_disconnected(conn_handle);
     free_gatt_disc_ctx(conn_handle);
 
+    /* Cancel any in-progress BLE readiness poll and release its timer.
+     * Safe to call even if no poll was active for this handle. */
+    gopro_readiness_free(conn_handle);
+
     ESP_LOGI(TAG, "Disconnected (slot %d, reason %d)", slot, reason);
 }

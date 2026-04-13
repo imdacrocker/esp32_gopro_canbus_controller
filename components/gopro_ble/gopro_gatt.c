@@ -148,19 +148,23 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
             cccd_write_cb(conn_handle, &fake_err, NULL, NULL);
         }
     } else {
-        /* All subscriptions done — push handles into driver context */
+        /* All subscriptions done — push handles into driver context, then start
+         * the OpenGoPro BLE readiness poll.  gatt_ready is NOT set here;
+         * gopro_readiness.c will call camera_manager_set_gatt_ready(slot, true)
+         * only after GetHardwareInfo returns status 0 (camera ready). */
         int slot = camera_manager_find_by_handle(conn_handle);
         if (slot >= 0) {
             void *driver_ctx = camera_manager_get_driver_ctx(slot);
             gopro_driver_set_gatt_handles(driver_ctx, &ctx->handles);
-            camera_manager_set_gatt_ready(slot, true);
-            ESP_LOGI(TAG, "GATT setup complete for slot %d (%d notification(s))",
-                     slot, ctx->notify_count);
+            ESP_LOGI(TAG, "GATT setup complete for slot %d (%d notification(s))"
+                     " — starting BLE readiness poll", slot, ctx->notify_count);
+            free_gatt_disc_ctx(conn_handle);
+            gopro_readiness_start(conn_handle);
         } else {
             ESP_LOGW(TAG, "GATT setup complete but camera slot not found (handle %d)",
                      conn_handle);
+            free_gatt_disc_ctx(conn_handle);
         }
-        free_gatt_disc_ctx(conn_handle);
     }
 
     return 0;
@@ -299,6 +303,31 @@ static int svc_disc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     return 0;
 }
 
+/* Begin service + characteristic discovery (called after MTU exchange). */
+static void begin_service_discovery(uint16_t conn_handle)
+{
+    int rc = ble_gattc_disc_all_svcs(conn_handle, svc_disc_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_disc_all_svcs failed: %d", rc);
+        free_gatt_disc_ctx(conn_handle);
+    }
+}
+
+/* MTU exchange callback — proceed to service discovery regardless of result. */
+static int mtu_exchange_cb(uint16_t conn_handle,
+                            const struct ble_gatt_error *error,
+                            uint16_t mtu, void *arg)
+{
+    if (error->status != 0) {
+        ESP_LOGW(TAG, "MTU exchange failed (handle %d status %d) — "
+                 "proceeding with default MTU", conn_handle, error->status);
+    } else {
+        ESP_LOGI(TAG, "MTU negotiated: %d bytes (handle %d)", mtu, conn_handle);
+    }
+    begin_service_discovery(conn_handle);
+    return 0;
+}
+
 void start_gatt_discovery(uint16_t conn_handle)
 {
     ESP_LOGI(TAG, "Starting GATT discovery for handle %d", conn_handle);
@@ -309,9 +338,24 @@ void start_gatt_discovery(uint16_t conn_handle)
         return;
     }
 
-    int rc = ble_gattc_disc_all_svcs(conn_handle, svc_disc_cb, NULL);
+    /* Negotiate the largest possible ATT MTU before service discovery.
+     *
+     * Why this matters for GetHardwareInfoRsp:
+     *   The response is ~88 bytes.  With the default MTU of 23 bytes only
+     *   20 bytes fit per ATT notification, so the camera fragments it into
+     *   ~5 continuation packets.  With MTU = 517 (BLE_ATT_MTU_MAX) the
+     *   entire response arrives in one notification, eliminating the need
+     *   for application-layer reassembly.
+     *
+     * ble_att_set_preferred_mtu() sets the local preferred value; the actual
+     * negotiated MTU is the minimum of both sides' preferences.  Most GoPro
+     * cameras support at least 517 bytes. */
+    ble_att_set_preferred_mtu(BLE_ATT_MTU_MAX);
+
+    int rc = ble_gattc_exchange_mtu(conn_handle, mtu_exchange_cb, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gattc_disc_all_svcs failed: %d", rc);
-        free_gatt_disc_ctx(conn_handle);
+        ESP_LOGW(TAG, "ble_gattc_exchange_mtu failed rc=%d — skipping to service discovery",
+                 rc);
+        begin_service_discovery(conn_handle);
     }
 }

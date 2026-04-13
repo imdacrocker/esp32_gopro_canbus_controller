@@ -23,3 +23,16 @@ void gopro_driver_set_gatt_handles(void *driver_ctx,
 /* GATT discovery lifecycle — defined in gopro_gatt.c, used in gopro_pairing.c */
 void start_gatt_discovery(uint16_t conn_handle);
 void free_gatt_disc_ctx(uint16_t conn_handle);
+
+/* BLE readiness polling — defined in gopro_readiness.c
+ *
+ * gopro_readiness_start()         — begin polling GetHardwareInfo after CCCD
+ *                                   subscriptions complete; gates gatt_ready.
+ * gopro_readiness_handle_response() — called by gopro_notify.c for every
+ *                                   cmd_resp_notify notification received.
+ * gopro_readiness_free()          — cancel polling and release the timer;
+ *                                   must be called on disconnect. */
+void gopro_readiness_start(uint16_t conn_handle);
+void gopro_readiness_handle_response(uint16_t conn_handle,
+                                      const uint8_t *data, uint16_t len);
+void gopro_readiness_free(uint16_t conn_handle);

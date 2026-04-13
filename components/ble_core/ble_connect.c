@@ -268,10 +268,16 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
         if (g_ble_core_cbs.on_notify_rx) {
             struct os_mbuf *om = event->notify_rx.om;
             uint16_t pkt_len  = OS_MBUF_PKTLEN(om);
-            if (pkt_len > 0 && pkt_len <= 64) {
-                uint8_t buf[64];
+            /* 512 bytes matches the maximum ATT MTU after negotiation.
+             * The previous limit of 64 bytes silently dropped long responses
+             * such as GetHardwareInfoRsp (~88 bytes). */
+            if (pkt_len > 0 && pkt_len <= 512) {
+                uint8_t buf[512];
                 os_mbuf_copydata(om, 0, pkt_len, buf);
                 g_ble_core_cbs.on_notify_rx(conn_h, attr_h, buf, pkt_len);
+            } else if (pkt_len > 512) {
+                ESP_LOGW(TAG, "notify_rx: pkt_len=%d exceeds buffer — dropped "
+                         "(conn=%d attr=0x%04x)", pkt_len, conn_h, attr_h);
             }
         }
         break;
