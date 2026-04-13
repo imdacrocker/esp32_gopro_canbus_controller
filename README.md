@@ -1,5 +1,8 @@
 # ESP32 GoPro CAN Bus Controller
 
+This project is currently in a working prrof-of-concept phase!  The project has been tested against a GoPro Hero13 black, but currently no more than that.
+
+
 An ESP32-S3 firmware that bridges GoPro cameras (controlled over BLE) with a [RaceCapture](https://autosportlabs.com/racecapture/) data logger (connected over CAN bus). When RaceCapture starts logging, all paired GoPro cameras start recording automatically. Camera connection status is broadcast back to RaceCapture in real time.
 
 A companion Wi-Fi web interface lets you pair cameras, check status, and manually trigger recording — no laptop or serial terminal required in the field.
@@ -8,6 +11,7 @@ A companion Wi-Fi web interface lets you pair cameras, check status, and manuall
 
 ## Table of Contents
 
+- [TODO](#todo)
 - [Hardware](#hardware)
 - [Architecture](#architecture)
 - [Component Overview](#component-overview)
@@ -19,6 +23,17 @@ A companion Wi-Fi web interface lets you pair cameras, check status, and manuall
 - [Troubleshooting](#troubleshooting)
 - [Project Structure](#project-structure)
 - [API Reference](#api-reference)
+
+---
+
+## TODO
+Known bugs:
+ - Clearing the camera pairing from the web interface, is not working
+ - Wifi and BLE are fighting each other on the chip.  This may need to be smoothed out
+
+ Features:
+ - Send KeepAlive every 3 seconds
+ - Faster triggering of multiple cameras
 
 ---
 
@@ -101,7 +116,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 | Component | Purpose |
 |-----------|---------|
 | `ble_core` | NimBLE stack wrapper. Owns scan, connect, encrypt, GATT write, and bond management. Camera-agnostic. |
-| `gopro_ble` | GoPro-specific BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). Provides a `camera_driver_t` vtable to `camera_manager`. |
+| `gopro_ble` | GoPro-specific BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding, BLE readiness polling). After GATT subscription the camera is polled with `GetHardwareInfo` until it reports ready before any other commands are sent. Provides a `camera_driver_t` vtable to `camera_manager`. |
 | `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. |
 | `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` frames, broadcasts `0x601` frames at 5 Hz. Thread-safe camera state updates. |
 | `wifi_manager` | Soft-AP + HTTP server. Serves the embedded web UI and all `/api/*` endpoints. |
@@ -199,7 +214,7 @@ Cameras are paired via the built-in web interface. You do **not** need to use th
 4. Power on the GoPro camera(s) and ensure Bluetooth is enabled on the camera.
 5. On the web page, tap **Scan for Cameras**. A 30-second scan will begin.
 6. When your camera appears in the list, tap **Pair**. The controller will initiate a BLE connection and complete the pairing process.
-7. Once paired, the camera appears in the **Camera Status** section. The status will change to **Connected** once the BLE link and GATT setup complete (~5–10 seconds).
+7. Once paired, the camera appears in the **Camera Status** section. The status will change to **Connected** once the BLE link, GATT setup, and BLE readiness handshake complete (~5–10 seconds). During this time the firmware polls the camera with `GetHardwareInfo` until the camera confirms it is ready to accept commands.
 
 Paired cameras are stored in NVS and reconnect automatically every time the controller boots — you only need to pair once.
 
@@ -290,9 +305,10 @@ esp32_gopro_canbus_controller/
 │   │   └── ble_gatt_write.c    # ATT write command helper
 │   ├── gopro_ble/              # GoPro BLE driver (OpenGoPro protocol)
 │   │   ├── include/gopro_ble.h
-│   │   ├── gopro_driver.c      # camera_driver_t vtable, status poll timer
-│   │   ├── gopro_gatt.c        # GATT service discovery, CCCD subscription
+│   │   │   ├── gopro_driver.c      # camera_driver_t vtable, status poll timer
+│   │   ├── gopro_gatt.c        # GATT service discovery, MTU negotiation, CCCD subscription
 │   │   ├── gopro_notify.c      # GATT notification handler (recording status)
+│   │   ├── gopro_readiness.c   # OpenGoPro BLE readiness polling (GetHardwareInfo 0x3C)
 │   │   └── gopro_pairing.c     # Connected/encrypted/disconnected callbacks
 │   ├── camera_manager/         # Camera slot state machine
 │   │   ├── include/
@@ -310,21 +326,4 @@ esp32_gopro_canbus_controller/
 ├── CMakeLists.txt
 ├── partitions.csv
 ├── sdkconfig.defaults
-└── API.md                      # Full API reference (HTTP, CAN, C components)
-```
-
----
-
-## API Reference
-
-See **[API.md](API.md)** for complete documentation of:
-
-- HTTP REST API served by the Wi-Fi management interface.
-- CAN bus protocol (frame formats, enumerations, RaceCapture mapping).
-- C public API for each component (`ble_core`, `gopro_ble`, `camera_manager`, `can_manager`, `wifi_manager`).
-
----
-
-## License
-
-See [LICENSE](LICENSE).
+└─�

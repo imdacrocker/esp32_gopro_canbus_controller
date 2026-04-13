@@ -454,6 +454,24 @@ Allocate and return a new, zeroed `gopro_ble_ctx_t` per-camera context. Returns 
 
 ---
 
+#### BLE readiness polling (`gopro_readiness.c`)
+
+The OpenGoPro spec requires the client to confirm the camera's BLE command stack is initialised before sending any commands — particularly important when the camera resumes from a low-power state. This is implemented internally in `gopro_readiness.c` and is not part of the public API, but the behaviour is relevant to anyone debugging connection timing.
+
+**Flow:**
+
+1. When all CCCD subscriptions are complete (`gopro_gatt.c`), `gopro_readiness_start()` is called instead of setting `gatt_ready` directly.
+2. `GetHardwareInfo` (command `0x3C` on GP-0072) is written to the camera immediately, then retried every 500 ms.
+3. The camera's `cmd_resp_notify` (GP-0073) is routed to the readiness handler *before* the `gatt_ready` guard, so responses arrive even though the slot is not yet usable.
+4. When the camera returns status `0x00` (success), `camera_manager_set_gatt_ready()` is called and the slot becomes available for normal commands.
+5. If no success is received within 30 seconds (60 attempts), polling stops. The slot never becomes ready and no commands are sent to it.
+
+**GPBS fragmentation note:** `GetHardwareInfoRsp` is approximately 91 bytes. The camera sends this as multiple ATT notifications using GPBS (General Purpose Byte Stream) application-layer fragmentation, regardless of the negotiated ATT MTU. The readiness module reassembles continuation fragments before parsing the hardware info fields (model number, model name, firmware version, serial number, AP SSID, AP MAC address).
+
+**ATT MTU:** `gopro_gatt.c` negotiates the maximum ATT MTU (`BLE_ATT_MTU_MAX` = 527 in ESP-IDF v6.0) immediately before GATT service discovery. The negotiated MTU is logged at INFO level. Despite this, GPBS-level fragmentation still occurs because it is controlled by the camera firmware, not the ATT layer.
+
+---
+
 ### `camera_manager`
 
 **Header:** `components/camera_manager/include/camera_manager.h`
