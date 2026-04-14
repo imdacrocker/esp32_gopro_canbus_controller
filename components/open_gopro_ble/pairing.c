@@ -45,6 +45,13 @@ void gopro_on_encrypted_cb(uint16_t conn_handle, const ble_addr_t *addr)
             return;
         }
 
+        /* Mark as first-time pairing so control_send_pairing_complete() fires
+         * later in the GATT flow (after char discovery, before CCCD setup). */
+        gopro_ble_ctx_t *new_ctx = (gopro_ble_ctx_t *)driver_ctx;
+        if (new_ctx) {
+            new_ctx->is_first_pairing = true;
+        }
+
         camera_manager_save_slot(slot);
         ESP_LOGI(TAG, "Registered new camera in slot %d (%s)", slot, name);
     }
@@ -84,9 +91,8 @@ void gopro_on_disconnected_cb(uint16_t conn_handle, const ble_addr_t *addr, int 
     camera_manager_on_disconnected(conn_handle);
     free_gatt_disc_ctx(conn_handle);
 
-    /* Cancel any in-progress BLE readiness poll and release its timer.
-     * Safe to call even if no poll was active for this handle. */
-    gopro_readiness_free(conn_handle);
+    /* Release any in-progress query reassembly context for this handle. */
+    gopro_query_free(conn_handle);
 
     ESP_LOGI(TAG, "Disconnected (slot %d, reason %d)", slot, reason);
 }

@@ -73,19 +73,53 @@ void gopro_on_notify_rx_cb(uint16_t conn_handle, uint16_t attr_handle,
     gopro_ble_ctx_t *ctx = (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
     if (!ctx) return;
 
-    /* Command responses are needed during the BLE readiness poll, which runs
-     * BEFORE gatt_ready is set.  Route cmd_resp_notify first, before the
-     * gatt_ready guard below. */
-    if (attr_handle == ctx->gatt.cmd_resp_notify) {
-        gopro_readiness_handle_response(conn_handle, data, len);
+    /* Network Management responses (GP-0092) arrive both during and after
+     * pairing.  Log the raw bytes unconditionally so we can see the
+     * ResponseGeneric result code for RequestPairingFinish.
+     *
+     * Expected GPBS layout for a short response:
+     *   Byte 0: GPBS header (length)
+     *   Byte 1: 0x03  Feature ID (Network Management)
+     *   Byte 2: 0x81  Action ID (0x01 | 0x80 response bit)
+     *   Byte 3: 0x08  Protobuf field 1, wiretype 0 (varint)
+     *   Byte 4: 0x00  EnumResultGeneric.RESULT_SUCCESS (0 = ok, 1 = error) */
+    if (attr_handle == ctx->gatt.net_mgmt_resp_notify) {
+        ESP_LOGI(TAG, "slot %d: net_mgmt_resp rx %d bytes:", slot, len);
+        ESP_LOG_BUFFER_HEX(TAG, data, len < 32 ? (int)len : 32);
+
+        /* Minimal ResponseGeneric parse — log the result code if present.
+         * GPBS single-packet format: [len][feat_id][act_id][protobuf...]
+         * Protobuf {result: N}: tag=0x08, value N (0=SUCCESS, 1+=ERROR) */
+        if (len >= 5 && (data[0] & 0xE0) == 0x00) {
+            uint8_t feat_id = data[1];
+            uint8_t act_id  = data[2];
+            uint8_t pb_tag  = data[3];
+            uint8_t result  = data[4];
+            if (feat_id == 0x03 && act_id == 0x81 && pb_tag == 0x08) {
+                if (result == 0x00) {
+                    ESP_LOGI(TAG, "slot %d: RequestPairingFinish → SUCCESS "
+                             "(pairing screen should dismiss)", slot);
+                } else {
+                    ESP_LOGW(TAG, "slot %d: RequestPairingFinish → ERROR "
+                             "result=0x%02x", slot, result);
+                }
+            }
+        }
         return;
     }
 
     /* All other notifications are only valid once the camera is fully ready. */
     if (!camera_manager_is_gatt_ready(slot)) return;
 
+    if (attr_handle == ctx->gatt.cmd_resp_notify) {
+        /* Route command responses to the query handler (e.g. GetHardwareInfo). */
+        gopro_query_handle_cmd_response(conn_handle, data, len);
+        return;
+    }
+
     if (attr_handle == ctx->gatt.query_resp_notify) {
         handle_query_response(slot, data, len);
+        return;
     }
-    /* Future: handle settings_resp_notify, net_mgmt_resp_notify, etc. */
+    /* Future: handle settings_resp_notify, etc. */
 }

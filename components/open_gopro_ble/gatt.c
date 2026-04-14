@@ -148,18 +148,30 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
             cccd_write_cb(conn_handle, &fake_err, NULL, NULL);
         }
     } else {
-        /* All subscriptions done — push handles into driver context, then start
-         * the OpenGoPro BLE readiness poll.  gatt_ready is NOT set here;
-         * readiness.c will call camera_manager_set_gatt_ready(slot, true)
-         * only after GetHardwareInfo returns status 0 (camera ready). */
+        /* All subscriptions done — push handles into driver context, mark the
+         * camera ready, and (on first-time pairing) send RequestPairingFinish
+         * to dismiss the camera's pairing screen.
+         *
+         * gatt_ready is set immediately here.  The C# OpenGoPro reference
+         * implementation does the same: it considers the camera usable as soon
+         * as CCCD setup completes.  No GetHardwareInfo readiness poll is needed
+         * during connect; call gopro_query_send_hw_info() on demand instead. */
         int slot = camera_manager_find_by_handle(conn_handle);
         if (slot >= 0) {
             void *driver_ctx = camera_manager_get_driver_ctx(slot);
             gopro_driver_set_gatt_handles(driver_ctx, &ctx->handles);
-            ESP_LOGI(TAG, "GATT setup complete for slot %d (%d notification(s))"
-                     " — starting BLE readiness poll", slot, ctx->notify_count);
+
+            gopro_ble_ctx_t *gctx = (gopro_ble_ctx_t *)driver_ctx;
+            if (gctx && gctx->is_first_pairing) {
+                ESP_LOGI(TAG, "slot %d: sending RequestPairingFinish "
+                         "(all CCCDs subscribed — response will be visible)", slot);
+                control_send_pairing_complete(conn_handle);
+            }
+
             free_gatt_disc_ctx(conn_handle);
-            gopro_readiness_start(conn_handle);
+            camera_manager_set_gatt_ready(slot, true);
+            ESP_LOGI(TAG, "GATT setup complete — slot %d ready (%d notification(s))",
+                     slot, ctx->notify_count);
         } else {
             ESP_LOGW(TAG, "GATT setup complete but camera slot not found (handle %d)",
                      conn_handle);

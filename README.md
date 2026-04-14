@@ -116,7 +116,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 | Component | Purpose |
 |-----------|---------|
 | `ble_core` | NimBLE stack wrapper. Owns scan, connect, encrypt, GATT write, and bond management. Camera-agnostic. |
-| `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding, BLE readiness polling). After GATT subscription the camera is polled with `GetHardwareInfo` until it reports ready before any other commands are sent. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
+| `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). The camera is considered ready as soon as CCCD subscriptions complete — no polling loop is needed. `GetHardwareInfo` is available on demand via `gopro_query_send_hw_info()`. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
 | `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. |
 | `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` frames, broadcasts `0x601` frames at 5 Hz. Thread-safe camera state updates. |
 | `wifi_manager` | Soft-AP + HTTP server. Serves the embedded web UI and all `/api/*` endpoints. |
@@ -215,7 +215,7 @@ Cameras are paired via the built-in web interface. You do **not** need to use th
 4. Power on the GoPro camera(s) and ensure Bluetooth is enabled on the camera.
 5. On the web page, tap **Scan for Cameras**. A 30-second scan will begin.
 6. When your camera appears in the list, tap **Pair**. The controller will initiate a BLE connection and complete the pairing process.
-7. Once paired, the camera appears in the **Camera Status** section. The status will change to **Connected** once the BLE link, GATT setup, and BLE readiness handshake complete (~5–10 seconds). During this time the firmware polls the camera with `GetHardwareInfo` until the camera confirms it is ready to accept commands.
+7. Once paired, the camera appears in the **Camera Status** section. The status will change to **Connected** once the BLE link and GATT setup complete (typically a few seconds).
 
 Paired cameras are stored in NVS and reconnect automatically every time the controller boots — you only need to pair once.
 
@@ -309,8 +309,8 @@ esp32_gopro_canbus_controller/
 │   │   ├── control.c           # Recording commands, status poll timer (5 s), keep-alive timer (3 s)
 │   │   ├── driver.c            # camera_driver_t vtable, context alloc, discovery list, init
 │   │   ├── gatt.c              # GATT service discovery, MTU negotiation, CCCD subscription
-│   │   ├── notify.c            # GATT notification handler (recording status)
-│   │   ├── readiness.c         # OpenGoPro BLE readiness polling (GetHardwareInfo 0x3C)
+│   │   ├── notify.c            # GATT notification handler (recording status, command responses)
+│   │   ├── query.c             # On-demand query commands (GetHardwareInfo 0x3C, GPBS reassembly)
 │   │   └── pairing.c           # Connected/encrypted/disconnected callbacks
 │   ├── camera_manager/         # Camera slot state machine
 │   │   ├── include/

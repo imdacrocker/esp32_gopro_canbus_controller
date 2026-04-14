@@ -20,11 +20,10 @@
  *
  *     Per the OpenGoPro specification the best practice is to start sending
  *     Keep Alive messages every 3.0 seconds after a connection is established.
- *     We start after gatt_ready — i.e. after the readiness poll confirms the
- *     camera's BLE stack is fully initialised — because:
- *       1. The camera is already awake responding to the readiness poll.
- *       2. We have confirmed that settings_write is a valid GATT handle.
- *       3. Using a single global timer that checks gatt_ready is simpler and
+ *     We start after gatt_ready — i.e. after CCCD subscriptions complete —
+ *     because:
+ *       1. We have confirmed that settings_write is a valid GATT handle.
+ *       2. Using a single global timer that checks gatt_ready is simpler and
  *          mirrors the existing status-poll pattern.
  *
  *     The response from the camera arrives on GP-0075 (Settings Response) and
@@ -90,6 +89,55 @@ camera_recording_status_t control_get_recording_status(void *ctx)
         return CAMERA_RECORDING_UNKNOWN;
     }
     return gctx->recording_status;
+}
+
+/* -------------------------------------------------------------------------
+ * Pairing complete — sent once after initial pairing to dismiss the camera UI
+ * ------------------------------------------------------------------------- */
+
+/*
+ * RequestPairingFinish packet — written to GP-0091 (net_mgmt_cmd_write).
+ *
+ * GPBS framing for a short Network Management command:
+ *   Byte 0: 0x04  — GPBS single-packet length (4 bytes follow)
+ *   Byte 1: 0x03  — Feature ID (Network Management)
+ *   Byte 2: 0x01  — Action ID  (Set Pairing State / RequestPairingFinish)
+ *
+ * Protobuf payload for RequestPairingFinish { pairing_state = COMPLETED(2) }:
+ *   Byte 3: 0x08  — field 1, wiretype 0 (varint)
+ *   Byte 4: 0x02  — EnumPairingState.PAIRING_STATE_COMPLETED
+ *
+ * The response arrives on GP-0092 (net_mgmt_resp_notify) as ResponseGeneric.
+ * Because this is sent before CCCD subscriptions are in place, the response
+ * notification is not received — this is intentional (fire-and-forget).
+ */
+static const uint8_t k_pairing_complete_pkt[] = { 0x04, 0x03, 0x01, 0x08, 0x02 };
+
+void control_send_pairing_complete(uint16_t conn_handle)
+{
+    int slot = camera_manager_find_by_handle(conn_handle);
+    if (slot < 0) {
+        ESP_LOGW(TAG, "pairing_complete: no slot for handle %d", conn_handle);
+        return;
+    }
+
+    gopro_ble_ctx_t *ctx = (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
+    if (!ctx || ctx->gatt.net_mgmt_cmd_write == 0) {
+        ESP_LOGW(TAG, "pairing_complete: net_mgmt_cmd_write not available for slot %d", slot);
+        return;
+    }
+
+    esp_err_t err = ble_core_gatt_write(conn_handle, ctx->gatt.net_mgmt_cmd_write,
+                                        k_pairing_complete_pkt,
+                                        sizeof(k_pairing_complete_pkt));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "slot %d: RequestPairingFinish write failed (%s)",
+                 slot, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "slot %d: RequestPairingFinish sent (pairing screen dismissed)", slot);
+    }
+
+    ctx->is_first_pairing = false;
 }
 
 /* -------------------------------------------------------------------------

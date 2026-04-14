@@ -387,8 +387,8 @@ OpenGoPro BLE driver implementing the [OpenGoPro BLE 2.0](https://gopro.github.i
 | `driver.c` | `camera_driver_t` vtable, per-camera context allocation, discovery list, component init |
 | `gatt.c` | GATT service/characteristic discovery, MTU negotiation, CCCD subscription |
 | `pairing.c` | BLE lifecycle callbacks: connected, encrypted, disconnected |
-| `notify.c` | ATT notification routing (recording status, readiness responses) |
-| `readiness.c` | OpenGoPro BLE readiness polling — polls `GetHardwareInfo` until camera confirms ready |
+| `notify.c` | ATT notification routing (recording status, command responses) |
+| `query.c` | On-demand query commands — `GetHardwareInfo` (0x3C) send + GPBS-aware response parsing |
 
 #### Types
 
@@ -482,21 +482,19 @@ The OpenGoPro spec requires a Keep Alive packet to be sent every 3 seconds after
 - **Fire-and-forget:** the camera's ACK response on GP-0075 is intentionally ignored. BLE disconnect handling covers connection loss.
 - **Gating:** the timer fires every 3 seconds and iterates all camera slots. It only sends to slots where `camera_manager_is_gatt_ready()` returns true — no explicit start/stop per connection is required.
 
-#### BLE readiness polling (`readiness.c`)
+#### On-demand queries (`query.c`)
 
-The OpenGoPro spec requires the client to confirm the camera's BLE command stack is initialised before sending any commands — particularly important when the camera resumes from a low-power state. This is implemented internally in `readiness.c` and is not part of the public API.
+Hardware info and other query commands can be issued at any time after the slot is `gatt_ready`. This is implemented in `query.c` and is not part of the public API.
 
-**Flow:**
+**`GetHardwareInfo` (cmd 0x3C)**
 
-1. When all CCCD subscriptions are complete (`gatt.c`), `gopro_readiness_start()` is called instead of setting `gatt_ready` directly.
-2. `GetHardwareInfo` (command `0x3C` on GP-0072) is written to the camera immediately, then retried every 500 ms.
-3. The camera's `cmd_resp_notify` (GP-0073) is routed to the readiness handler *before* the `gatt_ready` guard, so responses arrive even though the slot is not yet usable.
-4. When the camera returns status `0x00` (success), `camera_manager_set_gatt_ready()` is called and the slot becomes available for normal commands. The keep-alive timer will begin sending to this slot on its next 3-second fire.
-5. If no success is received within 30 seconds (60 attempts), polling stops. The slot never becomes ready and no commands are sent to it.
+Call `gopro_query_send_hw_info(conn_handle)` to request the camera's hardware details. The response arrives asynchronously on `cmd_resp_notify` (GP-0073) and is routed to `gopro_query_handle_cmd_response()` by `notify.c`. On success the parsed fields (model number, model name, firmware version, serial number, AP SSID, AP MAC address) are logged at INFO level.
 
-**GPBS fragmentation note:** `GetHardwareInfoRsp` is approximately 91 bytes. The camera sends this as multiple ATT notifications using GPBS (General Purpose Byte Stream) application-layer fragmentation, regardless of the negotiated ATT MTU. The readiness module reassembles continuation fragments before parsing the hardware info fields (model number, model name, firmware version, serial number, AP SSID, AP MAC address).
+**GPBS fragmentation:** `GetHardwareInfoRsp` is approximately 91 bytes. The camera sends this as multiple ATT notifications using GPBS (General Purpose Byte Stream) application-layer fragmentation, regardless of the negotiated ATT MTU. `query.c` handles GPBS reassembly transparently via a per-connection context buffer.
 
-**ATT MTU:** `gatt.c` negotiates the maximum ATT MTU (`BLE_ATT_MTU_MAX` = 527 in ESP-IDF v6.0) immediately before GATT service discovery. The negotiated MTU is logged at INFO level. Despite this, GPBS-level fragmentation still occurs because it is controlled by the camera firmware, not the ATT layer.
+**`gatt_ready` timing:** `camera_manager_set_gatt_ready()` is called immediately when all CCCD subscriptions complete (`gatt.c`). This matches the approach used in the OpenGoPro C# reference implementation — no polling loop is required. The keep-alive and status-poll timers begin sending to the slot on their next scheduled fire.
+
+**ATT MTU:** `gatt.c` negotiates the maximum ATT MTU (`BLE_ATT_MTU_MAX` = 527 in ESP-IDF v6.0) immediately before GATT service discovery. The negotiated MTU is logged at INFO level. GPBS-level fragmentation still occurs because it is controlled by the camera firmware, not the ATT layer.
 
 ---
 

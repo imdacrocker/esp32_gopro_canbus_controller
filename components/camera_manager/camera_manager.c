@@ -121,10 +121,26 @@ static void load_slot(int slot)
     camera_nv_record_t rec;
     size_t len = sizeof(rec);
     err = nvs_get_blob(handle, NVS_CAMERA_KEY, &rec, &len);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* Key was erased by camera_manager_remove_slot() or never written.
+         * The namespace exists because IDF cannot delete namespaces, but the
+         * slot is genuinely empty — not an error worth warning about. */
+        nvs_close(handle);
+        return;
+    }
+
     nvs_close(handle);
 
-    if (err != ESP_OK || len != sizeof(rec)) {
-        ESP_LOGW(TAG, "slot %d: blob missing or wrong size", slot);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "slot %d: nvs_get_blob failed (%s)", slot, esp_err_to_name(err));
+        return;
+    }
+
+    if (len != sizeof(rec)) {
+        ESP_LOGW(TAG, "slot %d: blob size mismatch (stored %zu bytes, expected %zu) — "
+                 "schema changed or stale data; slot ignored, re-pair required",
+                 slot, len, sizeof(rec));
         return;
     }
 
