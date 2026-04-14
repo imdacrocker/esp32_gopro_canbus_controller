@@ -181,14 +181,6 @@ All user-configurable values are defined as compile-time constants in the releva
 
 ---
 
-## Camera Setup
-
-- Connect to the ESP32 via wifi.  The SSID will be HERO-RC-XXXXXX (with the last 6 being your ESP32's MAC address)
-Note:  The Wifi connection seems to be colliding with the BLE at the moment.  You may have to refresh your settings and try multiple times to connect
-- Open a web browser and go to 10.71.79.1
-- Select Scan 
----
-
 ### CAN bus (`components/can_manager/include/can_manager.h`)
 
 | Macro | Default | Description |
@@ -258,6 +250,7 @@ Incorrect termination causes bus errors and silent communication failures. Alway
 
 ### RaceCapture Configuration
 
+
 #### Receiving camera status (0x601)
 
 Add a **Direct CAN Mapping** channel for each camera slot:
@@ -274,11 +267,15 @@ Add a **Direct CAN Mapping** channel for each camera slot:
 
 Camera state values: `0` = undefined, `1` = disconnected, `2` = idle, `3` = recording.
 
+A CAN preset will be available soon
+
 #### Sending logging state (0x600)
 
-Configure a RaceCapture Lua script to transmit a CAN frame on ID `0x600` (decimal 1536) containing `isLogging` (0 or 1) in byte 0 at approximately 10 Hz.
+To broadcast the logging status on the RaceCapture, you will need to use Lua.  You can insert this line anywhere in your onTick function:
 
-> **Lua note:** RaceCapture Lua arrays are 1-indexed. `data[1]` corresponds to CAN byte offset 0.
+```bash
+txCAN(0, 0x600, 0, {isLogging(), 0, 0, 0, 0, 0, 0, 0})
+```
 
 ---
 

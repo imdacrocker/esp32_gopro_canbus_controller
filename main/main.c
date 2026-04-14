@@ -102,6 +102,15 @@ void app_main(void)
 
     wifi_manager_init();
 
+    /* Wait for the AP beacon to be on air before starting BLE.
+     * The ESP32 shares one antenna between WiFi and BLE.  If BLE begins
+     * its connection/reconnection procedures (which are radio-intensive)
+     * before the AP has finished its bring-up sequence, it can starve the
+     * WiFi coexistence scheduler and leave the AP in a non-broadcasting
+     * state.  Blocking here until WIFI_EVENT_AP_START is confirmed gives
+     * WiFi the clear window it needs. */
+    wifi_manager_wait_for_ap_ready();
+
     /* Start the NimBLE stack.  on_sync fires once the stack is ready and
      * kicks off the boot reconnect chain. */
     ble_core_init();

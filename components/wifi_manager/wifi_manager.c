@@ -8,19 +8,71 @@
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include "lwip/ip4_addr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "open_gopro_ble.h"
 #include "camera_manager.h"
 #include "ble_core.h"
 
-#define AP_CHANNEL   6   /* ch.6 is the 2.4 GHz center channel; avoids HT40+
-                          * regulatory issues that ch.1 has with iOS clients */
-#define AP_MAX_CONN  4
+#define AP_CHANNEL          6   /* ch.6 is the 2.4 GHz center channel; avoids HT40+
+                                 * regulatory issues that ch.1 has with iOS clients */
+#define AP_MAX_CONN         4
+#define AP_READY_TIMEOUT_MS 5000  /* Max ms to wait for WIFI_EVENT_AP_START */
+#define AP_STARTED_BIT      BIT0
 
 static const char *TAG = "WIFI_MGR";
+
+/* Event group used to signal that the AP has successfully started.
+ * wifi_manager_wait_for_ap_ready() blocks on this bit so that callers
+ * (e.g. ble_core_init) do not start radio-intensive work until the AP
+ * beacon is on air. */
+static EventGroupHandle_t s_ap_event_group = NULL;
 
 /* Symbols injected by the build system from www/index.html */
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[]   asm("_binary_index_html_end");
+
+/* ============================================================
+ * WiFi Event Handler
+ * ============================================================ */
+
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    if (id == WIFI_EVENT_AP_START) {
+        /* AP is on air — safe to apply bandwidth config now.
+         * Calling esp_wifi_set_bandwidth() before this event can disrupt
+         * the AP bring-up sequence and leave it in a non-broadcasting state. */
+        esp_err_t err = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_set_bandwidth failed: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "AP started — HT20 bandwidth applied");
+        }
+        /* Unblock wifi_manager_wait_for_ap_ready() */
+        xEventGroupSetBits(s_ap_event_group, AP_STARTED_BIT);
+
+    } else if (id == WIFI_EVENT_AP_STOP) {
+        /* AP went down unexpectedly (coexistence scheduling, memory pressure, etc.).
+         * Clear the ready bit and restart.  Without this, the AP simply stays
+         * dark and the iPhone shows "network unavailable" indefinitely. */
+        ESP_LOGW(TAG, "AP stopped unexpectedly — restarting");
+        xEventGroupClearBits(s_ap_event_group, AP_STARTED_BIT);
+        esp_wifi_start();
+
+    } else if (id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *ev = (wifi_event_ap_staconnected_t *)data;
+        ESP_LOGI(TAG, "Station connected — AID=%d", ev->aid);
+
+    } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *ev = (wifi_event_ap_stadisconnected_t *)data;
+        ESP_LOGI(TAG, "Station disconnected — AID=%d reason=%d", ev->aid, ev->reason);
+    }
+}
+
+/* ============================================================
+ * HTTP Handlers
+ * ============================================================ */
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
@@ -281,6 +333,10 @@ static const httpd_uri_t api_shutter_uri = {
     .handler = api_shutter_handler,
 };
 
+/* ============================================================
+ * HTTP Server
+ * ============================================================ */
+
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -301,10 +357,17 @@ static void start_http_server(void)
     }
 }
 
+/* ============================================================
+ * Public API
+ * ============================================================ */
+
 void wifi_manager_init(void)
 {
-    esp_netif_init();
-    esp_event_loop_create_default();
+    s_ap_event_group = xEventGroupCreate();
+    configASSERT(s_ap_event_group);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
 
     /* Set a custom IP — must be done before esp_wifi_start() */
@@ -313,21 +376,40 @@ void wifi_manager_init(void)
     IP4_ADDR((ip4_addr_t *)&ip_info.ip,      10,  71,  79,   1);
     IP4_ADDR((ip4_addr_t *)&ip_info.gw,      10,  71,  79,   1);
     IP4_ADDR((ip4_addr_t *)&ip_info.netmask, 255, 255, 255,  0);
-    esp_netif_dhcps_stop(ap_netif);
-    esp_netif_set_ip_info(ap_netif, &ip_info);
-    esp_netif_dhcps_start(ap_netif);
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    esp_wifi_set_mode(WIFI_MODE_AP);
+    /* Register event handler BEFORE esp_wifi_start() so no events are missed.
+     * esp_wifi_set_bandwidth() is intentionally NOT called here — it is called
+     * from the WIFI_EVENT_AP_START handler.  Calling it before AP_START can
+     * silently disrupt the bring-up sequence and leave the AP dark. */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
 
-    /* Build SSID from last 3 bytes of AP MAC address */
-    uint8_t mac[6];
-    esp_wifi_get_mac(WIFI_IF_AP, mac);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+
+    /* Build SSID from last 3 bytes of AP MAC address.
+     * esp_wifi_get_mac() is safe to call after esp_wifi_init() + set_mode().
+     * Validate the result — an all-zero suffix means the read failed and we
+     * fall back to a static name rather than broadcasting a garbage SSID. */
+    uint8_t mac[6] = {0};
+    esp_err_t mac_err = esp_wifi_get_mac(WIFI_IF_AP, mac);
     char ap_ssid[16];
-    snprintf(ap_ssid, sizeof(ap_ssid), "HERO-RC-%02X%02X%02X",
-             mac[3], mac[4], mac[5]);
+    if (mac_err != ESP_OK || (mac[3] == 0 && mac[4] == 0 && mac[5] == 0)) {
+        ESP_LOGW(TAG, "MAC read failed (%s) — using fallback SSID",
+                 esp_err_to_name(mac_err));
+        snprintf(ap_ssid, sizeof(ap_ssid), "HERO-RC-000000");
+    } else {
+        snprintf(ap_ssid, sizeof(ap_ssid), "HERO-RC-%02X%02X%02X",
+                 mac[3], mac[4], mac[5]);
+    }
 
     wifi_config_t wifi_config = {
         .ap = {
@@ -343,16 +425,36 @@ void wifi_manager_init(void)
     memcpy(wifi_config.ap.ssid, ap_ssid, strlen(ap_ssid));
     wifi_config.ap.ssid_len = strlen(ap_ssid);
 
-    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
 
-    /* Force HT20 (20 MHz channel width).  The ESP-IDF v6 default is HT40,
-     * which on channel 1 extends into channel 5.  Most regulatory domains
-     * disallow ch.1 HT40+, and iOS enforces this strictly — causing
-     * "unsuccessful auth/assoc, AID=0" failures during association. */
-    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20);
+    /* Start the AP.  The event handler will fire WIFI_EVENT_AP_START once the
+     * beacon is on air, apply HT20 bandwidth, and set AP_STARTED_BIT. */
+    ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "WiFi AP started — SSID: %s  IP: 10.71.79.1", ap_ssid);
+    ESP_LOGI(TAG, "WiFi AP starting — SSID: %s  IP: 10.71.79.1", ap_ssid);
 
+    /* Start the HTTP server immediately — it will be reachable once the iPhone
+     * connects after AP_STARTED_BIT is set. */
     start_http_server();
+}
+
+void wifi_manager_wait_for_ap_ready(void)
+{
+    if (s_ap_event_group == NULL) {
+        ESP_LOGE(TAG, "wifi_manager_wait_for_ap_ready called before wifi_manager_init");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Waiting for AP to be ready...");
+    EventBits_t bits = xEventGroupWaitBits(s_ap_event_group,
+                                           AP_STARTED_BIT,
+                                           pdFALSE,                      /* don't clear on exit */
+                                           pdTRUE,                       /* wait for all bits */
+                                           pdMS_TO_TICKS(AP_READY_TIMEOUT_MS));
+    if (bits & AP_STARTED_BIT) {
+        ESP_LOGI(TAG, "AP ready — proceeding with BLE init");
+    } else {
+        ESP_LOGE(TAG, "Timed out waiting for AP_START after %d ms — proceeding anyway",
+                 AP_READY_TIMEOUT_MS);
+    }
 }
