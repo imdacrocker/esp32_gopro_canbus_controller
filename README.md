@@ -125,11 +125,13 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 
 ## Getting Started
 
+
 ### Prerequisites
 
+- [VS Code](https://code.visualstudio.com/download) installed 
 - [ESP-IDF v6.0](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32s3/get-started/index.html) installed and sourced.
 - Target chip: `esp32s3`
-- A USB connection to the ESP32-CAN-X2 board (COM port, typically COM4 on Windows).
+- A USB connection to the ESP32-CAN-X2 board (COM port).
 
 ### Clone the repository
 
@@ -141,6 +143,12 @@ cd esp32_gopro_canbus_controller
 ---
 
 ## Building and Flashing
+
+From the ESP-IDF in VS Code
+- Set the target to esp32s3
+- Set the COM port (detect often works)
+- Set flash method to UART
+- Use the Build, Flash and Monitor to flash the ESP32
 
 ```bash
 # Set the target (required once per checkout)
@@ -170,6 +178,16 @@ idf.py -p PORT monitor
 ## Configuration
 
 All user-configurable values are defined as compile-time constants in the relevant component headers. No `menuconfig` changes are required for the default setup.
+
+---
+
+## Camera Setup
+
+- Connect to the ESP32 via wifi.  The SSID will be HERO-RC-XXXXXX (with the last 6 being your ESP32's MAC address)
+Note:  The Wifi connection seems to be colliding with the BLE at the moment.  You may have to refresh your settings and try multiple times to connect
+- Open a web browser and go to 10.71.79.1
+- Select Scan 
+---
 
 ### CAN bus (`components/can_manager/include/can_manager.h`)
 
