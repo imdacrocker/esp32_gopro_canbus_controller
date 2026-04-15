@@ -31,9 +31,6 @@ Known bugs:
  - Clearing the camera pairing from the web interface is not working
  - WiFi and BLE are fighting each other on the chip. This may need to be smoothed out
 
-Features:
- - Faster triggering of multiple cameras
-
 ---
 
 ## Hardware
@@ -106,7 +103,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 4. `open_gopro_ble` sends the OpenGoPro `shutter start` TLV over BLE to each camera and logs the outgoing command.
 5. The camera responds with an acknowledgement on `cmd_resp_notify` (GP-0073). `open_gopro_ble` logs whether the camera accepted or rejected the command.
 6. `open_gopro_ble`'s status poll timer queries each camera for `encoding_active` every 5 seconds and updates the recording status in the driver context. A separate keep-alive command is sent to every connected camera every 3 seconds to prevent the camera from auto-sleeping.
-7. `camera_manager`'s tick timer (2 s) reads the recording status from each driver, fires the state-change callback, and retries the start command if a camera is still not recording.
+7. `camera_manager`'s tick timer (2 s) reads the recording status from each driver and fires the state-change callback. If a camera that was previously confirmed as recording is now idle (e.g. it stopped unexpectedly), the tick dispatches a recovery start command. The start command is not retried while the initial command is still in flight — `open_gopro_ble` sets an internal `start_cmd_pending` flag when the command is sent and clears it only after the status poll confirms the transition (IDLE→RECORDING clears it on the happy path; RECORDING→IDLE clears it to allow the recovery send).
 8. `app_main`'s state-change callback maps the internal status to a `camera_state_t` and calls `can_manager_set_camera_state()`.
 9. `can_manager` broadcasts the updated `0x601` status frame to RaceCapture at 5 Hz.
 

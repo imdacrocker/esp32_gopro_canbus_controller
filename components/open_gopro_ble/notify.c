@@ -50,13 +50,30 @@ static void handle_query_response(int slot, const uint8_t *data, uint16_t len)
         }
 
         if (status_id == GP_STATUS_ID_ENCODING && value_len >= 1) {
+            camera_recording_status_t old_status = ctx->recording_status;
             camera_recording_status_t new_status =
                 data[idx] ? CAMERA_RECORDING_ACTIVE : CAMERA_RECORDING_IDLE;
 
-            if (ctx->recording_status != new_status) {
+            if (old_status != new_status) {
                 ctx->recording_status = new_status;
                 ESP_LOGI(TAG, "slot %d: recording status → %s", slot,
                          new_status == CAMERA_RECORDING_ACTIVE ? "RECORDING" : "IDLE");
+
+                if (new_status == CAMERA_RECORDING_ACTIVE) {
+                    /* Camera confirmed it is recording — command delivered.
+                     * Clear the pending flag so a future IDLE transition
+                     * allows the tick to issue a recovery start command. */
+                    ctx->start_cmd_pending = false;
+                } else if (old_status == CAMERA_RECORDING_ACTIVE) {
+                    /* Camera was recording and has now stopped (while
+                     * desired_recording may still be true).  Clear the
+                     * pending flag so the camera_manager tick can dispatch
+                     * a recovery start command on its next cycle. */
+                    ctx->start_cmd_pending = false;
+                }
+                /* If old_status was UNKNOWN or IDLE and new_status is IDLE,
+                 * the camera is still coming up — leave start_cmd_pending
+                 * untouched so no duplicate command is sent. */
             }
         }
 

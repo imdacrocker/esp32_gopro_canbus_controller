@@ -388,11 +388,11 @@ OpenGoPro BLE driver implementing the [OpenGoPro BLE 2.0](https://gopro.github.i
 
 | File | Responsibility |
 |------|---------------|
-| `control.c` | Camera control commands (start/stop recording), status poll timer (5 s), keep-alive timer (3 s) |
+| `control.c` | Camera control commands (start/stop recording), `start_cmd_pending` guard, status poll timer (5 s), keep-alive timer (3 s) |
 | `driver.c` | `camera_driver_t` vtable, per-camera context allocation, discovery list, component init |
 | `gatt.c` | GATT service/characteristic discovery, MTU negotiation, CCCD subscription |
 | `pairing.c` | BLE lifecycle callbacks: connected, encrypted, disconnected |
-| `notify.c` | ATT notification routing (recording status, command responses) |
+| `notify.c` | ATT notification routing (recording status transitions, `start_cmd_pending` management, command responses) |
 | `query.c` | On-demand query commands — `GetHardwareInfo` (0x3C) send + GPBS-aware response parsing |
 
 #### Types
@@ -486,6 +486,27 @@ The OpenGoPro spec requires a Keep Alive packet to be sent every 3 seconds after
 - **Packet:** `{ 0x03, 0x5B, 0x01, 0x42 }` — TLV encoding: `[length=3][setting_id=0x5B][param_len=1][value=0x42]`
 - **Fire-and-forget:** the camera's ACK response on GP-0075 is intentionally ignored. BLE disconnect handling covers connection loss.
 - **Gating:** the timer fires every 3 seconds and iterates all camera slots. It only sends to slots where `camera_manager_is_gatt_ready()` returns true — no explicit start/stop per connection is required.
+
+#### Duplicate-send guard (`control.c` / `notify.c`)
+
+The driver tracks a per-camera `start_cmd_pending` boolean in `gopro_ble_ctx_t` to prevent the `camera_manager` tick from hammering the camera with repeated start commands while it is still transitioning from idle to recording (a process that can take several seconds on GoPro hardware).
+
+**State transitions:**
+
+| Event | Effect on `start_cmd_pending` |
+|-------|-------------------------------|
+| `control_start_recording()` called | Set to `true` (command dispatched) |
+| `control_start_recording()` called while already `true` | Returns `ESP_ERR_INVALID_STATE` immediately — no BLE write |
+| Status poll confirms IDLE → RECORDING | Cleared to `false` (happy path) |
+| Status poll confirms RECORDING → IDLE | Cleared to `false` (recovery — tick may now resend) |
+| `control_stop_recording()` called | Cleared to `false` (explicit stop) |
+| Camera disconnects | Cleared to `false` (context reset in `pairing.c`) |
+
+**Recovery path:** when the camera transitions from RECORDING back to IDLE while `desired_recording` is still `true`, clearing `start_cmd_pending` lets the `camera_manager` tick dispatch a fresh start command on its next 2-second cycle. The gap between the status poll confirming IDLE and the tick firing is at most `STATUS_POLL_INTERVAL_MS` + 2000 ms.
+
+**Lost-command caveat:** if the BLE write succeeds but the camera silently discards the command (e.g., RF collision) and never enters RECORDING, `start_cmd_pending` remains `true` indefinitely. The system will not retry. This is a deliberate trade-off — racing use cases prioritise getting all cameras started simultaneously over silent retry-until-success behaviour.
+
+---
 
 #### On-demand queries (`query.c`)
 
@@ -644,7 +665,7 @@ Slot accessors used by `open_gopro_ble` to route GATT operations to the correct 
 ```c
 void camera_manager_set_desired_recording(bool recording);
 ```
-Set the target recording state for all slots. The 2-second tick timer retries `start_recording` on any connected, GATT-ready camera that is not yet recording when `desired = true`.
+Set the target recording state for all slots. When `desired = true`, the 2-second tick timer calls `start_recording` on any connected, GATT-ready camera that is not currently recording. Whether that call actually dispatches a BLE command depends on the driver — the GoPro BLE driver gates on an internal `start_cmd_pending` flag so that the command is only re-sent after the camera has previously confirmed a RECORDING state and then gone idle (recovery path), not while the initial command is still in flight.
 
 ---
 
@@ -813,4 +834,4 @@ struct camera_driver {
 };
 ```
 
-All three function pointers receive the per-camera `ctx` allocated by the driver's factory function. `get_recording_status` must be non-blocking and return a cached value. `start_recording` and `stop_recording` dispatch commands asynchronously and return `ESP_OK` if the command was sent, or `ESP_ERR_INVALID_STATE` if the camera is not ready.
+All three function pointers receive the per-camera `ctx` allocated by the driver's factory function. `get_recording_status` must be non-blocking and return a cached value. `start_recording` and `stop_recording` dispatch commands asynchronously and return `ESP_OK` if the command was sent, or `ESP_ERR_INVALID_STATE` if the camera is not ready or a start command is already in flight (see `start_cmd_pending` in the `open_gopro_ble` section).

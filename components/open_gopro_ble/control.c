@@ -63,6 +63,15 @@ esp_err_t control_start_recording(void *ctx)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Guard: if a start command is already in flight, do not send another.
+     * The system assumes the camera received the first command; recovery is
+     * driven by the status poll, not by retrying here. */
+    if (gctx->start_cmd_pending) {
+        ESP_LOGD(TAG, "conn=%d: start recording already pending — skipping",
+                 gctx->conn_handle);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     /* OpenGoPro TLV: [length=3][cmd_id=0x01][param_len=1][param=1] */
     uint8_t pkt[4] = { 0x03, 0x01, 0x01, 0x01 };
     ESP_LOGI(TAG, "conn=%d cmd_write=0x%04x: sending Start Recording",
@@ -72,6 +81,8 @@ esp_err_t control_start_recording(void *ctx)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "conn=%d: Start Recording write failed (%s)",
                  gctx->conn_handle, esp_err_to_name(err));
+    } else {
+        gctx->start_cmd_pending = true;
     }
     return err;
 }
@@ -82,6 +93,9 @@ esp_err_t control_stop_recording(void *ctx)
     if (!gctx || gctx->gatt.cmd_write == 0) {
         return ESP_ERR_INVALID_STATE;
     }
+
+    /* Clear any in-flight start command — we are explicitly stopping. */
+    gctx->start_cmd_pending = false;
 
     /* OpenGoPro TLV: [length=3][cmd_id=0x01][param_len=1][param=0] */
     uint8_t pkt[4] = { 0x03, 0x01, 0x01, 0x00 };

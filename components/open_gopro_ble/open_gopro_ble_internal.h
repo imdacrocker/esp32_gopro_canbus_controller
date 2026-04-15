@@ -17,6 +17,19 @@ typedef struct {
      *  when gopro_on_encrypted_cb fired).  Cleared after RequestPairingFinish
      *  is sent in control_send_pairing_complete(). */
     bool                      is_first_pairing;
+    /**
+     * Set to true the moment a SetShutter(start) command is dispatched.
+     * Cleared by handle_query_response() when the status poll confirms the
+     * camera has transitioned to RECORDING (happy path) or back to IDLE after
+     * a confirmed RECORDING (recovery path — lets the tick resend).
+     * Also cleared by control_stop_recording() and on disconnect.
+     *
+     * Purpose: prevents the camera_manager tick from sending duplicate start
+     * commands while the camera is still processing the first one.  The system
+     * assumes the command was received; recovery is driven by status polling,
+     * not by retrying the command immediately.
+     */
+    bool                      start_cmd_pending;
 } gopro_ble_ctx_t;
 
 /* -------------------------------------------------------------------------

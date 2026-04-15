@@ -84,6 +84,7 @@ void gopro_on_disconnected_cb(uint16_t conn_handle, const ble_addr_t *addr, int 
         if (ctx) {
             ctx->conn_handle      = BLE_HS_CONN_HANDLE_NONE;
             ctx->recording_status = CAMERA_RECORDING_UNKNOWN;
+            ctx->start_cmd_pending = false;
             memset(&ctx->gatt, 0, sizeof(ctx->gatt));
         }
     }
