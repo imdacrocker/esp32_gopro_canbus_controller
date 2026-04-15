@@ -103,6 +103,22 @@ typedef void (*ble_core_on_notify_rx_cb_t)(uint16_t conn_handle, uint16_t attr_h
  */
 typedef bool (*ble_core_is_known_addr_cb_t)(const ble_addr_t *addr);
 
+/**
+ * @brief Predicate that tells ble_core whether any configured camera is
+ *        currently disconnected.
+ *
+ * ble_core calls this before starting a background scan to decide whether
+ * scanning serves any purpose.  If all known cameras are already connected,
+ * scanning wastes radio resources and is suppressed.
+ *
+ * Implemented by camera_manager_has_disconnected_cameras() in the reference
+ * build.
+ *
+ * @return true if at least one configured camera is not connected;
+ *         false if all cameras are connected (or none are configured).
+ */
+typedef bool (*ble_core_has_disconnected_cameras_cb_t)(void);
+
 /* ============================================================
  * Callback struct
  * ============================================================ */
@@ -118,7 +134,8 @@ typedef struct {
     ble_core_on_encrypted_cb_t     on_encrypted;   /**< Link encrypted — safe to use GATT. */
     ble_core_on_disconnected_cb_t  on_disconnected;/**< Connection dropped. */
     ble_core_on_notify_rx_cb_t     on_notify_rx;   /**< ATT notification / indication received. */
-    ble_core_is_known_addr_cb_t    is_known_addr;  /**< Returns true for registered cameras. */
+    ble_core_is_known_addr_cb_t             is_known_addr;           /**< Returns true for registered cameras. */
+    ble_core_has_disconnected_cameras_cb_t  has_disconnected_cameras;/**< Returns true if any camera is not connected. */
 } ble_core_callbacks_t;
 
 /* ============================================================

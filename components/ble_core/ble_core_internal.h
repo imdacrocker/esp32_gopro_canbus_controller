@@ -16,6 +16,7 @@ extern int        s_pending_idx;
 
 /* Internal functions shared across ble_core source files */
 void start_scan(void);
+void start_scan_if_needed(void);
 void reconnect_next(void);
 
 /* Connection event callback — defined in ble_connect.c, used in ble_scan.c */

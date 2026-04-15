@@ -351,8 +351,21 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
     uint8_t cmd_id = data[payload_off];
     uint8_t status = data[payload_off + 1];
 
+    /* Handle shutter (SetShutter) command response: cmd_id=0x01 */
+    if (cmd_id == 0x01) {
+        if (status == 0x00) {
+            ESP_LOGI(TAG, "query slot %d: SetShutter command accepted by camera", slot);
+        } else {
+            ESP_LOGW(TAG, "query slot %d: SetShutter command rejected — status=0x%02x",
+                     slot, status);
+        }
+        return;
+    }
+
     /* Only handle GetHardwareInfo responses; ignore everything else. */
     if (cmd_id != CMD_GET_HW_INFO) {
+        ESP_LOGD(TAG, "query slot %d: unhandled cmd response cmd_id=0x%02x status=0x%02x",
+                 slot, cmd_id, status);
         return;
     }
 

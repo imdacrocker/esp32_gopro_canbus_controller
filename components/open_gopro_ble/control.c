@@ -65,8 +65,15 @@ esp_err_t control_start_recording(void *ctx)
 
     /* OpenGoPro TLV: [length=3][cmd_id=0x01][param_len=1][param=1] */
     uint8_t pkt[4] = { 0x03, 0x01, 0x01, 0x01 };
-    return ble_core_gatt_write(gctx->conn_handle, gctx->gatt.cmd_write,
-                               pkt, sizeof(pkt));
+    ESP_LOGI(TAG, "conn=%d cmd_write=0x%04x: sending Start Recording",
+             gctx->conn_handle, gctx->gatt.cmd_write);
+    esp_err_t err = ble_core_gatt_write(gctx->conn_handle, gctx->gatt.cmd_write,
+                                        pkt, sizeof(pkt));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "conn=%d: Start Recording write failed (%s)",
+                 gctx->conn_handle, esp_err_to_name(err));
+    }
+    return err;
 }
 
 esp_err_t control_stop_recording(void *ctx)
@@ -78,8 +85,15 @@ esp_err_t control_stop_recording(void *ctx)
 
     /* OpenGoPro TLV: [length=3][cmd_id=0x01][param_len=1][param=0] */
     uint8_t pkt[4] = { 0x03, 0x01, 0x01, 0x00 };
-    return ble_core_gatt_write(gctx->conn_handle, gctx->gatt.cmd_write,
-                               pkt, sizeof(pkt));
+    ESP_LOGI(TAG, "conn=%d cmd_write=0x%04x: sending Stop Recording",
+             gctx->conn_handle, gctx->gatt.cmd_write);
+    esp_err_t err = ble_core_gatt_write(gctx->conn_handle, gctx->gatt.cmd_write,
+                                        pkt, sizeof(pkt));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "conn=%d: Stop Recording write failed (%s)",
+                 gctx->conn_handle, esp_err_to_name(err));
+    }
+    return err;
 }
 
 camera_recording_status_t control_get_recording_status(void *ctx)

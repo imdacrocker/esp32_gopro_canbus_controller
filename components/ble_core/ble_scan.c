@@ -69,6 +69,20 @@ static void start_discovery_cb(struct ble_npl_event *ev)
 static struct ble_npl_event s_start_disc_event;
 
 /* --------------------------------------------------------------------------
+ * Conditional scan start — only scans if disconnected cameras exist.
+ * Safe to call from any context where start_scan() would be called.
+ * -------------------------------------------------------------------------- */
+void start_scan_if_needed(void)
+{
+    if (g_ble_core_cbs.has_disconnected_cameras &&
+        !g_ble_core_cbs.has_disconnected_cameras()) {
+        ESP_LOGI(TAG, "All cameras connected — background scan suppressed");
+        return;
+    }
+    start_scan();
+}
+
+/* --------------------------------------------------------------------------
  * Public API
  * -------------------------------------------------------------------------- */
 
@@ -83,7 +97,7 @@ void ble_core_start_discovery(void)
 void ble_core_stop_discovery(void)
 {
     ble_gap_disc_cancel();
-    start_scan();
+    start_scan_if_needed();
 }
 
 void ble_core_connect_by_addr(const ble_addr_t *addr)
@@ -109,7 +123,7 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
 {
     if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
         ESP_LOGI(TAG, "Discovery scan complete");
-        start_scan(); /* restart background scan with no timeout */
+        start_scan_if_needed();
         return 0;
     }
 

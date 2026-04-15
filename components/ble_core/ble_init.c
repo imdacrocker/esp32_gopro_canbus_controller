@@ -51,8 +51,7 @@ static void on_sync(void)
                  s_pending_count);
         reconnect_next();
     } else {
-        ESP_LOGI(TAG, "No bonded peers — starting background scan");
-        start_scan();
+        ESP_LOGI(TAG, "No bonded peers — BLE idle");
     }
 }
 

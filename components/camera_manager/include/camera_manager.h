@@ -46,6 +46,7 @@ void camera_manager_set_desired_recording(bool recording);
 int  camera_manager_start_recording_all(void);
 int  camera_manager_stop_recording_all(void);
 bool camera_manager_is_known_addr(const ble_addr_t *addr);
+bool camera_manager_has_disconnected_cameras(void);
 void camera_manager_register_driver(camera_type_t type,
                                      const camera_driver_t *driver,
                                      void *(*create_ctx)(void));

@@ -512,6 +512,11 @@ bool camera_manager_is_known_addr(const ble_addr_t *addr)
     return camera_manager_find_by_addr(addr) >= 0;
 }
 
+bool camera_manager_has_disconnected_cameras(void)
+{
+    return camera_manager_remembered_count() > camera_manager_connected_count();
+}
+
 void camera_manager_register_driver(camera_type_t type,
                                      const camera_driver_t *driver,
                                      void *(*create_ctx)(void))

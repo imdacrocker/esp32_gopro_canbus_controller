@@ -134,12 +134,13 @@ static void gopro_on_disc_cb(const struct ble_gap_disc_desc *disc,
  * ------------------------------------------------------------------------- */
 
 static const ble_core_callbacks_t s_ble_cbs = {
-    .on_disc         = gopro_on_disc_cb,
-    .on_connected    = gopro_on_connected_cb,
-    .on_encrypted    = gopro_on_encrypted_cb,
-    .on_disconnected = gopro_on_disconnected_cb,
-    .on_notify_rx    = gopro_on_notify_rx_cb,
-    .is_known_addr   = camera_manager_is_known_addr,
+    .on_disc                  = gopro_on_disc_cb,
+    .on_connected             = gopro_on_connected_cb,
+    .on_encrypted             = gopro_on_encrypted_cb,
+    .on_disconnected          = gopro_on_disconnected_cb,
+    .on_notify_rx             = gopro_on_notify_rx_cb,
+    .is_known_addr            = camera_manager_is_known_addr,
+    .has_disconnected_cameras = camera_manager_has_disconnected_cameras,
 };
 
 void open_gopro_ble_init(void)

@@ -28,8 +28,8 @@ int        s_pending_idx            = 0;
 void reconnect_next(void)
 {
     if (s_pending_idx >= s_pending_count) {
-        ESP_LOGI(TAG, "Boot reconnect phase complete — starting background scan");
-        start_scan();
+        ESP_LOGI(TAG, "Boot reconnect phase complete");
+        start_scan_if_needed();
         return;
     }
 
@@ -258,7 +258,7 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
             const uint8_t *a = peer->val;
             ESP_LOGI(TAG, "Disconnected peer %02X:%02X:%02X:%02X:%02X:%02X is no longer "
                      "known — skipping reconnect", a[5], a[4], a[3], a[2], a[1], a[0]);
-            start_scan();
+            start_scan_if_needed();
             break;
         }
 

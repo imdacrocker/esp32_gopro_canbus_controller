@@ -169,7 +169,9 @@ Returns all configured camera slots with their current live status.
 
 Manually sends a start or stop recording command to all currently connected, GATT-ready cameras.
 
-This command does **not** change the desired recording state tracked by `camera_manager`. Use this for manual overrides only; the CAN-driven flow (via `0x600`) is the primary control path in normal operation.
+This command **does** update the desired recording state tracked by `camera_manager`. If a camera is currently disconnected and reconnects later, the tick timer will automatically retry the command to bring it into the desired state. Sending `{"on": false}` clears the desired state, preventing the tick timer from re-enabling recording even if CAN previously set it.
+
+> **Note:** If RaceCapture is actively sending `0x600` logging frames, those will overwrite the desired state on the next frame received. The web UI and CAN path will "fight" each other — this is expected behaviour. The web UI is intended for diagnostics when CAN is disconnected.
 
 **Request body** (`Content-Type: application/json`):
 
@@ -310,16 +312,19 @@ NimBLE stack abstraction. Manages scanning, connection lifecycle, encryption, an
 
 ```c
 typedef struct {
-    ble_core_on_disc_cb_t          on_disc;        // advertisement seen during discovery
-    ble_core_on_connected_cb_t     on_connected;   // connection established
-    ble_core_on_encrypted_cb_t     on_encrypted;   // link encrypted — safe to use GATT
-    ble_core_on_disconnected_cb_t  on_disconnected;// connection dropped
-    ble_core_on_notify_rx_cb_t     on_notify_rx;   // ATT notification received
-    ble_core_is_known_addr_cb_t    is_known_addr;  // returns true for registered cameras
+    ble_core_on_disc_cb_t                  on_disc;                  // advertisement seen during discovery
+    ble_core_on_connected_cb_t             on_connected;             // connection established
+    ble_core_on_encrypted_cb_t             on_encrypted;             // link encrypted — safe to use GATT
+    ble_core_on_disconnected_cb_t          on_disconnected;          // connection dropped
+    ble_core_on_notify_rx_cb_t             on_notify_rx;             // ATT notification received
+    ble_core_is_known_addr_cb_t            is_known_addr;            // returns true for registered cameras
+    ble_core_has_disconnected_cameras_cb_t has_disconnected_cameras; // returns true if any paired camera is not connected
 } ble_core_callbacks_t;
 ```
 
 All fields are optional; set unused callbacks to `NULL`.
+
+The `has_disconnected_cameras` callback controls background scan suppression. When provided and it returns `false` (all known cameras are connected), background scans are skipped automatically. When `NULL`, background scans always restart as before.
 
 #### Functions
 
@@ -333,7 +338,7 @@ Register the callback table. Must be called before `ble_core_init()`. Copies the
 ```c
 void ble_core_init(void);
 ```
-Initialise the NimBLE stack, configure the security manager for bonding (no I/O / Just Works), and launch the host task. On `on_sync`, automatically attempts to reconnect all stored bonds, then falls back to a passive background scan.
+Initialise the NimBLE stack, configure the security manager for bonding (no I/O / Just Works), and launch the host task. On `on_sync`, automatically attempts to reconnect all stored bonds. If bonded peers exist but some are not yet connected, a passive background scan is started. If no peers are paired, or all paired cameras are already connected, the background scan is suppressed (requires `has_disconnected_cameras` callback to be registered).
 
 ---
 
@@ -485,6 +490,15 @@ The OpenGoPro spec requires a Keep Alive packet to be sent every 3 seconds after
 #### On-demand queries (`query.c`)
 
 Hardware info and other query commands can be issued at any time after the slot is `gatt_ready`. This is implemented in `query.c` and is not part of the public API.
+
+**`SetShutter` response (cmd 0x01)**
+
+After every `control_start_recording()` or `control_stop_recording()` call, the camera sends a command response on `cmd_resp_notify` (GP-0073). `gopro_query_handle_cmd_response()` in `query.c` now handles these:
+
+- Status `0x00` → logged at INFO: `SetShutter command accepted by camera`
+- Any other status → logged at WARN with the rejection code
+
+This makes it possible to determine whether the camera actually accepted the recording command, rather than only seeing the outgoing write in the log.
 
 **`GetHardwareInfo` (cmd 0x3C)**
 

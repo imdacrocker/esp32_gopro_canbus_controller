@@ -316,6 +316,8 @@ static esp_err_t api_shutter_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    camera_manager_set_desired_recording(shutter_on);
+
     int dispatched = shutter_on
                    ? camera_manager_start_recording_all()
                    : camera_manager_stop_recording_all();

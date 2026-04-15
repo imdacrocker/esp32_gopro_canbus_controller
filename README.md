@@ -28,10 +28,10 @@ A companion Wi-Fi web interface lets you pair cameras, check status, and manuall
 
 ## TODO
 Known bugs:
- - Clearing the camera pairing from the web interface, is not working
- - Wifi and BLE are fighting each other on the chip.  This may need to be smoothed out
+ - Clearing the camera pairing from the web interface is not working
+ - WiFi and BLE are fighting each other on the chip. This may need to be smoothed out
 
- Features:
+Features:
  - Faster triggering of multiple cameras
 
 ---
@@ -98,16 +98,27 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 └─────────────────┘
 ```
 
-**Data flow summary:**
+**Data flow summary (CAN path):**
 
 1. RaceCapture sends a `0x600` CAN frame with `isLogging = 1`.
 2. `can_manager` detects the state change and calls the registered logging callback.
 3. `app_main`'s callback sets the desired recording state on `camera_manager` and immediately dispatches a start command to all GATT-ready cameras.
-4. `open_gopro_ble` sends the OpenGoPro `shutter start` TLV over BLE to each camera.
-5. `open_gopro_ble`'s status poll timer queries each camera for `encoding_active` every 5 seconds and updates the recording status in the driver context. A separate keep-alive command is sent to every connected camera every 3 seconds to prevent the camera from auto-sleeping.
-6. `camera_manager`'s tick timer (2 s) reads the recording status from each driver, fires the state-change callback, and retries the start command if a camera is still not recording.
-7. `app_main`'s state-change callback maps the internal status to a `camera_state_t` and calls `can_manager_set_camera_state()`.
-8. `can_manager` broadcasts the updated `0x601` status frame to RaceCapture at 5 Hz.
+4. `open_gopro_ble` sends the OpenGoPro `shutter start` TLV over BLE to each camera and logs the outgoing command.
+5. The camera responds with an acknowledgement on `cmd_resp_notify` (GP-0073). `open_gopro_ble` logs whether the camera accepted or rejected the command.
+6. `open_gopro_ble`'s status poll timer queries each camera for `encoding_active` every 5 seconds and updates the recording status in the driver context. A separate keep-alive command is sent to every connected camera every 3 seconds to prevent the camera from auto-sleeping.
+7. `camera_manager`'s tick timer (2 s) reads the recording status from each driver, fires the state-change callback, and retries the start command if a camera is still not recording.
+8. `app_main`'s state-change callback maps the internal status to a `camera_state_t` and calls `can_manager_set_camera_state()`.
+9. `can_manager` broadcasts the updated `0x601` status frame to RaceCapture at 5 Hz.
+
+**Data flow summary (web UI path):**
+
+1. User taps **Start Recording** or **Stop Recording** in the web interface.
+2. `wifi_manager` receives the `POST /api/shutter` request.
+3. The desired recording state is set on `camera_manager` (same flag used by the CAN path).
+4. A one-shot start/stop command is immediately dispatched to all GATT-ready cameras.
+5. The tick timer continues retrying for any cameras not yet in the desired state, and will apply the command to cameras that reconnect later.
+
+> If RaceCapture is actively sending `0x600` frames, the CAN and web UI paths will write to the same desired-state flag and can overwrite each other. This is intentional — the web UI is designed for diagnostics when CAN is disconnected.
 
 ---
 
@@ -296,8 +307,14 @@ txCAN(0, 0x600, 0, {isLogging(), 0, 0, 0, 0, 0, 0, 0})
 
 **Recording does not start when RaceCapture logs**
 - Confirm the `0x600` frame is being transmitted by RaceCapture (use the serial monitor to watch for `0x600 RX` log lines from `can_manager`).
-- Confirm cameras show as `recording` in the web UI after a manual **Start Recording** press.
-- Check that the desired recording state is being set: look for `Start recording dispatched to N camera(s)` in the serial log.
+- Confirm the command is reaching the camera: look for `conn=X cmd_write=0xXXXX: sending Start Recording` in the serial log from `open_gopro_ble`.
+- Confirm the camera accepted the command: look for `SetShutter command accepted by camera` immediately after. A `SetShutter command rejected` warning with a non-zero status code means the camera is refusing the command (wrong mode, not in video mode, etc.).
+- If no `sending Start Recording` line appears, check that cameras are GATT-ready: look for `gatt_ready` log lines after the camera connects.
+
+**Recording does not start from the web UI**
+- The web UI shutter button requires at least one camera in `gatt_ready` state. Check `/api/paired-cameras` — the status must be `not_recording` or `recording`, not `disconnected`.
+- Look for `conn=X cmd_write=0xXXXX: sending Start Recording` in the log to confirm the command was dispatched.
+- If the command is sent but the camera ignores it, check `SetShutter command accepted/rejected` in the log.
 
 **Web UI is not reachable**
 - Wait 5–10 seconds after power-on for the AP to initialise.
@@ -336,11 +353,4 @@ esp32_gopro_canbus_controller/
 │   │   ├── include/can_manager.h
 │   │   └── can_manager.c
 │   └── wifi_manager/           # Soft-AP + HTTP server
-│       ├── include/wifi_manager.h
-│       ├── wifi_manager.c
-│       └── www/
-│           └── index.html      # Embedded web UI
-├── CMakeLists.txt
-├── partitions.csv
-├── sdkconfig.defaults
-└─�
+│       ├── include/wifi_manag
