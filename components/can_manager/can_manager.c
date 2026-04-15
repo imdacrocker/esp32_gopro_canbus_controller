@@ -2,11 +2,14 @@
 
 #include <string.h>
 #include <inttypes.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 #include "hal/twai_types.h"
@@ -49,6 +52,14 @@ static twai_frame_t s_tx_frame;
 /* Flags set from ISR, consumed from the processing task. */
 static volatile bool     s_bus_off     = false;
 static volatile uint32_t s_error_count = 0;
+
+/* UTC state — updated from every valid 0x602 frame.
+ * Protected by s_utc_mutex so can_manager_get_utc_ms() is safe to call
+ * from any task (e.g. the BLE/camera task on camera connect). */
+static SemaphoreHandle_t s_utc_mutex   = NULL;
+static volatile bool     s_utc_valid   = false;  /* true once first good frame received */
+static uint64_t          s_utc_ms      = 0;       /* epoch ms from last 0x602 frame      */
+static int64_t           s_utc_rx_tick = 0;       /* esp_timer_get_time() at last RX (µs)*/
 
 /* ============================================================
  * ISR Callbacks
@@ -147,6 +158,60 @@ static void handle_rc_command(const can_frame_t *frame)
 }
 
 /**
+ * Process a received 0x602 frame (RaceCapture → ESP32 UTC timestamp).
+ *
+ * Payload: 64-bit millisecond Unix epoch, little-endian (LSB in byte 0).
+ * The RaceCapture Lua script suppresses transmission before GPS lock, but
+ * we validate anyway: any timestamp before Jan 1 2020 is treated as pre-lock
+ * noise and silently dropped.
+ *
+ * Logs exactly once — on the first valid frame — then goes silent.
+ */
+static void handle_rc_utc(const can_frame_t *frame)
+{
+    if (frame->data_len < 8) {
+        ESP_LOGW(TAG, "0x602 UTC frame too short (len=%u), ignoring", frame->data_len);
+        return;
+    }
+
+    /* Unpack 64-bit little-endian millisecond epoch. */
+    uint64_t epoch_ms = 0;
+    for (int i = 0; i < 8; i++) {
+        epoch_ms |= (uint64_t)frame->data[i] << (i * 8);
+    }
+
+    /* Sanity check: Jan 1, 2020 00:00:00 UTC = 1577836800000 ms.
+     * Anything older is almost certainly a pre-lock 1970 epoch value. */
+    if (epoch_ms < 1577836800000ULL) {
+        return;
+    }
+
+    int64_t rx_tick    = esp_timer_get_time();
+    bool    first_valid = false;
+
+    xSemaphoreTake(s_utc_mutex, portMAX_DELAY);
+    if (!s_utc_valid) {
+        s_utc_valid = true;
+        first_valid = true;
+    }
+    s_utc_ms      = epoch_ms;
+    s_utc_rx_tick = rx_tick;
+    xSemaphoreGive(s_utc_mutex);
+
+    if (first_valid) {
+        /* Convert to a human-readable UTC string for the one-time log. */
+        time_t t = (time_t)(epoch_ms / 1000);
+        struct tm ti;
+        gmtime_r(&t, &ti);
+        ESP_LOGI(TAG, "UTC acquired — %04d-%02d-%02d %02d:%02d:%02d.%03" PRIu64 " UTC  "
+                 "(%" PRIu64 " ms epoch)",
+                 ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                 ti.tm_hour, ti.tm_min, ti.tm_sec,
+                 epoch_ms % 1000, epoch_ms);
+    }
+}
+
+/**
  * Build and transmit the 0x601 camera status frame.
  * Called at 5 Hz from the processing task.
  *
@@ -202,6 +267,8 @@ static void can_rx_task(void *arg)
             /* ---- Dispatch known protocol messages --------------------- */
             if (frame.id == CAN_ID_RC_COMMAND && !frame.is_extended) {
                 handle_rc_command(&frame);
+            } else if (frame.id == CAN_ID_RC_UTC && !frame.is_extended) {
+                handle_rc_utc(&frame);
             } //else {
             //     /* DBG: log any frame we don't recognise.  Helps confirm
             //      * the bus is active and shows what else RaceCapture sends.
@@ -288,6 +355,29 @@ esp_err_t can_manager_set_camera_state(uint8_t camera_idx, camera_state_t state)
     return ESP_OK;
 }
 
+bool can_manager_get_utc_ms(uint64_t *epoch_ms_out)
+{
+    if (epoch_ms_out == NULL) {
+        return false;
+    }
+
+    xSemaphoreTake(s_utc_mutex, portMAX_DELAY);
+    bool     valid    = s_utc_valid;
+    uint64_t base_ms  = s_utc_ms;
+    int64_t  rx_tick  = s_utc_rx_tick;
+    xSemaphoreGive(s_utc_mutex);
+
+    if (!valid) {
+        return false;
+    }
+
+    /* Extrapolate from the last received timestamp using the monotonic timer.
+     * esp_timer_get_time() returns microseconds — divide by 1000 for ms. */
+    int64_t elapsed_ms = (esp_timer_get_time() - rx_tick) / 1000;
+    *epoch_ms_out = base_ms + (uint64_t)elapsed_ms;
+    return true;
+}
+
 esp_err_t can_manager_init(void)
 {
     esp_err_t ret;
@@ -307,11 +397,19 @@ esp_err_t can_manager_init(void)
     s_tx_frame.buffer     = s_tx_buf;
     s_tx_frame.buffer_len = sizeof(s_tx_buf);
 
+    /* --- Create the UTC mutex ------------------------------------------ */
+    s_utc_mutex = xSemaphoreCreateMutex();
+    if (s_utc_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create UTC mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
     /* --- Create the software receive queue ----------------------------- */
     s_rx_queue = xQueueCreate(CAN_MANAGER_RX_QUEUE_DEPTH, sizeof(can_frame_t));
     if (s_rx_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create RX queue");
-        return ESP_ERR_NO_MEM;
+        ret = ESP_ERR_NO_MEM;
+        goto cleanup_mutex;
     }
 
     /* --- Configure and create the on-chip TWAI node -------------------- */
@@ -393,6 +491,9 @@ cleanup_node:
 cleanup_queue:
     vQueueDelete(s_rx_queue);
     s_rx_queue = NULL;
+cleanup_mutex:
+    vSemaphoreDelete(s_utc_mutex);
+    s_utc_mutex = NULL;
     return ret;
 }
 
@@ -417,6 +518,11 @@ esp_err_t can_manager_deinit(void)
     if (s_rx_queue != NULL) {
         vQueueDelete(s_rx_queue);
         s_rx_queue = NULL;
+    }
+
+    if (s_utc_mutex != NULL) {
+        vSemaphoreDelete(s_utc_mutex);
+        s_utc_mutex = NULL;
     }
 
     ESP_LOGI(TAG, "CAN manager stopped");

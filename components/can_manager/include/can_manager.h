@@ -48,6 +48,12 @@ extern "C" {
 /** ESP32 → RaceCapture: camera status broadcast. */
 #define CAN_ID_CAM_STATUS   0x601U
 
+/** RaceCapture → ESP32: UTC timestamp (millisecond Unix epoch, little-endian 64-bit).
+ *  Broadcast by the RaceCapture Lua script at 25 Hz once GPS lock is acquired.
+ *  Temporary ID — will migrate to the developer's standard ID when native
+ *  UTC broadcast is available in firmware. */
+#define CAN_ID_RC_UTC       0x602U
+
 /* ============================================================
  * CAN Termination Note (HARDWARE — not software controlled)
  * ============================================================
@@ -162,6 +168,22 @@ esp_err_t can_manager_register_rx_callback(can_rx_frame_cb_t cb, void *user_ctx)
  * @return ESP_OK, or ESP_ERR_INVALID_ARG if cb is NULL.
  */
 esp_err_t can_manager_register_logging_callback(can_logging_state_cb_t cb, void *user_ctx);
+
+/**
+ * @brief Get the current best-estimate UTC time in milliseconds.
+ *
+ * Uses the last received 0x602 timestamp plus elapsed time from the ESP32's
+ * monotonic clock (esp_timer_get_time) to extrapolate the current UTC without
+ * waiting for the next CAN frame.
+ *
+ * Thread-safe: may be called from any task.
+ *
+ * @param[out] epoch_ms_out  Receives the estimated current Unix epoch in milliseconds.
+ *                           Undefined if the function returns false.
+ * @return true  if a valid UTC has been received from the RaceCapture.
+ * @return false if GPS lock has not yet been established (no valid frame received).
+ */
+bool can_manager_get_utc_ms(uint64_t *epoch_ms_out);
 
 /**
  * @brief Update the recorded state of one camera slot.
