@@ -176,6 +176,11 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
             /* Set the camera's clock to the current UTC on every connection
              * (first pairing and all reconnections). */
             control_send_set_date_time(conn_handle);
+
+            /* Read hardware info (model name, firmware, serial) so it can be
+             * displayed on the web page.  The response arrives asynchronously
+             * on cmd_resp_notify and is stored via camera_manager_set_model_name(). */
+            gopro_query_send_hw_info(conn_handle);
         } else {
             ESP_LOGW(TAG, "GATT setup complete but camera slot not found (handle %d)",
                      conn_handle);

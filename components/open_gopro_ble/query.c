@@ -219,6 +219,12 @@ log_partial:
     ESP_LOGI(TAG, "slot %d hardware info: model=%lu (%s)  fw=%s  sn=%s  ssid=%s  mac=%s",
              slot, (unsigned long)model_number, model_name,
              firmware, serial, ap_ssid, ap_mac);
+
+    /* Persist the model name into the camera slot so it can be displayed
+     * on the web page and included in camera_slot_info_t. */
+    if (model_name[0] != '\0') {
+        camera_manager_set_model_name(slot, model_name);
+    }
 }
 
 /* -------------------------------------------------------------------------

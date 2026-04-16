@@ -29,6 +29,7 @@ typedef struct {
 /* In-RAM camera slot structure */
 typedef struct {
     char              name[CAMERA_NAME_LEN];
+    char              model_name[CAMERA_MODEL_NAME_LEN]; /**< Populated from GetHardwareInfo after GATT is ready. */
     ble_addr_t        mac_address;
     bool              is_configured;
     camera_type_t     type;
@@ -373,6 +374,15 @@ void camera_manager_set_gatt_ready(int slot, bool ready)
     notify_slot_state(slot);
 }
 
+void camera_manager_set_model_name(int slot, const char *model_name)
+{
+    if (slot < 0 || slot >= CAMERA_MAX_SLOTS) return;
+    if (!model_name) return;
+    strncpy(s_slots[slot].model_name, model_name, CAMERA_MODEL_NAME_LEN - 1);
+    s_slots[slot].model_name[CAMERA_MODEL_NAME_LEN - 1] = '\0';
+    ESP_LOGI(TAG, "slot %d model_name: %s", slot, s_slots[slot].model_name);
+}
+
 int camera_manager_register_new(const ble_addr_t *addr, const char *name,
                                  const camera_driver_t *driver, void *driver_ctx,
                                  camera_type_t type)
@@ -442,6 +452,7 @@ camera_slot_info_t camera_manager_get_slot_info(int slot)
     if (slot < 0 || slot >= CAMERA_MAX_SLOTS) return info;
 
     memcpy(info.name, s_slots[slot].name, CAMERA_NAME_LEN);
+    memcpy(info.model_name, s_slots[slot].model_name, CAMERA_MODEL_NAME_LEN);
     info.mac_address = s_slots[slot].mac_address;
     info.is_configured = s_slots[slot].is_configured;
 

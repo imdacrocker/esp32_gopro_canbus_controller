@@ -8,8 +8,9 @@
 #include "sdkconfig.h"
 
 /* Max cameras equals the NimBLE bond limit — one bond per camera. */
-#define CAMERA_MAX_SLOTS    CONFIG_BT_NIMBLE_MAX_BONDS
-#define CAMERA_NAME_LEN     32
+#define CAMERA_MAX_SLOTS       CONFIG_BT_NIMBLE_MAX_BONDS
+#define CAMERA_NAME_LEN        32
+#define CAMERA_MODEL_NAME_LEN  32
 
 #define CAMERA_STATUS_NOT_CONFIGURED  (-1)
 #define CAMERA_STATUS_DISCONNECTED      0
@@ -19,6 +20,7 @@
 typedef struct {
     int        index;
     char       name[CAMERA_NAME_LEN];
+    char       model_name[CAMERA_MODEL_NAME_LEN]; /**< Camera model string from GetHardwareInfo, e.g. "HERO12 Black". Empty until hw_info is received. */
     ble_addr_t mac_address;
     bool       is_configured;
     int        status;
@@ -42,6 +44,7 @@ void *camera_manager_get_driver_ctx(int slot);
 esp_err_t camera_manager_save_slot(int slot);
 esp_err_t camera_manager_remove_slot(int slot);
 camera_slot_info_t camera_manager_get_slot_info(int slot);
+void camera_manager_set_model_name(int slot, const char *model_name);
 void camera_manager_set_desired_recording(bool recording);
 int  camera_manager_start_recording_all(void);
 int  camera_manager_stop_recording_all(void);
