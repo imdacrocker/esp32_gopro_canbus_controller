@@ -113,8 +113,12 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 1. A Lua script on the RaceCapture reads GPS-derived UTC from `getDateTime()` and broadcasts it at 25 Hz on CAN ID `0x602` once GPS lock is acquired. The payload is a 64-bit millisecond Unix epoch timestamp, little-endian, in all 8 bytes.
 2. `can_manager` receives each `0x602` frame and records the epoch value alongside the ESP32 monotonic timestamp (`esp_timer_get_time()`) at the moment of receipt. The first valid frame (year > 2020) is logged at INFO level with a human-readable UTC string.
 3. `can_manager_get_utc_ms()` extrapolates the stored epoch forward using elapsed monotonic time, so callers always get a current estimate regardless of when the last CAN frame arrived.
-4. SetDateTime is sent to each camera via one of two paths depending on timing:
-   - **Camera connects after UTC is available:** when GATT setup completes (all CCCD subscriptions done), `gatt.c` calls `control_send_set_date_time()` directly.
+4. When GATT setup completes (all CCCD subscriptions done), `gatt.c` issues two commands in sequence:
+   - `control_send_set_date_time()` — sets the camera's clock (see paths below).
+   - `gopro_query_send_hw_info()` — requests the camera's model name, firmware version, and serial number. The response is parsed asynchronously and the model name is stored in the camera slot via `camera_manager_set_model_name()`, making it available through `camera_slot_info_t.model_name` for display in the web UI.
+
+   SetDateTime specifically is sent via one of two paths depending on timing:
+   - **Camera connects after UTC is available:** `gatt.c` calls `control_send_set_date_time()` directly when GATT setup completes.
    - **Camera is already connected when UTC first arrives:** `can_manager` fires a one-shot `can_utc_acquired_cb_t` callback. `main.c` handles it by calling `open_gopro_ble_sync_time_all()`, which iterates all GATT-ready slots and calls `control_send_set_date_time()` for each.
 5. In both cases, `control_send_set_date_time()` fetches the current UTC from `can_manager_get_utc_ms()`, converts it to calendar fields, and writes a SetDateTime TLV command (ID `0x0D`) to GP-0072 (`cmd_write`).
 6. The camera responds on GP-0073 (`cmd_resp_notify`). `query.c` logs whether the camera accepted or rejected the command.
@@ -136,7 +140,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 | Component | Purpose |
 |-----------|---------|
 | `ble_core` | NimBLE stack wrapper. Owns scan, connect, encrypt, GATT write, and bond management. Camera-agnostic. |
-| `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). The camera is considered ready as soon as CCCD subscriptions complete — no polling loop is needed. `GetHardwareInfo` is available on demand via `gopro_query_send_hw_info()`. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
+| `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). The camera is considered ready as soon as CCCD subscriptions complete — no polling loop is needed. `GetHardwareInfo` is sent automatically after every GATT setup to populate the camera's model name (e.g. `"HERO12 Black"`) in `camera_slot_info_t`. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
 | `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. |
 | `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` (isLogging) and `0x602` (UTC timestamp) frames; broadcasts `0x601` camera status at 5 Hz. Exposes `can_manager_get_utc_ms()` for on-demand UTC retrieval with monotonic-clock extrapolation. Thread-safe. |
 | `wifi_manager` | Soft-AP + HTTP server. Serves the embedded web UI and all `/api/*` endpoints. |

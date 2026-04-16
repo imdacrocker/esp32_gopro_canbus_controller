@@ -580,7 +580,11 @@ This makes it possible to determine whether the camera actually accepted the rec
 
 **`GetHardwareInfo` (cmd 0x3C)**
 
-Call `gopro_query_send_hw_info(conn_handle)` to request the camera's hardware details. The response arrives asynchronously on `cmd_resp_notify` (GP-0073) and is routed to `gopro_query_handle_cmd_response()` by `notify.c`. On success the parsed fields (model number, model name, firmware version, serial number, AP SSID, AP MAC address) are logged at INFO level.
+`gopro_query_send_hw_info(conn_handle)` is called automatically by `gatt.c` immediately after all CCCD subscriptions complete (alongside `control_send_set_date_time()`). It can also be called on demand at any time the slot is `gatt_ready`.
+
+The response arrives asynchronously on `cmd_resp_notify` (GP-0073) and is routed to `gopro_query_handle_cmd_response()` by `notify.c`. On success, the parsed fields (model number, model name, firmware version, serial number, AP SSID, AP MAC address) are logged at INFO level, and the **model name** is written into the camera slot via `camera_manager_set_model_name()`. It is then available through `camera_slot_info_t.model_name` for display in the web UI or any other consumer.
+
+The model name is **not** persisted to NVS — it is RAM-only and repopulated on every connection.
 
 **GPBS fragmentation:** `GetHardwareInfoRsp` is approximately 91 bytes. The camera sends this as multiple ATT notifications using GPBS (General Purpose Byte Stream) application-layer fragmentation, regardless of the negotiated ATT MTU. `query.c` handles GPBS reassembly transparently via a per-connection context buffer.
 
@@ -602,6 +606,7 @@ Camera slot state machine. Persists camera records to NVS. Runs a 2-second tick 
 |----------|-------|-------------|
 | `CAMERA_MAX_SLOTS` | `CONFIG_BT_NIMBLE_MAX_BONDS` | Maximum number of simultaneous paired cameras. |
 | `CAMERA_NAME_LEN` | `32` | Maximum camera name length including null terminator. |
+| `CAMERA_MODEL_NAME_LEN` | `32` | Maximum model name length including null terminator. |
 | `CAMERA_STATUS_NOT_CONFIGURED` | `-1` | Slot is empty — no camera assigned. |
 | `CAMERA_STATUS_DISCONNECTED` | `0` | Camera paired but not connected. |
 | `CAMERA_STATUS_CONNECTED` | `1` | Connected; GATT ready or not yet ready. |
@@ -613,11 +618,12 @@ Camera slot state machine. Persists camera records to NVS. Runs a 2-second tick 
 
 ```c
 typedef struct {
-    int        index;                       // Slot index (0-based)
-    char       name[CAMERA_NAME_LEN];       // Camera name
-    ble_addr_t mac_address;                 // BLE MAC address
-    bool       is_configured;               // false if this slot is empty
-    int        status;                      // One of the CAMERA_STATUS_* constants
+    int        index;                                // Slot index (0-based)
+    char       name[CAMERA_NAME_LEN];               // Advertised camera name
+    char       model_name[CAMERA_MODEL_NAME_LEN];   // Model string from GetHardwareInfo, e.g. "HERO12 Black". Empty until hw_info is received after connection.
+    ble_addr_t mac_address;                          // BLE MAC address
+    bool       is_configured;                        // false if this slot is empty
+    int        status;                               // One of the CAMERA_STATUS_* constants
 } camera_slot_info_t;
 ```
 
@@ -716,6 +722,13 @@ bool     camera_manager_is_gatt_ready(int slot);
 void    *camera_manager_get_driver_ctx(int slot);
 ```
 Slot accessors used by `open_gopro_ble` to route GATT operations to the correct per-camera context.
+
+---
+
+```c
+void camera_manager_set_model_name(int slot, const char *model_name);
+```
+Store the camera's model name string (e.g. `"HERO12 Black"`) in the given slot. Called automatically by `query.c` when a `GetHardwareInfo` response is parsed after GATT setup. The value is held in RAM only — it is not persisted to NVS and will be re-populated on every reconnection. Accessible via `camera_slot_info_t.model_name` from `camera_manager_get_slot_info()`.
 
 ---
 
