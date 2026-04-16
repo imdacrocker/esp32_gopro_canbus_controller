@@ -362,6 +362,18 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
         return;
     }
 
+    /* Handle SetDateTime command response: cmd_id=0x0D */
+    if (cmd_id == 0x0D) {
+        if (status == 0x00) {
+            ESP_LOGI(TAG, "query slot %d: SetDateTime accepted — camera clock updated",
+                     slot);
+        } else {
+            ESP_LOGW(TAG, "query slot %d: SetDateTime rejected — status=0x%02x",
+                     slot, status);
+        }
+        return;
+    }
+
     /* Only handle GetHardwareInfo responses; ignore everything else. */
     if (cmd_id != CMD_GET_HW_INFO) {
         ESP_LOGD(TAG, "query slot %d: unhandled cmd response cmd_id=0x%02x status=0x%02x",

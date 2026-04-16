@@ -172,6 +172,10 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
             camera_manager_set_gatt_ready(slot, true);
             ESP_LOGI(TAG, "GATT setup complete — slot %d ready (%d notification(s))",
                      slot, ctx->notify_count);
+
+            /* Set the camera's clock to the current UTC on every connection
+             * (first pairing and all reconnections). */
+            control_send_set_date_time(conn_handle);
         } else {
             ESP_LOGW(TAG, "GATT setup complete but camera slot not found (handle %d)",
                      conn_handle);

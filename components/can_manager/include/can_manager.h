@@ -125,6 +125,18 @@ typedef void (*can_rx_frame_cb_t)(const can_frame_t *frame, void *user_ctx);
  */
 typedef void (*can_logging_state_cb_t)(bool is_logging, void *user_ctx);
 
+/**
+ * @brief Callback invoked exactly once — the first time a valid UTC timestamp
+ *        is received on CAN ID 0x602 (i.e. the RaceCapture has GPS lock).
+ *
+ * Use this to set the date/time on any cameras that are already connected at
+ * the moment UTC becomes available.  For cameras that connect later,
+ * control_send_set_date_time() is called directly from gatt.c.
+ *
+ * @param user_ctx  Opaque context registered with can_manager_register_utc_acquired_callback().
+ */
+typedef void (*can_utc_acquired_cb_t)(void *user_ctx);
+
 /* ============================================================
  * Public API
  * ============================================================ */
@@ -168,6 +180,19 @@ esp_err_t can_manager_register_rx_callback(can_rx_frame_cb_t cb, void *user_ctx)
  * @return ESP_OK, or ESP_ERR_INVALID_ARG if cb is NULL.
  */
 esp_err_t can_manager_register_logging_callback(can_logging_state_cb_t cb, void *user_ctx);
+
+/**
+ * @brief Register a callback fired exactly once when the first valid UTC
+ *        timestamp is received from the RaceCapture (0x602).
+ *
+ * If a valid UTC has already been received before this is called the callback
+ * will never fire — register before can_manager_init() to avoid the race.
+ *
+ * @param cb        Callback function (must not be NULL).
+ * @param user_ctx  Opaque context pointer passed to the callback unchanged.
+ * @return ESP_OK, or ESP_ERR_INVALID_ARG if cb is NULL.
+ */
+esp_err_t can_manager_register_utc_acquired_callback(can_utc_acquired_cb_t cb, void *user_ctx);
 
 /**
  * @brief Get the current best-estimate UTC time in milliseconds.

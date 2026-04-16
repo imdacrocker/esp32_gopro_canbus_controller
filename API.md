@@ -234,10 +234,11 @@ The controller communicates with RaceCapture over a **1 Mbps CAN bus** using **s
 
 ### Message IDs
 
-| Direction | CAN ID (hex) | CAN ID (decimal) | Rate |
-|-----------|-------------|-----------------|------|
-| RaceCapture → ESP32 | `0x600` | 1536 | ~10 Hz |
-| ESP32 → RaceCapture | `0x601` | 1537 | 5 Hz (fixed) |
+| Direction | CAN ID (hex) | CAN ID (decimal) | Rate | Purpose |
+|-----------|-------------|-----------------|------|---------|
+| RaceCapture → ESP32 | `0x600` | 1536 | ~10 Hz | Logging control |
+| ESP32 → RaceCapture | `0x601` | 1537 | 5 Hz (fixed) | Camera status |
+| RaceCapture → ESP32 | `0x602` | 1538 | 25 Hz | UTC timestamp |
 
 ---
 
@@ -263,6 +264,27 @@ Broadcast by the controller at 5 Hz regardless of whether the bus is active. Eac
 | 2 | Camera slot 2 state | uint8 | See `camera_state_t` below |
 | 3 | Camera slot 3 state | uint8 | See `camera_state_t` below |
 | 4–7 | Reserved | — | `0x00` |
+
+---
+
+### `0x602` — RaceCapture → ESP32 (UTC timestamp frame)
+
+Broadcast by the RaceCapture Lua script at 25 Hz once GPS lock is acquired. Transmission is suppressed when GPS lock has not yet been established (the Lua script checks `getDateTime()` for year ≤ 1970).
+
+| Bytes | Field | Type | Description |
+|-------|-------|------|-------------|
+| 0–7 | `epoch_ms` | uint64, little-endian | Milliseconds since Unix epoch (Jan 1 1970 00:00:00.000 UTC) |
+
+The controller stores the received value alongside the ESP32 monotonic clock timestamp at the moment of receipt. `can_manager_get_utc_ms()` extrapolates forward from this pair so the caller always gets a current estimate between CAN frames.
+
+On the first valid frame received, the controller logs a human-readable timestamp at INFO level and fires the registered `can_utc_acquired_cb_t` callback, e.g.:
+```
+UTC acquired — 2026-04-15 14:32:07.412 UTC  (1744727527412 ms epoch)
+```
+
+> **ID note:** `0x602` is a temporary assignment used until the RaceCapture developer ships native UTC broadcast support. When that firmware is available, remove the Lua script and update `CAN_ID_RC_UTC` in `can_manager.h` to avoid two nodes transmitting on the same ID.
+
+---
 
 ### `camera_state_t` enumeration
 
@@ -388,7 +410,7 @@ OpenGoPro BLE driver implementing the [OpenGoPro BLE 2.0](https://gopro.github.i
 
 | File | Responsibility |
 |------|---------------|
-| `control.c` | Camera control commands (start/stop recording), `start_cmd_pending` guard, status poll timer (5 s), keep-alive timer (3 s) |
+| `control.c` | Camera control commands (start/stop recording, SetDateTime), `start_cmd_pending` guard, status poll timer (5 s), keep-alive timer (3 s) |
 | `driver.c` | `camera_driver_t` vtable, per-camera context allocation, discovery list, component init |
 | `gatt.c` | GATT service/characteristic discovery, MTU negotiation, CCCD subscription |
 | `pairing.c` | BLE lifecycle callbacks: connected, encrypted, disconnected |
@@ -440,6 +462,13 @@ typedef struct {
 void open_gopro_ble_init(void);
 ```
 Initialise the OpenGoPro BLE component. Registers the `camera_driver_t` vtable with `camera_manager`, registers BLE event callbacks with `ble_core`, and starts the recording-status poll timer (5 s) and keep-alive timer (3 s). Must be called before `camera_manager_init()` and `ble_core_init()`.
+
+---
+
+```c
+void open_gopro_ble_sync_time_all(void);
+```
+Send a SetDateTime command to every camera slot that is currently GATT-ready. Called from `main.c`'s `can_utc_acquired_cb_t` handler to cover cameras that were already connected when GPS lock was first established. Slots that are not GATT-ready are skipped silently. Safe to call from any task.
 
 ---
 
@@ -512,9 +541,37 @@ The driver tracks a per-camera `start_cmd_pending` boolean in `gopro_ble_ctx_t` 
 
 Hardware info and other query commands can be issued at any time after the slot is `gatt_ready`. This is implemented in `query.c` and is not part of the public API.
 
+**`SetDateTime` (cmd 0x0D)**
+
+Sets the camera's clock to the current UTC. Sent via one of two paths depending on which is available first — the camera connection or the UTC:
+
+- **Camera connects after UTC is available:** `gatt.c` calls `control_send_set_date_time()` directly when all CCCD subscriptions complete, on every connection (first pairing and all reconnections).
+- **UTC arrives while cameras are already connected:** `can_manager` fires the `can_utc_acquired_cb_t` callback exactly once. `main.c` responds by calling `open_gopro_ble_sync_time_all()`, which iterates all GATT-ready slots and calls `control_send_set_date_time()` for each.
+
+In both cases, `control_send_set_date_time()` reads the current UTC from `can_manager_get_utc_ms()`, converts it to calendar fields via `gmtime_r`, and writes the following TLV command to GP-0072 (`cmd_write`):
+
+| Byte | Value | Description |
+|------|-------|-------------|
+| 0 | `0x09` | GPBS single-packet length (9 bytes follow) |
+| 1 | `0x0D` | SetDateTime command ID |
+| 2 | `0x07` | Parameter length (7 bytes) |
+| 3–4 | year | `uint16`, big-endian |
+| 5 | month | 1–12 |
+| 6 | day | 1–31 |
+| 7 | hour | 0–23 |
+| 8 | minute | 0–59 |
+| 9 | second | 0–59 |
+
+The response arrives on GP-0073 (`cmd_resp_notify`) and is dispatched to `gopro_query_handle_cmd_response()`:
+
+- Status `0x00` → logged at INFO: `SetDateTime accepted — camera clock updated`
+- Any other status → logged at WARN with the rejection code
+
+If UTC is not yet available when `control_send_set_date_time()` is called (e.g. GPS lock not yet acquired on the RaceCapture), the command is skipped with a warning and will not be retried for that connection.
+
 **`SetShutter` response (cmd 0x01)**
 
-After every `control_start_recording()` or `control_stop_recording()` call, the camera sends a command response on `cmd_resp_notify` (GP-0073). `gopro_query_handle_cmd_response()` in `query.c` now handles these:
+After every `control_start_recording()` or `control_stop_recording()` call, the camera sends a command response on `cmd_resp_notify` (GP-0073). `gopro_query_handle_cmd_response()` in `query.c` handles these:
 
 - Status `0x00` → logged at INFO: `SetShutter command accepted by camera`
 - Any other status → logged at WARN with the rejection code
@@ -704,8 +761,9 @@ ESP-IDF v6.0 TWAI (CAN) driver wrapper. Manages the on-chip TWAI node, a FreeRTO
 | `CAN_MANAGER_TASK_PRIORITY` | `5` | FreeRTOS task priority. |
 | `CAN_MANAGER_TX_INTERVAL_MS` | `200` | Camera status broadcast interval. |
 | `CAN_MANAGER_MAX_CAMERAS` | `4` | Maximum camera slots in the `0x601` frame. |
-| `CAN_ID_RC_COMMAND` | `0x600` | Frame ID for RaceCapture commands. |
-| `CAN_ID_CAM_STATUS` | `0x601` | Frame ID for camera status broadcast. |
+| `CAN_ID_RC_COMMAND` | `0x600` | Frame ID for RaceCapture → ESP32 logging commands. |
+| `CAN_ID_CAM_STATUS` | `0x601` | Frame ID for ESP32 → RaceCapture camera status broadcast. |
+| `CAN_ID_RC_UTC`     | `0x602` | Frame ID for RaceCapture → ESP32 UTC timestamp. Temporary — see `0x602` frame spec above. |
 
 #### Types
 
@@ -745,6 +803,12 @@ typedef void (*can_rx_frame_cb_t)(const can_frame_t *frame, void *user_ctx);
 typedef void (*can_logging_state_cb_t)(bool is_logging, void *user_ctx);
 ```
 
+**`can_utc_acquired_cb_t`** — callback fired exactly once when the first valid UTC timestamp is received (GPS lock acquired). Used to set the date/time on cameras that are already connected at that moment.
+
+```c
+typedef void (*can_utc_acquired_cb_t)(void *user_ctx);
+```
+
 #### Functions
 
 ```c
@@ -776,9 +840,25 @@ Register a callback fired when the RaceCapture `isLogging` value in `0x600` fram
 ---
 
 ```c
+esp_err_t can_manager_register_utc_acquired_callback(can_utc_acquired_cb_t cb, void *user_ctx);
+```
+Register a callback fired exactly once when the first valid UTC timestamp is received on `0x602`. Intended for setting the date/time on cameras that are already GATT-ready at the moment GPS lock is first established. Register before `can_manager_init()` to avoid missing the event. Returns `ESP_ERR_INVALID_ARG` if `cb` is `NULL`.
+
+---
+
+```c
 esp_err_t can_manager_set_camera_state(uint8_t camera_idx, camera_state_t state);
 ```
 Update the recorded state for camera slot `camera_idx` (0-based). The new state is included in the next `0x601` broadcast within 200 ms. Thread-safe — may be called from any task. Returns `ESP_ERR_INVALID_ARG` if `camera_idx >= CAN_MANAGER_MAX_CAMERAS` or `state` is out of range.
+
+---
+
+```c
+bool can_manager_get_utc_ms(uint64_t *epoch_ms_out);
+```
+Get the current best-estimate UTC as a millisecond Unix epoch. Uses the last received `0x602` timestamp plus elapsed time from the ESP32's monotonic clock (`esp_timer_get_time`) to extrapolate forward, so the result is current even between CAN frames. Thread-safe — may be called from any task.
+
+Returns `true` and writes to `*epoch_ms_out` if a valid UTC has been received from the RaceCapture (GPS lock acquired). Returns `false` and leaves `*epoch_ms_out` undefined if no valid `0x602` frame has been received yet.
 
 ---
 

@@ -50,6 +50,21 @@ static void on_camera_state_changed(int slot, int status, void *user_ctx)
  * keeps retrying if a camera is mid-reconnect, then immediately dispatches
  * the start/stop command to every camera that is already GATT-ready.
  */
+/**
+ * Called by can_manager exactly once, the first time a valid UTC timestamp
+ * is received on 0x602 (i.e. the RaceCapture has acquired GPS lock).
+ *
+ * Sends SetDateTime to any cameras that were already connected and GATT-ready
+ * before UTC became available.  Cameras that connect later have their clocks
+ * set directly from gatt.c when their CCCD subscriptions complete.
+ */
+static void on_utc_acquired(void *user_ctx)
+{
+    (void)user_ctx;
+    ESP_LOGI(TAG, "UTC acquired — syncing time to all connected cameras");
+    open_gopro_ble_sync_time_all();
+}
+
 static void on_logging_state_changed(bool is_logging, void *user_ctx)
 {
     if (is_logging) {
@@ -115,9 +130,9 @@ void app_main(void)
      * kicks off the boot reconnect chain. */
     ble_core_init();
 
-    /* Register the logging-state callback before init so no transitions
-     * are missed during startup. */
+    /* Register CAN callbacks before init so no events are missed during startup. */
     can_manager_register_logging_callback(on_logging_state_changed, NULL);
+    can_manager_register_utc_acquired_callback(on_utc_acquired, NULL);
 
     ret = can_manager_init();
     if (ret != ESP_OK) {

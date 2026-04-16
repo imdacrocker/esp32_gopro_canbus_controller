@@ -160,6 +160,22 @@ void open_gopro_ble_connect_by_addr(const ble_addr_t *addr);
 const camera_driver_t *open_gopro_ble_get_driver(void);
 
 /**
+ * @brief Send a SetDateTime command to every currently GATT-ready camera.
+ *
+ * Intended to be called from the can_manager UTC-acquired callback so that
+ * cameras already connected at the moment GPS lock is first established also
+ * have their clocks set.  For cameras that connect after UTC is already
+ * available, control_send_set_date_time() is called directly from gatt.c.
+ *
+ * Fetches the current UTC from can_manager_get_utc_ms() once and uses it for
+ * all slots in the same call.  Slots that are not GATT-ready are skipped
+ * silently.
+ *
+ * Safe to call from any task.
+ */
+void open_gopro_ble_sync_time_all(void);
+
+/**
  * @brief Allocate and initialise a per-camera driver context.
  *
  * Called by camera_manager each time a GoPro camera slot is loaded from NVS

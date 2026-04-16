@@ -66,8 +66,9 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 │  camera_manager │             │   can_manager   │
 │  (slot state,   │◄───────────►│  (TWAI node,    │
 │   NVS persist,  │  state CB   │   0x600 RX,     │
-│   tick timer)   │             │   0x601 TX 5Hz) │
-└────────┬────────┘             └─────────────────┘
+│   tick timer)   │             │   0x601 TX 5Hz, │
+└────────┬────────┘             │   0x602 RX UTC) │
+         │                      └─────────────────┘
          │ driver vtable
          ▼
 ┌─────────────────┐
@@ -95,7 +96,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 └─────────────────┘
 ```
 
-**Data flow summary (CAN path):**
+**Data flow summary (CAN path — recording control):**
 
 1. RaceCapture sends a `0x600` CAN frame with `isLogging = 1`.
 2. `can_manager` detects the state change and calls the registered logging callback.
@@ -106,6 +107,17 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 7. `camera_manager`'s tick timer (2 s) reads the recording status from each driver and fires the state-change callback. If a camera that was previously confirmed as recording is now idle (e.g. it stopped unexpectedly), the tick dispatches a recovery start command. The start command is not retried while the initial command is still in flight — `open_gopro_ble` sets an internal `start_cmd_pending` flag when the command is sent and clears it only after the status poll confirms the transition (IDLE→RECORDING clears it on the happy path; RECORDING→IDLE clears it to allow the recovery send).
 8. `app_main`'s state-change callback maps the internal status to a `camera_state_t` and calls `can_manager_set_camera_state()`.
 9. `can_manager` broadcasts the updated `0x601` status frame to RaceCapture at 5 Hz.
+
+**Data flow summary (CAN path — UTC time sync):**
+
+1. A Lua script on the RaceCapture reads GPS-derived UTC from `getDateTime()` and broadcasts it at 25 Hz on CAN ID `0x602` once GPS lock is acquired. The payload is a 64-bit millisecond Unix epoch timestamp, little-endian, in all 8 bytes.
+2. `can_manager` receives each `0x602` frame and records the epoch value alongside the ESP32 monotonic timestamp (`esp_timer_get_time()`) at the moment of receipt. The first valid frame (year > 2020) is logged at INFO level with a human-readable UTC string.
+3. `can_manager_get_utc_ms()` extrapolates the stored epoch forward using elapsed monotonic time, so callers always get a current estimate regardless of when the last CAN frame arrived.
+4. SetDateTime is sent to each camera via one of two paths depending on timing:
+   - **Camera connects after UTC is available:** when GATT setup completes (all CCCD subscriptions done), `gatt.c` calls `control_send_set_date_time()` directly.
+   - **Camera is already connected when UTC first arrives:** `can_manager` fires a one-shot `can_utc_acquired_cb_t` callback. `main.c` handles it by calling `open_gopro_ble_sync_time_all()`, which iterates all GATT-ready slots and calls `control_send_set_date_time()` for each.
+5. In both cases, `control_send_set_date_time()` fetches the current UTC from `can_manager_get_utc_ms()`, converts it to calendar fields, and writes a SetDateTime TLV command (ID `0x0D`) to GP-0072 (`cmd_write`).
+6. The camera responds on GP-0073 (`cmd_resp_notify`). `query.c` logs whether the camera accepted or rejected the command.
 
 **Data flow summary (web UI path):**
 
@@ -126,7 +138,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 | `ble_core` | NimBLE stack wrapper. Owns scan, connect, encrypt, GATT write, and bond management. Camera-agnostic. |
 | `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). The camera is considered ready as soon as CCCD subscriptions complete — no polling loop is needed. `GetHardwareInfo` is available on demand via `gopro_query_send_hw_info()`. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
 | `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. |
-| `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` frames, broadcasts `0x601` frames at 5 Hz. Thread-safe camera state updates. |
+| `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` (isLogging) and `0x602` (UTC timestamp) frames; broadcasts `0x601` camera status at 5 Hz. Exposes `can_manager_get_utc_ms()` for on-demand UTC retrieval with monotonic-clock extrapolation. Thread-safe. |
 | `wifi_manager` | Soft-AP + HTTP server. Serves the embedded web UI and all `/api/*` endpoints. |
 
 ---
@@ -200,8 +212,9 @@ All user-configurable values are defined as compile-time constants in the releva
 | `CAN_MANAGER_RX_QUEUE_DEPTH` | `32` | Software RX queue depth. |
 | `CAN_MANAGER_TX_QUEUE_DEPTH` | `8` | Hardware TX queue depth. |
 | `CAN_MANAGER_TASK_PRIORITY` | `5` | FreeRTOS priority of the CAN processing task. |
-| `CAN_ID_RC_COMMAND` | `0x600` | CAN ID for RaceCapture → ESP32 commands. |
-| `CAN_ID_CAM_STATUS` | `0x601` | CAN ID for ESP32 → RaceCapture status. |
+| `CAN_ID_RC_COMMAND` | `0x600` | CAN ID for RaceCapture → ESP32 logging commands. |
+| `CAN_ID_CAM_STATUS` | `0x601` | CAN ID for ESP32 → RaceCapture camera status broadcast. |
+| `CAN_ID_RC_UTC`     | `0x602` | CAN ID for RaceCapture → ESP32 UTC timestamp. Temporary ID — will migrate to the RaceCapture developer's standard ID when native UTC broadcast is available in firmware. |
 
 ### OpenGoPro BLE (`components/open_gopro_ble/include/open_gopro_ble.h`)
 
@@ -281,9 +294,17 @@ A CAN preset will be available soon
 
 To broadcast the logging status on the RaceCapture, you will need to use Lua.  You can insert this line anywhere in your onTick function:
 
-```bash
+```lua
 txCAN(0, 0x600, 0, {isLogging(), 0, 0, 0, 0, 0, 0, 0})
 ```
+
+#### Sending UTC timestamp (0x602)
+
+The controller uses the RaceCapture's GPS-derived UTC to set the date and time on each camera at connection. Use the provided Lua script (`racecapture_utc_broadcast.lua`) as a standalone script on the RaceCapture.
+
+The script broadcasts a 64-bit millisecond Unix epoch timestamp at 25 Hz on CAN ID `0x602`, little-endian, once GPS lock is acquired. Transmission is suppressed until a valid GPS fix is available.
+
+> **Note:** `0x602` is a temporary ID used until the RaceCapture developer ships native UTC broadcast support in firmware. When that happens, remove this Lua script and update `CAN_ID_RC_UTC` in `can_manager.h` to the developer's assigned ID to avoid two nodes transmitting on the same ID.
 
 ---
 

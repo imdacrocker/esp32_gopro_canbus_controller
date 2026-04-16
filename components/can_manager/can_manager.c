@@ -33,6 +33,10 @@ static can_logging_state_cb_t s_logging_cb     = NULL;
 static void                  *s_logging_cb_ctx = NULL;
 static bool                   s_last_logging   = false;   /* tracks previous state */
 
+/* UTC-acquired callback, fired exactly once on first valid 0x602 frame. */
+static can_utc_acquired_cb_t  s_utc_acquired_cb     = NULL;
+static void                  *s_utc_acquired_cb_ctx = NULL;
+
 /* Camera states broadcast in 0x601.  Written from any task, read from the
  * processing task.  Single-byte writes are atomic on ESP32-S3 Xtensa LX7,
  * so volatile is sufficient here — no mutex needed. */
@@ -208,6 +212,12 @@ static void handle_rc_utc(const can_frame_t *frame)
                  ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
                  ti.tm_hour, ti.tm_min, ti.tm_sec,
                  epoch_ms % 1000, epoch_ms);
+
+        /* Notify any registered listener (e.g. to set date/time on cameras
+         * that are already connected at the moment UTC first becomes valid). */
+        if (s_utc_acquired_cb) {
+            s_utc_acquired_cb(s_utc_acquired_cb_ctx);
+        }
     }
 }
 
@@ -339,6 +349,16 @@ esp_err_t can_manager_register_logging_callback(can_logging_state_cb_t cb, void 
     }
     s_logging_cb     = cb;
     s_logging_cb_ctx = user_ctx;
+    return ESP_OK;
+}
+
+esp_err_t can_manager_register_utc_acquired_callback(can_utc_acquired_cb_t cb, void *user_ctx)
+{
+    if (cb == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_utc_acquired_cb     = cb;
+    s_utc_acquired_cb_ctx = user_ctx;
     return ESP_OK;
 }
 

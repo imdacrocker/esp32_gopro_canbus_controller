@@ -44,11 +44,13 @@
 
 #include "open_gopro_ble_internal.h"
 
+#include <time.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "host/ble_hs.h"
 #include "ble_core.h"
 #include "camera_manager.h"
+#include "can_manager.h"
 
 static const char *TAG = "open_gopro_ble";
 
@@ -166,6 +168,113 @@ void control_send_pairing_complete(uint16_t conn_handle)
     }
 
     ctx->is_first_pairing = false;
+}
+
+/* -------------------------------------------------------------------------
+ * Set Date/Time — sent once per connection after GATT setup completes
+ * ------------------------------------------------------------------------- */
+
+#define CMD_SET_DATE_TIME  0x0D
+
+/*
+ * control_send_set_date_time()
+ *
+ * Builds and transmits an OpenGoPro SetDateTime command (ID 0x0D) to the
+ * camera on GP-0072 (Command characteristic).  The current UTC is read from
+ * can_manager_get_utc_ms(), which extrapolates forward from the last 0x602
+ * CAN frame so the value is current regardless of when this is called.
+ *
+ * If the RaceCapture has not yet acquired GPS lock (no valid UTC available),
+ * the command is skipped with a warning.  The caller is responsible for any
+ * retry logic.
+ *
+ * Response arrives on GP-0073 (cmd_resp_notify) and is confirmed by the
+ * 0x0D handler in gopro_query_handle_cmd_response() (query.c).
+ *
+ * OpenGoPro TLV packet layout:
+ *
+ *   Byte 0: 0x09  GPBS single-packet length (9 bytes follow)
+ *   Byte 1: 0x0D  SetDateTime command ID
+ *   Byte 2: 0x07  Parameter length (7 bytes)
+ *   Bytes 3–4:    year  (uint16, big-endian)
+ *   Byte 5:       month (1–12)
+ *   Byte 6:       day   (1–31)
+ *   Byte 7:       hour  (0–23)
+ *   Byte 8:       minute (0–59)
+ *   Byte 9:       second (0–59)
+ *
+ * Example: 2023-01-31 03:04:05 → 09:0D:07:07:E7:01:1F:03:04:05
+ */
+esp_err_t control_send_set_date_time(uint16_t conn_handle)
+{
+    int slot = camera_manager_find_by_handle(conn_handle);
+    if (slot < 0) {
+        ESP_LOGW(TAG, "set_date_time: no camera slot for handle %d", conn_handle);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    gopro_ble_ctx_t *gctx = (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
+    if (!gctx || gctx->gatt.cmd_write == 0) {
+        ESP_LOGW(TAG, "slot %d: set_date_time: cmd_write handle not available", slot);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Fetch the current best-estimate UTC.  Returns false if GPS lock has not
+     * yet been established on the RaceCapture. */
+    uint64_t epoch_ms;
+    if (!can_manager_get_utc_ms(&epoch_ms)) {
+        ESP_LOGW(TAG, "slot %d: set_date_time: UTC not yet available — "
+                 "skipping (no GPS lock on RaceCapture)", slot);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Break epoch into calendar fields. */
+    time_t    t = (time_t)(epoch_ms / 1000);
+    struct tm ti;
+    gmtime_r(&t, &ti);
+
+    uint16_t year   = (uint16_t)(ti.tm_year + 1900);
+    uint8_t  month  = (uint8_t)(ti.tm_mon + 1);   /* tm_mon is 0-based */
+    uint8_t  day    = (uint8_t)(ti.tm_mday);
+    uint8_t  hour   = (uint8_t)(ti.tm_hour);
+    uint8_t  minute = (uint8_t)(ti.tm_min);
+    uint8_t  second = (uint8_t)(ti.tm_sec);
+
+    uint8_t pkt[10] = {
+        0x09,                           /* GPBS length */
+        CMD_SET_DATE_TIME,              /* cmd_id */
+        0x07,                           /* param length */
+        (uint8_t)(year >> 8),           /* year high byte */
+        (uint8_t)(year & 0xFF),         /* year low byte  */
+        month, day, hour, minute, second
+    };
+
+    ESP_LOGI(TAG, "slot %d: SetDateTime → %04d-%02d-%02d %02d:%02d:%02d UTC",
+             slot, year, month, day, hour, minute, second);
+
+    esp_err_t err = ble_core_gatt_write(conn_handle, gctx->gatt.cmd_write,
+                                        pkt, sizeof(pkt));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "slot %d: SetDateTime write failed (%s)",
+                 slot, esp_err_to_name(err));
+    }
+    return err;
+}
+
+void open_gopro_ble_sync_time_all(void)
+{
+    for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
+        if (!camera_manager_is_gatt_ready(i)) {
+            continue;
+        }
+
+        uint16_t conn_h = camera_manager_get_handle(i);
+        if (conn_h == BLE_HS_CONN_HANDLE_NONE) {
+            continue;
+        }
+
+        control_send_set_date_time(conn_h);
+    }
 }
 
 /* -------------------------------------------------------------------------

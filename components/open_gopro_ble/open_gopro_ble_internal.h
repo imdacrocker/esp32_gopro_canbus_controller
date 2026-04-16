@@ -94,3 +94,15 @@ camera_recording_status_t control_get_recording_status(void *ctx);
 
 void open_gopro_control_start_timers(void);
 void control_send_pairing_complete(uint16_t conn_handle);
+
+/**
+ * Send a SetDateTime command (0x0D) to the camera on GP-0072.
+ *
+ * Fetches the current UTC from can_manager_get_utc_ms() and sends it.
+ * Must be called after GATT discovery and CCCD subscriptions are complete
+ * (cmd_write handle must be populated and cmd_resp_notify subscribed).
+ *
+ * Returns ESP_ERR_INVALID_STATE if UTC is not yet available (no GPS lock).
+ * The caller is responsible for any retry logic in that case.
+ */
+esp_err_t control_send_set_date_time(uint16_t conn_handle);
