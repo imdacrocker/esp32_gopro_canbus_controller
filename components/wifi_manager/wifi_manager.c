@@ -313,6 +313,37 @@ static const httpd_uri_t api_logging_state_uri = {
     .handler = api_logging_state_handler,
 };
 
+/* GET /api/utc — current UTC time derived from the RaceCapture GPS clock
+ *
+ * Returns: {"valid":true,"epoch_ms":NNNN} once GPS lock has been acquired,
+ *          {"valid":false}                if no valid UTC frame received yet.
+ *
+ * The ESP32 extrapolates the current time between 0x602 frames using its
+ * monotonic timer (see can_manager_get_utc_ms), so sub-second accuracy is
+ * maintained without waiting for the next CAN frame.
+ */
+static esp_err_t api_utc_handler(httpd_req_t *req)
+{
+    uint64_t epoch_ms = 0;
+    bool valid = can_manager_get_utc_ms(&epoch_ms);
+
+    char buf[64];
+    if (valid) {
+        snprintf(buf, sizeof(buf), "{\"valid\":true,\"epoch_ms\":%llu}", epoch_ms);
+    } else {
+        snprintf(buf, sizeof(buf), "{\"valid\":false}");
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_utc_uri = {
+    .uri     = "/api/utc",
+    .method  = HTTP_GET,
+    .handler = api_utc_handler,
+};
+
 /* POST /api/shutter — body: {"on":true} or {"on":false}
  *
  * Sends a start/stop recording command to every connected, GATT-ready camera.
@@ -385,6 +416,7 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_shutter_uri);
         httpd_register_uri_handler(server, &api_paired_cameras_uri);
         httpd_register_uri_handler(server, &api_logging_state_uri);
+        httpd_register_uri_handler(server, &api_utc_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");

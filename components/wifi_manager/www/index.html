@@ -42,21 +42,28 @@
         .badge-not_recording{ background: #eaf5ea; color: #2e7d32; }
         #cam-status-empty   { color: #888; font-size: 0.9em; }
 
-        /* RaceCapture logging state pill */
+        /* RaceCapture logging state pill + UTC row */
+        #status-row { display: flex; align-items: center; gap: 0.8em; margin: 0.4em 0 0.6em; flex-wrap: wrap; }
         #rc-logging-pill { display: inline-block; padding: 0.3em 0.9em;
                            border-radius: 1em; font-size: 0.85em; font-weight: bold;
-                           margin: 0.2em 0 1em; letter-spacing: 0.02em; }
+                           letter-spacing: 0.02em; }
         .rc-logging     { background: #27ae60; color: #fff; }
         .rc-not-logging { background: #ddd;    color: #555; }
         .rc-unknown     { background: #f39c12; color: #fff; }
+        #utc-display { font-size: 0.9em; color: #555; font-family: monospace; }
+        #scan-row { margin-bottom: 0.6em; }
     </style>
 </head>
 <body>
     <h1>GoPro Controller</h1>
-    <div id="rc-logging-pill" class="rc-unknown">RC: Unknown</div>
-
-    <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
-    <button id="reset-btn" onclick="resetBonds()">Reset Bonds</button>
+    <div id="status-row">
+        <div id="rc-logging-pill" class="rc-unknown">RC: Unknown</div>
+        <span id="utc-display">--:--:-- UTC</span>
+    </div>
+    <div id="scan-row">
+        <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
+        <button id="reset-btn" onclick="resetBonds()">Reset Bonds</button>
+    </div>
 
     <div id="control-bar">
         <button id="start-btn" onclick="sendShutter(true)">&#9654; Start Recording</button>
@@ -126,6 +133,22 @@
                     var el  = document.getElementById('rc-logging-pill');
                     el.className  = 'rc-' + s.replace('_', '-');
                     el.textContent = RC_LOGGING_LABELS[s] || ('RC: ' + s);
+                })
+                .catch(function() {});
+
+            fetch('/api/utc')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var utcEl = document.getElementById('utc-display');
+                    if (data.valid) {
+                        var d = new Date(data.epoch_ms);
+                        var h = String(d.getUTCHours()).padStart(2, '0');
+                        var m = String(d.getUTCMinutes()).padStart(2, '0');
+                        var s = String(d.getUTCSeconds()).padStart(2, '0');
+                        utcEl.textContent = h + ':' + m + ':' + s + ' UTC';
+                    } else {
+                        utcEl.textContent = 'No GPS';
+                    }
                 })
                 .catch(function() {});
         }
