@@ -137,12 +137,12 @@ Returns all configured camera slots with their current live status.
 ```json
 [
   {
-    "index": 0,
+    "index": 1,
     "addr": "AA:BB:CC:DD:EE:FF",
     "status": "recording"
   },
   {
-    "index": 1,
+    "index": 2,
     "addr": "11:22:33:44:55:66",
     "status": "disconnected"
   }
@@ -151,7 +151,7 @@ Returns all configured camera slots with their current live status.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `index` | integer | Camera slot index (0-based, up to `CAMERA_MAX_SLOTS - 1`). |
+| `index` | integer | Camera slot index (1-based, 1 to `CAMERA_MAX_SLOTS`). |
 | `addr` | string | BLE MAC address of the paired camera. |
 | `status` | string | Live status string (see table below). |
 
@@ -257,12 +257,14 @@ Sent by RaceCapture to command the controller's logging state. The controller fi
 
 Broadcast by the controller at 5 Hz regardless of whether the bus is active. Each byte reports the state of one camera slot.
 
+> **Numbering note:** Cameras are numbered 1–4 in the HTTP API and web UI. In this CAN frame the byte *offset* is 0-based (byte 0 = Camera 1, byte 1 = Camera 2, etc.) — this is a CAN frame layout convention and matches the RaceCapture Direct CAN Mapping offsets.
+
 | Byte | Field | Type | Values |
 |------|-------|------|--------|
-| 0 | Camera slot 0 state | uint8 | See `camera_state_t` below |
-| 1 | Camera slot 1 state | uint8 | See `camera_state_t` below |
-| 2 | Camera slot 2 state | uint8 | See `camera_state_t` below |
-| 3 | Camera slot 3 state | uint8 | See `camera_state_t` below |
+| 0 | Camera 1 state | uint8 | See `camera_state_t` below |
+| 1 | Camera 2 state | uint8 | See `camera_state_t` below |
+| 2 | Camera 3 state | uint8 | See `camera_state_t` below |
+| 3 | Camera 4 state | uint8 | See `camera_state_t` below |
 | 4–7 | Reserved | — | `0x00` |
 
 ---
@@ -618,7 +620,7 @@ Camera slot state machine. Persists camera records to NVS. Runs a 2-second tick 
 
 ```c
 typedef struct {
-    int        index;                                // Slot index (0-based)
+    int        index;                                // Slot index (0-based internally; HTTP API adds 1 to produce the 1-based user-facing index)
     char       name[CAMERA_NAME_LEN];               // Advertised camera name
     char       model_name[CAMERA_MODEL_NAME_LEN];   // Model string from GetHardwareInfo, e.g. "HERO12 Black". Empty until hw_info is received after connection.
     ble_addr_t mac_address;                          // BLE MAC address
@@ -633,7 +635,7 @@ typedef struct {
 typedef void (*camera_state_change_fn_t)(int slot, int status, void *ctx);
 ```
 
-`slot` is the 0-based camera slot index; `status` is one of the `CAMERA_STATUS_*` constants.
+`slot` is the 0-based camera slot index (Camera 1 = slot 0, Camera 4 = slot 3); `status` is one of the `CAMERA_STATUS_*` constants.
 
 #### Functions
 
@@ -862,7 +864,7 @@ Register a callback fired exactly once when the first valid UTC timestamp is rec
 ```c
 esp_err_t can_manager_set_camera_state(uint8_t camera_idx, camera_state_t state);
 ```
-Update the recorded state for camera slot `camera_idx` (0-based). The new state is included in the next `0x601` broadcast within 200 ms. Thread-safe — may be called from any task. Returns `ESP_ERR_INVALID_ARG` if `camera_idx >= CAN_MANAGER_MAX_CAMERAS` or `state` is out of range.
+Update the recorded state for camera slot `camera_idx` (0-based internally; Camera 1 = index 0, Camera 4 = index 3). The new state is included in the next `0x601` broadcast within 200 ms. Thread-safe — may be called from any task. Returns `ESP_ERR_INVALID_ARG` if `camera_idx >= CAN_MANAGER_MAX_CAMERAS` or `state` is out of range.
 
 ---
 
@@ -928,3 +930,4 @@ struct camera_driver {
 ```
 
 All three function pointers receive the per-camera `ctx` allocated by the driver's factory function. `get_recording_status` must be non-blocking and return a cached value. `start_recording` and `stop_recording` dispatch commands asynchronously and return `ESP_OK` if the command was sent, or `ESP_ERR_INVALID_STATE` if the camera is not ready or a start command is already in flight (see `start_cmd_pending` in the `open_gopro_ble` section).
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            

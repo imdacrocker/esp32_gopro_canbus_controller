@@ -240,7 +240,7 @@ static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
             "{\"index\":%d,"
             "\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
             "\"status\":\"%s\"}",
-            i,
+            i + 1,
             v[5], v[4], v[3], v[2], v[1], v[0],
             status_str);
     }
