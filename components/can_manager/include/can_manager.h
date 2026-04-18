@@ -37,6 +37,11 @@ extern "C" {
  *  200 ms = 5 Hz.  Must be a multiple of the task tick period (100 ms). */
 #define CAN_MANAGER_TX_INTERVAL_MS  200U
 
+/** If no 0x600 logging-command frame is received within this window the
+ *  logging state transitions to LOGGING_STATE_UNKNOWN.  Must be a multiple
+ *  of the task tick period (100 ms). */
+#define CAN_MANAGER_LOGGING_TIMEOUT_MS  5000U
+
 /* ============================================================
  * CAN Protocol — Message IDs
  * Both sides use standard 11-bit (non-extended) frames.
@@ -72,6 +77,18 @@ extern "C" {
 /* ============================================================
  * Public Types
  * ============================================================ */
+
+/**
+ * @brief Known state of the RaceCapture logging signal, derived from 0x600 frames.
+ *
+ * LOGGING_STATE_UNKNOWN is the initial state and is also entered whenever
+ * no 0x600 frame has been received within CAN_MANAGER_LOGGING_TIMEOUT_MS.
+ */
+typedef enum {
+    LOGGING_STATE_UNKNOWN     = 0,  /**< No recent 0x600 — RaceCapture absent or silent */
+    LOGGING_STATE_NOT_LOGGING = 1,  /**< 0x600 received: isLogging == 0                */
+    LOGGING_STATE_LOGGING     = 2,  /**< 0x600 received: isLogging != 0                */
+} logging_state_t;
 
 /**
  * @brief State of a single camera slot, transmitted in 0x601 frames.
@@ -116,14 +133,20 @@ typedef struct {
 typedef void (*can_rx_frame_cb_t)(const can_frame_t *frame, void *user_ctx);
 
 /**
- * @brief Callback invoked when the RaceCapture logging state changes (0x600).
+ * @brief Callback invoked when the RaceCapture logging state changes.
  *
- * Only fired when the state actually changes, not on every received frame.
+ * Fired when the state transitions between any of the three values:
+ * LOGGING_STATE_UNKNOWN, LOGGING_STATE_NOT_LOGGING, LOGGING_STATE_LOGGING.
  *
- * @param is_logging  true if RaceCapture is actively logging, false if stopped.
- * @param user_ctx    Opaque context registered with can_manager_register_logging_callback().
+ * Transitions to UNKNOWN occur when no 0x600 frame has been received within
+ * CAN_MANAGER_LOGGING_TIMEOUT_MS (5 s).  Transitions between LOGGING and
+ * NOT_LOGGING are driven by the isLogging byte in the 0x600 frame.  The
+ * callback is never called when the state does not change.
+ *
+ * @param state     New logging state.
+ * @param user_ctx  Opaque context registered with can_manager_register_logging_callback().
  */
-typedef void (*can_logging_state_cb_t)(bool is_logging, void *user_ctx);
+typedef void (*can_logging_state_cb_t)(logging_state_t state, void *user_ctx);
 
 /**
  * @brief Callback invoked exactly once — the first time a valid UTC timestamp
@@ -171,9 +194,10 @@ esp_err_t can_manager_deinit(void);
 esp_err_t can_manager_register_rx_callback(can_rx_frame_cb_t cb, void *user_ctx);
 
 /**
- * @brief Register a callback for RaceCapture logging state changes (0x600).
+ * @brief Register a callback for RaceCapture logging state changes.
  *
- * The callback fires only when the isLogging value changes, not on every frame.
+ * The callback fires only when the state transitions, never on every frame.
+ * See can_logging_state_cb_t for the full set of transitions.
  *
  * @param cb        Callback function (must not be NULL).
  * @param user_ctx  Opaque context pointer passed to the callback unchanged.
@@ -193,6 +217,20 @@ esp_err_t can_manager_register_logging_callback(can_logging_state_cb_t cb, void 
  * @return ESP_OK, or ESP_ERR_INVALID_ARG if cb is NULL.
  */
 esp_err_t can_manager_register_utc_acquired_callback(can_utc_acquired_cb_t cb, void *user_ctx);
+
+/**
+ * @brief Get the current RaceCapture logging state.
+ *
+ * Returns LOGGING_STATE_UNKNOWN until the first 0x600 frame arrives, and
+ * reverts to LOGGING_STATE_UNKNOWN again if no 0x600 has been received
+ * within CAN_MANAGER_LOGGING_TIMEOUT_MS.
+ *
+ * Thread-safe: 32-bit aligned reads are single-instruction on Xtensa LX7.
+ * May be called from any task.
+ *
+ * @return Current logging_state_t value.
+ */
+logging_state_t can_manager_get_logging_state(void);
 
 /**
  * @brief Get the current best-estimate UTC time in milliseconds.

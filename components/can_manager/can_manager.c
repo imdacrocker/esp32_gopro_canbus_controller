@@ -28,10 +28,11 @@ static TaskHandle_t         s_rx_task   = NULL;
 static can_rx_frame_cb_t    s_rx_cb     = NULL;
 static void                *s_rx_cb_ctx = NULL;
 
-/* Logging-state callback, fired only when the value changes. */
-static can_logging_state_cb_t s_logging_cb     = NULL;
-static void                  *s_logging_cb_ctx = NULL;
-static bool                   s_last_logging   = false;   /* tracks previous state */
+/* Logging-state callback, fired only when the state transitions. */
+static can_logging_state_cb_t s_logging_cb      = NULL;
+static void                  *s_logging_cb_ctx  = NULL;
+static volatile logging_state_t s_logging_state  = LOGGING_STATE_UNKNOWN; /* current state */
+static int64_t                s_last_cmd_rx_us  = 0;   /* esp_timer_get_time() of last 0x600 */
 
 /* UTC-acquired callback, fired exactly once on first valid 0x602 frame. */
 static can_utc_acquired_cb_t  s_utc_acquired_cb     = NULL;
@@ -132,9 +133,23 @@ static bool on_error(twai_node_handle_t handle,
  * Internal — Protocol Handlers (task context)
  * ============================================================ */
 
+/** Human-readable label for a logging_state_t value (for log messages). */
+static const char *logging_state_name(logging_state_t state)
+{
+    switch (state) {
+        case LOGGING_STATE_LOGGING:     return "LOGGING";
+        case LOGGING_STATE_NOT_LOGGING: return "NOT_LOGGING";
+        default:                        return "UNKNOWN";
+    }
+}
+
 /**
  * Process a received 0x600 frame (RaceCapture → ESP32 commands).
- * Byte 0: isLogging (0 or 1).  Only fires the callback when the value changes.
+ * Byte 0: isLogging (0 or 1).
+ *
+ * Always stamps s_last_cmd_rx_us regardless of whether the state changes,
+ * so the 5 s timeout resets on every valid frame.  The callback fires only
+ * when the state actually changes.
  */
 static void handle_rc_command(const can_frame_t *frame)
 {
@@ -143,21 +158,26 @@ static void handle_rc_command(const can_frame_t *frame)
         return;
     }
 
-    bool is_logging = (frame->data[0] != 0);
+    /* Reset the timeout clock on every valid frame. */
+    s_last_cmd_rx_us = esp_timer_get_time();
 
-    if (is_logging == s_last_logging) {
+    logging_state_t new_state = (frame->data[0] != 0)
+                                ? LOGGING_STATE_LOGGING
+                                : LOGGING_STATE_NOT_LOGGING;
+
+    if (new_state == s_logging_state) {
         return;     /* no change — nothing to do */
     }
 
-    /* DBG: log only when the value actually changes. */
-    ESP_LOGI(TAG, "0x600 RX: byte0=0x%02X  isLogging=%d  (prev=%d)",
-             frame->data[0], (int)is_logging, (int)s_last_logging);
+    ESP_LOGI(TAG, "0x600 RX: byte0=0x%02X  logging state: %s → %s",
+             frame->data[0],
+             logging_state_name(s_logging_state),
+             logging_state_name(new_state));
 
-    s_last_logging = is_logging;
-    ESP_LOGI(TAG, "RaceCapture logging: %s", is_logging ? "STARTED" : "STOPPED");
+    s_logging_state = new_state;
 
     if (s_logging_cb) {
-        s_logging_cb(is_logging, s_logging_cb_ctx);
+        s_logging_cb(s_logging_state, s_logging_cb_ctx);
     }
 }
 
@@ -263,8 +283,14 @@ static void can_rx_task(void *arg)
     // int         diag_tick = 0;  /* counts 100 ms ticks for 5 s diagnostics */
     int         tx_tick   = 0;  /* counts 100 ms ticks for 5 Hz TX */
 
-    const int tx_ticks   = (int)(CAN_MANAGER_TX_INTERVAL_MS / 100U); /* = 2 */
-    // const int diag_ticks = 50;                                         /* = 5 s */
+    const int    tx_ticks      = (int)(CAN_MANAGER_TX_INTERVAL_MS / 100U);   /* = 2  */
+    const int64_t logging_timeout_us =
+        (int64_t)CAN_MANAGER_LOGGING_TIMEOUT_MS * 1000LL;                    /* = 5 s in µs */
+
+    /* Stamp the clock now so the timeout is measured from task-start, not from
+     * the epoch origin (which would cause an instant UNKNOWN→UNKNOWN no-op on
+     * first check — harmless, but misleading). */
+    s_last_cmd_rx_us = esp_timer_get_time();
 
     ESP_LOGI(TAG, "Processing task started");
 
@@ -313,6 +339,21 @@ static void can_rx_task(void *arg)
             esp_err_t ret = twai_node_recover(s_node);
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "Recovery failed: %s", esp_err_to_name(ret));
+            }
+        }
+
+        /* ---- Logging timeout → UNKNOWN ------------------------------- */
+        /* Only meaningful when we're in a known state; if we're already
+         * UNKNOWN there's nothing to transition into. */
+        if (s_logging_state != LOGGING_STATE_UNKNOWN) {
+            int64_t elapsed = esp_timer_get_time() - s_last_cmd_rx_us;
+            if (elapsed > logging_timeout_us) {
+                ESP_LOGW(TAG, "No 0x600 for %" PRId64 " ms — logging state: %s → UNKNOWN",
+                         elapsed / 1000LL, logging_state_name(s_logging_state));
+                s_logging_state = LOGGING_STATE_UNKNOWN;
+                if (s_logging_cb) {
+                    s_logging_cb(LOGGING_STATE_UNKNOWN, s_logging_cb_ctx);
+                }
             }
         }
 
@@ -373,6 +414,12 @@ esp_err_t can_manager_set_camera_state(uint8_t camera_idx, camera_state_t state)
     /* Single-byte write — atomic on Xtensa LX7 without a mutex. */
     s_camera_states[camera_idx] = (uint8_t)state;
     return ESP_OK;
+}
+
+logging_state_t can_manager_get_logging_state(void)
+{
+    /* 32-bit aligned read — single instruction on Xtensa LX7, no mutex needed. */
+    return s_logging_state;
 }
 
 bool can_manager_get_utc_ms(uint64_t *epoch_ms_out)

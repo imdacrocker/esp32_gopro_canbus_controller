@@ -41,10 +41,19 @@
         .badge-recording    { background: #e74c3c; color: #fff; }
         .badge-not_recording{ background: #eaf5ea; color: #2e7d32; }
         #cam-status-empty   { color: #888; font-size: 0.9em; }
+
+        /* RaceCapture logging state pill */
+        #rc-logging-pill { display: inline-block; padding: 0.3em 0.9em;
+                           border-radius: 1em; font-size: 0.85em; font-weight: bold;
+                           margin: 0.2em 0 1em; letter-spacing: 0.02em; }
+        .rc-logging     { background: #27ae60; color: #fff; }
+        .rc-not-logging { background: #ddd;    color: #555; }
+        .rc-unknown     { background: #f39c12; color: #fff; }
     </style>
 </head>
 <body>
     <h1>GoPro Controller</h1>
+    <div id="rc-logging-pill" class="rc-unknown">RC: Unknown</div>
 
     <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
     <button id="reset-btn" onclick="resetBonds()">Reset Bonds</button>
@@ -102,6 +111,27 @@
         /* Refresh camera status on load and every 3 seconds */
         refreshCameraStatus();
         setInterval(refreshCameraStatus, 3000);
+
+        var RC_LOGGING_LABELS = {
+            'logging':     'RC: Logging',
+            'not_logging': 'RC: Not Logging',
+            'unknown':     'RC: Unknown'
+        };
+
+        function refreshLoggingState() {
+            fetch('/api/logging-state')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var s   = data.state || 'unknown';
+                    var el  = document.getElementById('rc-logging-pill');
+                    el.className  = 'rc-' + s.replace('_', '-');
+                    el.textContent = RC_LOGGING_LABELS[s] || ('RC: ' + s);
+                })
+                .catch(function() {});
+        }
+
+        refreshLoggingState();
+        setInterval(refreshLoggingState, 2000);
 
         function startScan() {
             document.getElementById('scan-btn').disabled = true;

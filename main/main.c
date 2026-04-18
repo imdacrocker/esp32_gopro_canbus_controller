@@ -65,28 +65,43 @@ static void on_utc_acquired(void *user_ctx)
     open_gopro_ble_sync_time_all();
 }
 
-static void on_logging_state_changed(bool is_logging, void *user_ctx)
+static void on_logging_state_changed(logging_state_t state, void *user_ctx)
 {
-    if (is_logging) {
-        ESP_LOGI(TAG, "RaceCapture logging STARTED — commanding cameras to record");
+    switch (state) {
+        case LOGGING_STATE_LOGGING:
+            ESP_LOGI(TAG, "RaceCapture logging STARTED — commanding cameras to record");
 
-        /* Set the desired state first so the camera_manager tick timer will
-         * keep trying to record even if a camera is mid-reconnect. */
-        camera_manager_set_desired_recording(true);
+            /* Set the desired state first so the camera_manager tick timer will
+             * keep trying to record even if a camera is mid-reconnect. */
+            camera_manager_set_desired_recording(true);
 
-        /* Immediately dispatch the start command to all cameras that are
-         * already connected and GATT-ready, without waiting for the next
-         * 2-second tick.  Returns the number of cameras commanded. */
-        int n = camera_manager_start_recording_all();
-        ESP_LOGI(TAG, "Start recording dispatched to %d camera(s)", n);
-    } else {
-        ESP_LOGI(TAG, "RaceCapture logging STOPPED — commanding cameras to stop");
+            /* Immediately dispatch the start command to all cameras that are
+             * already connected and GATT-ready, without waiting for the next
+             * 2-second tick.  Returns the number of cameras commanded. */
+            {
+                int n = camera_manager_start_recording_all();
+                ESP_LOGI(TAG, "Start recording dispatched to %d camera(s)", n);
+            }
+            break;
 
-        /* Clear desired state so the tick timer stops trying to restart. */
-        camera_manager_set_desired_recording(false);
+        case LOGGING_STATE_NOT_LOGGING:
+            ESP_LOGI(TAG, "RaceCapture logging STOPPED — commanding cameras to stop");
 
-        int n = camera_manager_stop_recording_all();
-        ESP_LOGI(TAG, "Stop recording dispatched to %d camera(s)", n);
+            /* Clear desired state so the tick timer stops trying to restart. */
+            camera_manager_set_desired_recording(false);
+
+            {
+                int n = camera_manager_stop_recording_all();
+                ESP_LOGI(TAG, "Stop recording dispatched to %d camera(s)", n);
+            }
+            break;
+
+        case LOGGING_STATE_UNKNOWN:
+            /* No 0x600 received recently — RaceCapture may be absent or rebooting.
+             * Leave cameras in their current state: they'll resume normal control
+             * as soon as a LOGGING or NOT_LOGGING transition arrives. */
+            ESP_LOGW(TAG, "RaceCapture logging state UNKNOWN — holding camera state");
+            break;
     }
 }
 

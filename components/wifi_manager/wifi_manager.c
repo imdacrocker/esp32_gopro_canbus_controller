@@ -13,6 +13,7 @@
 #include "open_gopro_ble.h"
 #include "camera_manager.h"
 #include "ble_core.h"
+#include "can_manager.h"
 
 #define AP_CHANNEL          6   /* ch.6 is the 2.4 GHz center channel; avoids HT40+
                                  * regulatory issues that ch.1 has with iOS clients */
@@ -283,6 +284,35 @@ static const httpd_uri_t api_reset_bonds_uri = {
     .handler = api_reset_bonds_handler,
 };
 
+/* GET /api/logging-state — current RaceCapture logging state
+ *
+ * Returns: {"state":"logging"} | {"state":"not_logging"} | {"state":"unknown"}
+ *
+ * "unknown" means no 0x600 frame has been received from the RaceCapture
+ * within the last 5 seconds (see CAN_MANAGER_LOGGING_TIMEOUT_MS).
+ */
+static esp_err_t api_logging_state_handler(httpd_req_t *req)
+{
+    const char *state_str;
+    switch (can_manager_get_logging_state()) {
+        case LOGGING_STATE_LOGGING:     state_str = "logging";     break;
+        case LOGGING_STATE_NOT_LOGGING: state_str = "not_logging"; break;
+        default:                        state_str = "unknown";     break;
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "{\"state\":\"%s\"}", state_str);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_logging_state_uri = {
+    .uri     = "/api/logging-state",
+    .method  = HTTP_GET,
+    .handler = api_logging_state_handler,
+};
+
 /* POST /api/shutter — body: {"on":true} or {"on":false}
  *
  * Sends a start/stop recording command to every connected, GATT-ready camera.
@@ -342,6 +372,7 @@ static const httpd_uri_t api_shutter_uri = {
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 12;  /* default is 8; bump to fit current 9 + headroom */
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -353,6 +384,7 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_reset_bonds_uri);
         httpd_register_uri_handler(server, &api_shutter_uri);
         httpd_register_uri_handler(server, &api_paired_cameras_uri);
+        httpd_register_uri_handler(server, &api_logging_state_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");
