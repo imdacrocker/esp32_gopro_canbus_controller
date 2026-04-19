@@ -100,10 +100,10 @@
         .status-badge.disconnected             { color: #999; }
         .status-badge.connected .status-dot    { width: 9px; height: 9px; background: #2980b9; }
         .status-badge.connected                { color: #2980b9; }
-        .status-badge.not-recording .status-dot { width: 9px; height: 9px; background: #27ae60; }
-        .status-badge.not-recording             { color: #2e7d32; }
-        .status-badge.recording .status-dot    { width: 9px; height: 9px; background: #e74c3c; animation: cam-pulse 1.2s infinite; }
-        .status-badge.recording                { color: #c0392b; }
+        .status-badge.not-recording .status-dot { width: 9px; height: 9px; background: #f39c12; }
+        .status-badge.not-recording             { color: #f39c12; }
+        .status-badge.recording .status-dot    { width: 9px; height: 9px; background: #27ae60; animation: cam-pulse 1.2s infinite; }
+        .status-badge.recording                { color: #2e7d32; }
         @keyframes cam-pulse {
             0%, 100% { opacity: 1; }
             50%       { opacity: 0.25; }
@@ -183,8 +183,8 @@
             font-weight: 600;
         }
         .rc-logging     { color: #27ae60; }
-        .rc-not-logging { color: #555; }
-        .rc-unknown     { color: #f39c12; }
+        .rc-not-logging { color: #f39c12; }
+        .rc-unknown     { color: #e74c3c; }
         #utc-display { font-size: 0.95rem; color: #555; font-family: monospace; font-weight: 600; }
 
         /* ---- Auto-control section ---- */
@@ -397,7 +397,7 @@
         <div id="cam-section-title">Camera Status</div>
 
         <!-- Record All / Stop All — only visible when Automatic Control is off -->
-        <div id="control-bar" style="display:none">
+        <div id="control-bar" style="display:none;">
             <button id="start-btn" onclick="sendShutter(true)">Record All</button>
             <button id="stop-btn"  onclick="sendShutter(false)">Stop All</button>
         </div>
@@ -466,7 +466,7 @@
         function updateManualControlVisibility() {
             /* Show the all-camera control bar only in manual mode */
             document.getElementById('control-bar').style.display =
-                autoControlEnabled ? 'none' : 'flex';
+                autoControlEnabled ? 'none' : 'grid';
             /* Per-camera buttons are rendered inside refreshCameraStatus(),
              * so force an immediate re-render to add/remove them right away. */
             refreshCameraStatus();
@@ -841,6 +841,7 @@
         function pairCamera(addr, addrType) {
             /* Pairing cancels the BLE scan on the firmware side — reflect that in the UI */
             if (scanning) {
+                cancelScan();
                 clearInterval(pollTimer);
                 pollTimer = null;
                 setScanningState(false);
