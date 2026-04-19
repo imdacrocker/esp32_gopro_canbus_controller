@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_store.h"
@@ -16,6 +17,77 @@ bool       s_connecting             = false;
 ble_addr_t s_pending_reconnect[CONFIG_BT_NIMBLE_MAX_BONDS];
 int        s_pending_count          = 0;
 int        s_pending_idx            = 0;
+
+/* -------------------------------------------------------------------------
+ * Delayed-reconnect state
+ *
+ * When an ENC_CHANGE failure indicates a stale bond, the camera's SM layer
+ * may enforce a "Repeated Attempts" (BLE_SM_ERR_REPEATED) cooldown.  We
+ * delete the stale bond immediately so the next attempt uses fresh SMP
+ * pairing, and we schedule a 5-second delay before reconnecting to let the
+ * camera's rate-limit timer expire.
+ * ------------------------------------------------------------------------- */
+
+#define RECONNECT_BACKOFF_US   (5 * 1000 * 1000)   /* 5 seconds */
+
+static ble_addr_t           s_backoff_addr;
+static bool                 s_backoff_pending = false;
+static esp_timer_handle_t   s_reconnect_timer = NULL;
+static struct ble_npl_event s_reconnect_event;
+
+static void reconnect_event_cb(struct ble_npl_event *ev)
+{
+    if (!s_backoff_pending) return;
+    s_backoff_pending = false;
+
+    const uint8_t *a = s_backoff_addr.val;
+    ESP_LOGI(TAG, "Backoff elapsed — reconnecting to %02X:%02X:%02X:%02X:%02X:%02X",
+             a[5], a[4], a[3], a[2], a[1], a[0]);
+
+    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &s_backoff_addr,
+                             BLE_HS_FOREVER, NULL, connection_event_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Backoff reconnect failed: %d — scanning", rc);
+        start_scan();
+    }
+}
+
+static void reconnect_timer_cb(void *arg)
+{
+    /* Timer fires from a high-priority esp_timer task — must not call NimBLE
+     * APIs directly.  Post an event to the NimBLE host queue instead. */
+    ble_npl_event_init(&s_reconnect_event, reconnect_event_cb, NULL);
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_reconnect_event);
+}
+
+static void schedule_backoff_reconnect(const ble_addr_t *addr)
+{
+    s_backoff_addr    = *addr;
+    s_backoff_pending = true;
+
+    if (s_reconnect_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback  = reconnect_timer_cb,
+            .arg       = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name      = "ble_reconnect_backoff",
+        };
+        esp_timer_create(&args, &s_reconnect_timer);
+    } else {
+        esp_timer_stop(s_reconnect_timer);  /* restart if already armed */
+    }
+
+    const uint8_t *a = addr->val;
+    ESP_LOGI(TAG, "Scheduling reconnect to %02X:%02X:%02X:%02X:%02X:%02X in %d s",
+             a[5], a[4], a[3], a[2], a[1], a[0],
+             (int)(RECONNECT_BACKOFF_US / 1000000));
+    esp_timer_start_once(s_reconnect_timer, RECONNECT_BACKOFF_US);
+}
+
+/* Tracks which address last had an ENC_CHANGE failure so the disconnect
+ * handler knows to use the backoff path rather than an immediate reconnect. */
+static ble_addr_t s_enc_failed_addr;
+static bool       s_enc_failed = false;
 
 /* -------------------------------------------------------------------------
  * Boot reconnect helpers
@@ -266,6 +338,26 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
         } else {
             ESP_LOGE(TAG, "Pairing/encryption failed — status: %d",
                      event->enc_change.status);
+
+            /* The stored LTK is stale (camera was reset, re-paired elsewhere,
+             * or firmware-updated).  Delete the bond now so the next reconnect
+             * attempt performs a fresh SMP pairing instead of re-trying the
+             * same dead key.  Without this the ESP32 loops forever: connect →
+             * fail ENC_CHANGE → disconnect → reconnect → same stale LTK → …
+             *
+             * Also set s_enc_failed so the upcoming DISCONNECT event uses a
+             * back-off reconnect rather than an immediate one, giving the
+             * camera's BLE_SM_ERR_REPEATED rate-limit timer time to clear. */
+            struct ble_gap_conn_desc fail_desc;
+            if (ble_gap_conn_find(event->enc_change.conn_handle, &fail_desc) == 0) {
+                const uint8_t *a = fail_desc.peer_id_addr.val;
+                ESP_LOGW(TAG, "Deleting stale bond for %02X:%02X:%02X:%02X:%02X:%02X — "
+                         "will re-pair on next connection",
+                         a[5], a[4], a[3], a[2], a[1], a[0]);
+                ble_store_util_delete_peer(&fail_desc.peer_id_addr);
+                s_enc_failed_addr = fail_desc.peer_id_addr;
+                s_enc_failed      = true;
+            }
         }
         break;
 
@@ -309,10 +401,21 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
          * if a scan is already running. */
         ble_gap_disc_cancel();
 
+        const uint8_t *a = peer->val;
+
+        /* If this disconnect follows an ENC_CHANGE failure for the same peer,
+         * use a back-off reconnect so the camera's "Repeated Attempts" SM
+         * rate-limit timer has time to expire before we try fresh pairing. */
+        if (s_enc_failed &&
+            memcmp(&s_enc_failed_addr, peer, sizeof(ble_addr_t)) == 0) {
+            s_enc_failed = false;
+            schedule_backoff_reconnect(peer);
+            break;
+        }
+
         /* Attempt direct reconnect — BLE_HS_FOREVER: the controller stays in
          * initiating state until the peer starts advertising, however long
          * that takes. */
-        const uint8_t *a = peer->val;
         ESP_LOGI(TAG, "Attempting reconnect to %02X:%02X:%02X:%02X:%02X:%02X",
                  a[5], a[4], a[3], a[2], a[1], a[0]);
 
@@ -358,3 +461,4 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
 
     return 0;
 }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
