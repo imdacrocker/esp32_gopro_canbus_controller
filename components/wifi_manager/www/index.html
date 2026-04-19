@@ -235,10 +235,19 @@
         }
 
         function pollCameras() {
-            fetch('/api/cameras')
-                .then(function(r) { return r.json(); })
-                .then(renderCameras)
-                .catch(function() {});
+            Promise.all([
+                fetch('/api/cameras').then(function(r) { return r.json(); }),
+                fetch('/api/paired-cameras').then(function(r) { return r.json(); })
+            ])
+            .then(function(results) {
+                var discovered = results[0];
+                var paired     = results[1];
+                var pairedAddrs = {};
+                paired.forEach(function(cam) { pairedAddrs[cam.addr] = true; });
+                var unpaired = discovered.filter(function(cam) { return !pairedAddrs[cam.addr]; });
+                renderCameras(unpaired);
+            })
+            .catch(function() {});
         }
 
         function renderCameras(cameras) {
