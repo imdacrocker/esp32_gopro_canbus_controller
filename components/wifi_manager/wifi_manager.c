@@ -103,6 +103,21 @@ static const httpd_uri_t api_scan_uri = {
     .handler = api_scan_handler,
 };
 
+/* POST /api/scan-cancel — stop a running discovery scan */
+static esp_err_t api_scan_cancel_handler(httpd_req_t *req)
+{
+    open_gopro_ble_stop_discovery();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"cancelled\"}");
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_scan_cancel_uri = {
+    .uri     = "/api/scan-cancel",
+    .method  = HTTP_POST,
+    .handler = api_scan_cancel_handler,
+};
+
 /* GET /api/cameras — return discovered cameras as a JSON array */
 static esp_err_t api_cameras_handler(httpd_req_t *req)
 {
@@ -512,13 +527,14 @@ static const httpd_uri_t api_shutter_uri = {
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 14;  /* default is 8; bump to fit current 12 + headroom */
+    config.max_uri_handlers = 14;  /* default is 8; bump to fit current 13 + headroom */
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &api_status_uri);
         httpd_register_uri_handler(server, &api_scan_uri);
+        httpd_register_uri_handler(server, &api_scan_cancel_uri);
         httpd_register_uri_handler(server, &api_cameras_uri);
         httpd_register_uri_handler(server, &api_pair_uri);
         httpd_register_uri_handler(server, &api_remove_camera_uri);

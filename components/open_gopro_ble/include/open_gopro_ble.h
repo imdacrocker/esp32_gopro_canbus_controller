@@ -123,6 +123,17 @@ void open_gopro_ble_init(void);
 void open_gopro_ble_start_discovery(void);
 
 /**
+ * @brief Cancel a running discovery scan and resume the background scan.
+ *
+ * No-op if no discovery scan is currently active.  The background scan
+ * restarts automatically if any configured camera is not yet connected;
+ * otherwise the radio stays idle.
+ *
+ * Safe to call from any task.
+ */
+void open_gopro_ble_stop_discovery(void);
+
+/**
  * @brief Retrieve the list of GoPro cameras found during the last scan.
  *
  * Copies up to @p max_count entries from the internal discovery list into

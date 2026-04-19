@@ -82,7 +82,7 @@
         <span id="auto-control-label">Automatic Control</span>
     </div>
     <div id="scan-row">
-        <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
+        <button id="scan-btn" onclick="handleScanButton()">Scan for Cameras</button>
     </div>
 
     <div id="control-bar">
@@ -100,9 +100,16 @@
 
     <script>
         var pollTimer = null;
+        var scanning  = false;
 
         function setStatus(msg) {
             document.getElementById('status').textContent = msg;
+        }
+
+        function setScanningState(active) {
+            scanning = active;
+            var btn = document.getElementById('scan-btn');
+            btn.textContent = active ? 'Cancel Scan' : 'Scan for Cameras';
         }
 
         var BADGE_LABEL = {
@@ -210,28 +217,48 @@
             });
         }
 
+        function handleScanButton() {
+            if (scanning) {
+                cancelScan();
+            } else {
+                startScan();
+            }
+        }
+
         function startScan() {
-            document.getElementById('scan-btn').disabled = true;
             document.getElementById('results').innerHTML = '';
             setStatus('Scanning... (30 seconds)');
+            setScanningState(true);
 
             fetch('/api/scan', { method: 'POST' })
                 .then(function(r) { return r.json(); })
                 .then(function() {
                     pollTimer = setInterval(pollCameras, 1000);
-                    setTimeout(stopScan, 31000);
+                    setTimeout(function() {
+                        if (scanning) { stopScan(); }
+                    }, 31000);
                 })
                 .catch(function() {
                     setStatus('Error starting scan.');
-                    document.getElementById('scan-btn').disabled = false;
+                    setScanningState(false);
                 });
         }
 
         function stopScan() {
             clearInterval(pollTimer);
+            pollTimer = null;
             pollCameras(); /* final poll */
             setStatus('Scan complete.');
-            document.getElementById('scan-btn').disabled = false;
+            setScanningState(false);
+        }
+
+        function cancelScan() {
+            fetch('/api/scan-cancel', { method: 'POST' })
+                .catch(function() { /* best-effort */ });
+            clearInterval(pollTimer);
+            pollTimer = null;
+            setStatus('Scan cancelled.');
+            setScanningState(false);
         }
 
         function pollCameras() {
@@ -286,6 +313,12 @@
         }
 
         function pairCamera(addr, addrType) {
+            /* Pairing cancels the BLE scan on the firmware side — reflect that in the UI. */
+            if (scanning) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+                setScanningState(false);
+            }
             setStatus('Pairing with ' + addr + '...');
             fetch('/api/pair', {
                 method: 'POST',

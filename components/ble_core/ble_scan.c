@@ -8,9 +8,9 @@
 
 static const char *TAG = "ble_core";
 
-/* Targeted connect state — set from any task, acted on by scan_event_cb */
-static volatile bool s_connect_requested = false;
-static ble_addr_t    s_connect_addr;
+/* State for event-posted direct connect */
+static ble_addr_t           s_connect_target;
+static struct ble_npl_event s_connect_by_addr_event;
 
 /* Forward declaration for the scan event callback */
 static int scan_event_cb(struct ble_gap_event *event, void *arg);
@@ -100,24 +100,55 @@ void ble_core_stop_discovery(void)
     start_scan_if_needed();
 }
 
+/* --------------------------------------------------------------------------
+ * Direct connect — runs on the NimBLE host task.
+ *
+ * Cancels any running scan and calls ble_gap_connect() immediately, putting
+ * the controller into initiating mode.  No advertisement needs to be seen
+ * first; the controller will connect as soon as the peer starts advertising.
+ * -------------------------------------------------------------------------- */
+static void connect_by_addr_cb(struct ble_npl_event *ev)
+{
+    if (s_connecting) {
+        ESP_LOGW(TAG, "connect_by_addr: connection already in progress — ignoring");
+        return;
+    }
+
+    ble_gap_disc_cancel(); /* stop any running scan; no-op if none active */
+
+    const uint8_t *a = s_connect_target.val;
+    ESP_LOGI(TAG, "Direct connect — %02X:%02X:%02X:%02X:%02X:%02X",
+             a[5], a[4], a[3], a[2], a[1], a[0]);
+
+    s_connecting = true;
+    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &s_connect_target,
+                             BLE_HS_FOREVER, NULL, connection_event_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_connect failed: %d", rc);
+        s_connecting = false;
+        start_scan_if_needed();
+    }
+}
+
 void ble_core_connect_by_addr(const ble_addr_t *addr)
 {
-    /* Safe to call from any task — only sets flags.
-     * scan_event_cb sees the target camera and performs the actual connect. */
-    memcpy(&s_connect_addr, addr, sizeof(ble_addr_t));
-    s_connect_requested = true;
+    /* Safe to call from any task — posts an event to the NimBLE host task,
+     * which cancels the current scan and initiates a direct connection. */
+    s_connect_target = *addr;
+    ble_npl_event_init(&s_connect_by_addr_event, connect_by_addr_cb, NULL);
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_connect_by_addr_event);
 }
 
 /* --------------------------------------------------------------------------
  * Scan event callback — runs on the NimBLE host task.
  *
- * All BLE API calls happen here; other tasks only set flags.
- *
  * Responsibilities:
  *   1. Fire on_disc callback for every parsed advertisement.
- *   2. Targeted connect — connect to the explicitly requested address.
- *   3. Safety net — reconnect a known camera that is seen advertising after a
+ *   2. Safety net — reconnect a known camera seen advertising after a
  *      post-disconnect ble_gap_connect() attempt timed out.
+ *
+ * User-initiated pairings are handled by connect_by_addr_cb() via the event
+ * queue and do not go through this path.
  * -------------------------------------------------------------------------- */
 static int scan_event_cb(struct ble_gap_event *event, void *arg)
 {
@@ -147,22 +178,13 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
 
     const uint8_t *a = event->disc.addr.val;
 
-    /* --- Targeted connect: only connect to the explicitly requested camera --- */
-    if (s_connect_requested) {
-        if (memcmp(a, s_connect_addr.val, 6) != 0) {
-            return 0; /* not our target */
-        }
-        s_connect_requested = false;
-        /* fall through to connect logic */
-    } else {
-        /* Safety net: known camera advertising after a reconnect attempt.
-         * Use the registered is_known_addr callback to avoid ble_core depending
-         * on gopro_ble or camera_manager directly. */
-        if (!g_ble_core_cbs.is_known_addr ||
-            !g_ble_core_cbs.is_known_addr(&event->disc.addr)) {
-            return 0; /* unknown camera — ignore */
-        }
-        /* fall through to connect logic */
+    /* Safety net: reconnect a known camera seen advertising during the
+     * background scan (e.g. after a post-disconnect ble_gap_connect() timed
+     * out and scanning resumed).  User-initiated pairings go through
+     * connect_by_addr_cb() via the event queue and never reach this path. */
+    if (!g_ble_core_cbs.is_known_addr ||
+        !g_ble_core_cbs.is_known_addr(&event->disc.addr)) {
+        return 0; /* unknown camera — skip */
     }
 
     /* --- Connect --- */

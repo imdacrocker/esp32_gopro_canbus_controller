@@ -130,6 +130,15 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 4. A one-shot start/stop command is immediately dispatched to all GATT-ready cameras.
 5. The tick timer continues retrying for any cameras not yet in the desired state, and will apply the command to cameras that reconnect later.
 
+**Data flow summary (scan and pairing — web UI):**
+
+1. User taps **Scan for Cameras**. The button label changes to **Cancel Scan**.
+2. `wifi_manager` receives `POST /api/scan`. `open_gopro_ble` clears the discovery list and starts a 30-second BLE scan via `ble_core`.
+3. Discovered GoPro cameras (service UUID `0xFEA6`) appear in the list. The UI polls `GET /api/cameras` once per second during the scan. Already-paired cameras are filtered out client-side by cross-referencing `GET /api/paired-cameras` — only new, unpaired cameras are shown.
+4a. **Scan expires naturally (30 s):** the firmware fires `BLE_GAP_EVENT_DISC_COMPLETE`, the UI's 31-second timeout fires, polling stops, and the button reverts to **Scan for Cameras**.
+4b. **User taps Cancel Scan:** `wifi_manager` receives `POST /api/scan-cancel`. `open_gopro_ble` calls `ble_core_stop_discovery()`, which cancels the scan and resumes the passive background scan if any paired camera is disconnected.
+4c. **User taps Pair:** the UI stops polling and reverts the button immediately. `wifi_manager` receives `POST /api/pair`. The firmware cancels the scan and calls `ble_gap_connect()` directly — the controller enters initiating mode and connects as soon as the camera advertises.
+
 > If RaceCapture is actively sending `0x600` frames and **Automatic Control** is enabled, the CAN and web UI paths write to the same desired-state flag and can overwrite each other. This is intentional — the web UI is designed for diagnostics when CAN is disconnected.
 
 **Automatic camera control:**
@@ -251,8 +260,8 @@ Cameras are paired via the built-in web interface. You do **not** need to use th
 2. On your phone or laptop, connect to the Wi-Fi network `HERO-RC-XXXXXX` (open, no password).
 3. Open a browser and navigate to `http://10.71.79.1`.
 4. Power on the GoPro camera(s) and ensure Bluetooth is enabled on the camera.
-5. On the web page, tap **Scan for Cameras**. A 30-second scan will begin.
-6. When your camera appears in the list, tap **Pair**. The controller will initiate a BLE connection and complete the pairing process.
+5. On the web page, tap **Scan for Cameras**. A 30-second scan will begin. The button changes to **Cancel Scan** while the scan is running — tap it again to stop early. The scan also stops automatically when you tap **Pair**.
+6. When your camera appears in the list, tap **Pair**. The controller cancels the scan and immediately initiates a BLE connection and pairing process.
 7. Once paired, the camera appears in the **Camera Status** section. The status will change to **Connected** once the BLE link and GATT setup complete (typically a few seconds).
 
 Paired cameras are stored in NVS and reconnect automatically every time the controller boots — you only need to pair once.

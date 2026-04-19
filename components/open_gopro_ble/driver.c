@@ -61,6 +61,11 @@ void open_gopro_ble_start_discovery(void)
     ble_core_start_discovery();
 }
 
+void open_gopro_ble_stop_discovery(void)
+{
+    ble_core_stop_discovery();
+}
+
 int open_gopro_ble_get_discovered(gopro_device_t *out, int max_count)
 {
     int n = s_discovered_count < max_count ? s_discovered_count : max_count;

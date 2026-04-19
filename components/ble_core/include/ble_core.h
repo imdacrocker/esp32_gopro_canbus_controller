@@ -185,9 +185,17 @@ void ble_core_start_discovery(void);
 void ble_core_stop_discovery(void);
 
 /**
- * @brief Initiate a connection to a specific BLE address.
+ * @brief Cancel the current scan and initiate a direct connection to a
+ *        specific BLE address.
  *
- * The connection is deferred until the target device is seen advertising.
+ * Posts an event to the NimBLE host task that:
+ *  1. Cancels any running discovery or background scan immediately.
+ *  2. Calls ble_gap_connect() to put the controller into initiating mode.
+ *
+ * The controller will connect as soon as the peer starts advertising —
+ * no advertisement needs to be seen before this call is made.  If a
+ * connection attempt is already in progress the request is silently ignored.
+ *
  * Safe to call from any task.
  *
  * @param addr  Target device address.  Must remain valid until the call returns.

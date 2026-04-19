@@ -64,9 +64,25 @@ Poll `GET /api/cameras` every second after calling this endpoint to retrieve dis
 
 ---
 
+### `POST /api/scan-cancel`
+
+Cancels a running discovery scan and resumes the passive background scan (if any configured camera is not yet connected), or leaves the radio idle (if all cameras are already connected).
+
+Safe to call even when no scan is active — the call is a no-op in that case.
+
+**Request body:** none
+
+**Response**
+
+```json
+{ "status": "cancelled" }
+```
+
+---
+
 ### `GET /api/cameras`
 
-Returns the list of GoPro cameras discovered during the most recent scan.
+Returns the list of GoPro cameras discovered during the most recent scan. This includes all discovered devices regardless of pairing status — the web UI filters out already-paired cameras client-side by cross-referencing `/api/paired-cameras` before rendering the list.
 
 **Response** — array of discovered camera objects (may be empty):
 
@@ -93,6 +109,8 @@ Returns the list of GoPro cameras discovered during the most recent scan.
 ### `POST /api/pair`
 
 Initiates a BLE connection and pairing sequence with a specific camera. The camera must be advertising (powered on with Bluetooth enabled) when this call is made.
+
+Calling this endpoint cancels any running discovery scan immediately and puts the BLE controller into initiating mode — the firmware connects as soon as the target camera's advertisement is seen, without waiting for further scan results.
 
 On success, the camera is registered with `camera_manager`, bonded, and persisted to NVS. It will reconnect automatically on every subsequent boot.
 
@@ -458,7 +476,7 @@ Cancel a running discovery scan and resume the background scan.
 ```c
 void ble_core_connect_by_addr(const ble_addr_t *addr);
 ```
-Request a connection to a specific BLE address. The connection is initiated the next time the device is seen advertising. Safe to call from any task.
+Cancel any running scan and immediately initiate a direct BLE connection to `addr`. Posts an event to the NimBLE host task that calls `ble_gap_disc_cancel()` then `ble_gap_connect()`, putting the controller into initiating mode. The controller connects as soon as the peer starts advertising — no advertisement needs to be seen before this call. If a connection attempt is already in progress the request is silently ignored. Safe to call from any task.
 
 ---
 
@@ -560,6 +578,13 @@ Send a SetDateTime command to every camera slot that is currently GATT-ready. Ca
 void open_gopro_ble_start_discovery(void);
 ```
 Clear the discovery list and start a 30-second BLE scan. Cameras are filtered by service UUID `0xFEA6` (GoPro). Safe to call from any task.
+
+---
+
+```c
+void open_gopro_ble_stop_discovery(void);
+```
+Cancel a running discovery scan and resume the passive background scan (if any configured camera is not yet connected), or leave the radio idle if all cameras are already connected. No-op if no discovery scan is active. Safe to call from any task.
 
 ---
 
