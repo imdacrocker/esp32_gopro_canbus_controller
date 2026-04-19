@@ -524,6 +524,27 @@ int camera_manager_stop_recording_all(void)
     return dispatched;
 }
 
+int camera_manager_set_recording_slot(int slot, bool on)
+{
+    if (slot < 0 || slot >= CAMERA_MAX_SLOTS) return 0;
+    camera_slot_t *s = &s_slots[slot];
+    if (!s->is_configured) return 0;
+
+    /* Update desired state so the tick timer retries if the camera isn't
+     * ready yet or if a start command is still in flight. */
+    s->desired_recording = on;
+
+    /* If not currently reachable, desired_recording will trigger the command
+     * on the next tick once the camera connects / becomes GATT-ready. */
+    if (s->bt_handle == BLE_HS_CONN_HANDLE_NONE) return 0;
+    if (!s->gatt_ready) return 0;
+    if (!s->driver) return 0;
+
+    esp_err_t err = on ? s->driver->start_recording(s->driver_ctx)
+                       : s->driver->stop_recording(s->driver_ctx);
+    return (err == ESP_OK) ? 1 : 0;
+}
+
 bool camera_manager_is_known_addr(const ble_addr_t *addr)
 {
     return camera_manager_find_by_addr(addr) >= 0;

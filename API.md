@@ -234,9 +234,14 @@ This command **does** update the desired recording state tracked by `camera_mana
 { "on": true }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `on` | boolean | `true` to start recording; `false` to stop. |
+```json
+{ "slot": 0, "on": true }
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `on` | boolean | Yes | `true` to start recording; `false` to stop. |
+| `slot` | integer | No | 0-based slot index from `/api/paired-cameras`. If present, the command targets only that camera slot and updates only that slot's desired recording state. If absent, the command targets all cameras and updates all slots' desired recording state (original behaviour). |
 
 **Response**
 
@@ -246,7 +251,7 @@ This command **does** update the desired recording state tracked by `camera_mana
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `dispatched` | integer | Number of cameras that received the command. `0` means no cameras were ready. |
+| `dispatched` | integer | Number of cameras that received the command. `0` means no cameras were ready (the desired state is still updated and the tick timer will retry). |
 
 **Error responses**
 
@@ -853,6 +858,15 @@ int camera_manager_start_recording_all(void);
 int camera_manager_stop_recording_all(void);
 ```
 Immediately dispatch a start/stop command to all connected, GATT-ready cameras. Returns the number of cameras that received the command.
+
+---
+
+```c
+int camera_manager_set_recording_slot(int slot, bool on);
+```
+Start or stop recording on a single camera slot. Sets `desired_recording` for that slot only (so the 2-second tick timer will retry if the slot is not immediately ready), then dispatches the command immediately if the slot is connected and GATT-ready. Returns `1` if the command was dispatched, `0` if the slot was not ready (desired state is still updated).
+
+Note: a subsequent call to `camera_manager_set_desired_recording()` or the `_all` variants will overwrite `desired_recording` for all slots, including any per-slot state set here.
 
 ---
 

@@ -501,11 +501,19 @@ static esp_err_t api_shutter_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    camera_manager_set_desired_recording(shutter_on);
-
-    int dispatched = shutter_on
+    /* Optional "slot" field: if present, target only that camera.
+     * If absent, apply to all cameras (original behaviour). */
+    int dispatched;
+    char *slot_p = strstr(body, "\"slot\":");
+    if (slot_p) {
+        int slot = atoi(slot_p + 7);
+        dispatched = camera_manager_set_recording_slot(slot, shutter_on);
+    } else {
+        camera_manager_set_desired_recording(shutter_on);
+        dispatched = shutter_on
                    ? camera_manager_start_recording_all()
                    : camera_manager_stop_recording_all();
+    }
 
     char resp[48];
     snprintf(resp, sizeof(resp), "{\"dispatched\":%d}", dispatched);

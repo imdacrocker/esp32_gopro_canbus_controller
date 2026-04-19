@@ -5,7 +5,7 @@ This project is currently in a working prrof-of-concept phase!  The project has 
 
 An ESP32-S3 firmware that bridges GoPro cameras (controlled over BLE) with a [RaceCapture](https://autosportlabs.com/racecapture/) data logger (connected over CAN bus). When RaceCapture starts logging, all paired GoPro cameras start recording automatically. Camera connection status is broadcast back to RaceCapture in real time.
 
-A companion Wi-Fi web interface lets you pair cameras, check status, manually trigger recording, and override automatic recording control — no laptop or serial terminal required in the field.
+A companion Wi-Fi web interface lets you pair and manage cameras, monitor live recording status, and — when Automatic Control is disabled — manually trigger recording on all cameras at once or on individual cameras independently. No laptop or serial terminal required in the field.
 
 ---
 
@@ -124,26 +124,36 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 
 **Data flow summary (web UI path):**
 
-1. User taps **Start Recording** or **Stop Recording** in the web interface.
-2. `wifi_manager` receives the `POST /api/shutter` request.
-3. The desired recording state is set on `camera_manager` (same flag used by the CAN path).
-4. A one-shot start/stop command is immediately dispatched to all GATT-ready cameras.
-5. The tick timer continues retrying for any cameras not yet in the desired state, and will apply the command to cameras that reconnect later.
+> The **Start/Stop All** and per-camera **Start/Stop** buttons are only shown when **Automatic Control** is disabled. When Automatic Control is on, recording is driven exclusively by the CAN path and manual shutter controls are hidden.
+
+1. User disables Automatic Control via the toggle, then taps **▶ Start Recording** / **⏹ Stop Recording** (all cameras) or the per-camera toggle button on an individual camera row.
+2. `wifi_manager` receives `POST /api/shutter`. For all-camera actions, `"on"` is the only field. For a per-camera action the request also includes `"slot"` with the 0-based camera slot index.
+3. **All-camera path:** `camera_manager_set_desired_recording()` updates the desired state for every slot, then `camera_manager_start/stop_recording_all()` dispatches the command to every connected, GATT-ready camera immediately.
+   **Per-camera path:** `camera_manager_set_recording_slot(slot, on)` updates `desired_recording` for that slot only and dispatches the command to that camera if it is connected and GATT-ready.
+4. After a per-camera command is sent, the button is disabled immediately in the UI. It re-enables on the next `/api/paired-cameras` poll (every 3 seconds) once the camera reports its new state.
+5. The tick timer continues retrying for any camera not yet in the desired state, and applies the command to cameras that reconnect later.
 
 **Data flow summary (scan and pairing — web UI):**
 
-1. User taps **Scan for Cameras**. The button label changes to **Cancel Scan**.
-2. `wifi_manager` receives `POST /api/scan`. `open_gopro_ble` clears the discovery list and starts a 30-second BLE scan via `ble_core`.
-3. Discovered GoPro cameras (service UUID `0xFEA6`) appear in the list. The UI polls `GET /api/cameras` once per second during the scan. Already-paired cameras are filtered out client-side by cross-referencing `GET /api/paired-cameras` — only new, unpaired cameras are shown.
-4a. **Scan expires naturally (30 s):** the firmware fires `BLE_GAP_EVENT_DISC_COMPLETE`, the UI's 31-second timeout fires, polling stops, and the button reverts to **Scan for Cameras**.
-4b. **User taps Cancel Scan:** `wifi_manager` receives `POST /api/scan-cancel`. `open_gopro_ble` calls `ble_core_stop_discovery()`, which cancels the scan and resumes the passive background scan if any paired camera is disconnected.
-4c. **User taps Pair:** the UI stops polling and reverts the button immediately. `wifi_manager` receives `POST /api/pair`. The firmware cancels the scan and calls `ble_gap_connect()` directly — the controller enters initiating mode and connects as soon as the camera advertises.
+1. User taps **+ Add / Manage Cameras** at the bottom of the screen. A bottom-sheet modal opens showing two sections: **Paired Cameras** (name + remove button) and **Add New Camera** (scan controls).
+2. User taps **Scan for Cameras** inside the modal. The button label changes to **Cancel Scan**.
+3. `wifi_manager` receives `POST /api/scan`. `open_gopro_ble` clears the discovery list and starts a 30-second BLE scan via `ble_core`.
+4. Discovered GoPro cameras (service UUID `0xFEA6`) appear in the modal's results list. The UI polls `GET /api/cameras` once per second during the scan. Already-paired cameras are filtered out client-side by cross-referencing `GET /api/paired-cameras` — only new, unpaired cameras are shown.
+5a. **Scan expires naturally (30 s):** the firmware fires `BLE_GAP_EVENT_DISC_COMPLETE`, the UI's 31-second timeout fires, polling stops, and the button reverts to **Scan for Cameras**.
+5b. **User taps Cancel Scan:** `wifi_manager` receives `POST /api/scan-cancel`. `open_gopro_ble` calls `ble_core_stop_discovery()`, which cancels the scan and resumes the passive background scan if any paired camera is disconnected.
+5c. **User closes the modal while scanning:** the UI calls `POST /api/scan-cancel` automatically before hiding the modal. This prevents an invisible background scan from continuing.
+5d. **User taps Pair:** the UI stops polling and reverts the button immediately. `wifi_manager` receives `POST /api/pair`. The firmware cancels the scan and calls `ble_gap_connect()` directly — the controller enters initiating mode and connects as soon as the camera advertises. The UI shows a "Pairing initiated" message and the newly paired camera appears in the **Paired Cameras** list within a few seconds.
 
 > If RaceCapture is actively sending `0x600` frames and **Automatic Control** is enabled, the CAN and web UI paths write to the same desired-state flag and can overwrite each other. This is intentional — the web UI is designed for diagnostics when CAN is disconnected.
 
 **Automatic camera control:**
 
-The web UI exposes an **Automatic Control** toggle (on by default, always resets to on at boot). When enabled, the CAN logging state drives camera recording as described above. When disabled, `0x600` transitions are ignored — cameras hold whatever state they were in when the toggle was switched off, and can only be controlled manually via the web UI shutter buttons or `POST /api/shutter`. The flag is RAM-only and never stored in NVS.
+The web UI exposes an **Automatic Control** toggle (on by default, always resets to on at boot). When enabled, the CAN logging state drives camera recording as described above and all manual shutter controls are hidden — there is no way to accidentally override the CAN-driven state from the UI. When disabled, `0x600` transitions are ignored, cameras hold whatever state they were in when the toggle was switched off, and the following manual controls become visible:
+
+- **Start Recording / Stop Recording** buttons (all cameras simultaneously).
+- A per-camera **▶ Start** or **⏹ Stop** toggle button on each row of the Camera Status section. The button shows the action that will be taken (not the current state): **▶ Start** when the camera is idle, **⏹ Stop** when it is recording, and no button when the camera is disconnected. Tapping the button disables it immediately to prevent duplicate commands; it re-enables automatically on the next status poll once the camera confirms its new state.
+
+The flag is RAM-only and never stored in NVS.
 
 ---
 
@@ -260,13 +270,14 @@ Cameras are paired via the built-in web interface. You do **not** need to use th
 2. On your phone or laptop, connect to the Wi-Fi network `HERO-RC-XXXXXX` (open, no password).
 3. Open a browser and navigate to `http://10.71.79.1`.
 4. Power on the GoPro camera(s) and ensure Bluetooth is enabled on the camera.
-5. On the web page, tap **Scan for Cameras**. A 30-second scan will begin. The button changes to **Cancel Scan** while the scan is running — tap it again to stop early. The scan also stops automatically when you tap **Pair**.
-6. When your camera appears in the list, tap **Pair**. The controller cancels the scan and immediately initiates a BLE connection and pairing process.
-7. Once paired, the camera appears in the **Camera Status** section. The status will change to **Connected** once the BLE link and GATT setup complete (typically a few seconds).
+5. Tap **+ Add / Manage Cameras** at the bottom of the screen. The camera management modal will open.
+6. Tap **Scan for Cameras**. A 30-second scan will begin. The button changes to **Cancel Scan** while the scan is running — tap it again to stop early. The scan also stops automatically when you tap **Pair**.
+7. When your camera appears in the list, tap **Pair**. The controller cancels the scan and immediately initiates a BLE connection and pairing process. A "Pairing initiated" message will appear.
+8. The camera will appear in the **Paired Cameras** list at the top of the modal within a few seconds. Close the modal — the camera now appears in the **Camera Status** section on the main screen. Its status will change from **Disconnected** to **Not recording** once the BLE link and GATT setup complete (typically a few seconds).
 
 Paired cameras are stored in NVS and reconnect automatically every time the controller boots — you only need to pair once.
 
-To remove a camera, tap the **✕** button next to it in the **Camera Status** section. The camera is immediately disconnected and its pairing is erased. It will need to be re-paired before it can reconnect.
+To remove a camera, tap **+ Add / Manage Cameras** to open the modal and tap the **✕** button next to the camera in the **Paired Cameras** list. The camera is immediately disconnected and its pairing is erased. It will need to be re-paired before it can reconnect.
 
 ---
 

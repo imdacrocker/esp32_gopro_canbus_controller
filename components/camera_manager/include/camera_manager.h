@@ -48,6 +48,22 @@ void camera_manager_set_model_name(int slot, const char *model_name);
 void camera_manager_set_desired_recording(bool recording);
 int  camera_manager_start_recording_all(void);
 int  camera_manager_stop_recording_all(void);
+
+/**
+ * @brief Start or stop recording on a single camera slot.
+ *
+ * Sets desired_recording for the slot (so the 2-second tick timer will retry
+ * if the command cannot be dispatched immediately) and immediately dispatches
+ * the command if the slot is connected and GATT-ready.
+ *
+ * Note: calling camera_manager_set_desired_recording() or the _all variants
+ * afterwards will overwrite the per-slot desired state for all slots.
+ *
+ * @param slot  0-based slot index.
+ * @param on    true = start recording, false = stop recording.
+ * @return      1 if the command was dispatched, 0 if the slot was not ready.
+ */
+int  camera_manager_set_recording_slot(int slot, bool on);
 bool camera_manager_is_known_addr(const ble_addr_t *addr);
 bool camera_manager_has_disconnected_cameras(void);
 void camera_manager_register_driver(camera_type_t type,
