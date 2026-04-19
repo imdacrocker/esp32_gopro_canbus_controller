@@ -204,8 +204,10 @@ static const httpd_uri_t api_status_uri = {
 /* GET /api/paired-cameras — all remembered cameras with live status
  *
  * Returns a JSON array of every configured slot:
- *   [{"index":N,"addr":"XX:XX:XX:XX:XX:XX","status":"<label>"},...]
+ *   [{"slot":N,"index":N,"name":"...","addr":"XX:XX:XX:XX:XX:XX","status":"<label>"},...]
  *
+ * slot   — 0-based slot index used by API calls (e.g. /api/remove-camera)
+ * index  — 1-based display number shown in the UI
  * status values:
  *   "disconnected"  — configured but no active BLE connection
  *   "not_recording" — connected, idle or recording state not yet known
@@ -213,7 +215,7 @@ static const httpd_uri_t api_status_uri = {
  */
 static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
 {
-    char buf[512];
+    char buf[1024];
     int  pos   = 0;
     bool first = true;
 
@@ -237,10 +239,14 @@ static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
         first = false;
 
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "{\"index\":%d,"
+            "{\"slot\":%d,"
+            "\"index\":%d,"
+            "\"name\":\"%s\","
             "\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
             "\"status\":\"%s\"}",
+            i,
             i + 1,
+            info.name,
             v[5], v[4], v[3], v[2], v[1], v[0],
             status_str);
     }
@@ -258,31 +264,63 @@ static const httpd_uri_t api_paired_cameras_uri = {
     .handler = api_paired_cameras_handler,
 };
 
-/* POST /api/reset-bonds — delete all stored BLE bonds and camera slots */
-static esp_err_t api_reset_bonds_handler(httpd_req_t *req)
+/* POST /api/remove-camera — remove a single camera slot
+ *
+ * Body: {"slot":N}  where N is the 0-based slot index from /api/paired-cameras.
+ *
+ * Sequence:
+ *  1. Validate the slot and retrieve the camera's MAC address.
+ *  2. Clear the slot from camera_manager (RAM + NVS) so that
+ *     is_known_addr returns false before the BLE disconnect fires.
+ *  3. Post an async request to the NimBLE task to terminate the active
+ *     connection (if any) and remove just this camera's BLE bond.
+ */
+static esp_err_t api_remove_camera_handler(httpd_req_t *req)
 {
-    /* Remove every camera slot from camera_manager (RAM + NVS).
-     * Without this, the Camera Status panel still shows cameras as paired
-     * after the reset because /api/paired-cameras reads from camera_manager,
-     * not from NimBLE's bond store. */
-    for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
-        camera_manager_remove_slot(i);
+    char body[64] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
     }
 
-    /* Purge BLE bonds from NimBLE's peer-security store (NVS).
-     * This is posted asynchronously to the NimBLE event queue. */
-    ble_core_purge_unknown_bonds(NULL, 0);
+    char *p = strstr(body, "\"slot\":");
+    if (!p) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing slot");
+        return ESP_FAIL;
+    }
+    int slot = atoi(p + 7);
+    if (slot < 0 || slot >= CAMERA_MAX_SLOTS) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid slot");
+        return ESP_FAIL;
+    }
+
+    camera_slot_info_t info = camera_manager_get_slot_info(slot);
+    if (!info.is_configured) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Slot not configured");
+        return ESP_FAIL;
+    }
+
+    /* Save MAC before the slot is cleared. */
+    ble_addr_t mac = info.mac_address;
+
+    /* Step 2: clear camera_manager slot (RAM + NVS). */
+    camera_manager_remove_slot(slot);
+
+    /* Step 3: async disconnect + bond removal on the NimBLE task. */
+    ble_core_remove_bond(&mac);
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"bonds cleared\"}");
+    httpd_resp_sendstr(req, "{\"status\":\"removed\"}");
     return ESP_OK;
 }
 
-static const httpd_uri_t api_reset_bonds_uri = {
-    .uri     = "/api/reset-bonds",
+static const httpd_uri_t api_remove_camera_uri = {
+    .uri     = "/api/remove-camera",
     .method  = HTTP_POST,
-    .handler = api_reset_bonds_handler,
+    .handler = api_remove_camera_handler,
 };
+
 
 /* GET /api/logging-state — current RaceCapture logging state
  *
@@ -403,7 +441,7 @@ static const httpd_uri_t api_shutter_uri = {
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;  /* default is 8; bump to fit current 9 + headroom */
+    config.max_uri_handlers = 12;  /* default is 8; bump to fit current 10 + headroom */
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -412,7 +450,7 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_scan_uri);
         httpd_register_uri_handler(server, &api_cameras_uri);
         httpd_register_uri_handler(server, &api_pair_uri);
-        httpd_register_uri_handler(server, &api_reset_bonds_uri);
+        httpd_register_uri_handler(server, &api_remove_camera_uri);
         httpd_register_uri_handler(server, &api_shutter_uri);
         httpd_register_uri_handler(server, &api_paired_cameras_uri);
         httpd_register_uri_handler(server, &api_logging_state_uri);

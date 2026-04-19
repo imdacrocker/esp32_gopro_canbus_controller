@@ -206,6 +206,23 @@ void ble_core_connect_by_addr(const ble_addr_t *addr);
 void ble_core_purge_unknown_bonds(const ble_addr_t *keep, int keep_count);
 
 /**
+ * @brief Remove the BLE bond for a single camera and disconnect it.
+ *
+ * Posts a request to the NimBLE event queue that:
+ *  1. Terminates the active BLE connection to @p addr (if any).
+ *  2. Deletes @p addr's entry from the NimBLE peer-security store (NVS).
+ *
+ * The caller should remove the camera from camera_manager *before* calling
+ * this function so that the is_known_addr check in the disconnect handler
+ * returns false and no automatic reconnect is attempted.
+ *
+ * Safe to call from any task — the actual work runs on the NimBLE host task.
+ *
+ * @param addr  BLE address of the camera to remove.
+ */
+void ble_core_remove_bond(const ble_addr_t *addr);
+
+/**
  * @brief Write data to a remote GATT characteristic.
  *
  * Performs a Write Without Response (ATT write command) to the specified

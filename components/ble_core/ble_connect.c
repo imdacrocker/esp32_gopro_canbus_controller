@@ -153,6 +153,49 @@ void ble_core_purge_unknown_bonds(const ble_addr_t *keep, int keep_count)
 }
 
 /* -------------------------------------------------------------------------
+ * Single-bond removal
+ *
+ * Removes the NimBLE bond for one specific camera address and terminates any
+ * active connection to it.  Runs on the NimBLE host task via the event queue
+ * so it is safe to call from any context (e.g. an HTTP handler task).
+ * ------------------------------------------------------------------------- */
+
+static ble_addr_t           s_remove_bond_addr;
+static struct ble_npl_event s_remove_bond_event;
+
+static void remove_bond_cb(struct ble_npl_event *ev)
+{
+    const uint8_t *a = s_remove_bond_addr.val;
+
+    /* Cancel any in-flight ble_gap_connect() attempt.  There can only be one
+     * pending connect at a time; if it happens to be to this camera, cancelling
+     * it prevents a re-registration race.  If it is to a different camera, the
+     * disconnect handler will advance the reconnect chain immediately. */
+    ble_gap_conn_cancel();
+
+    /* Terminate the active connection if one exists for this address. */
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find_by_addr(&s_remove_bond_addr, &desc) == 0) {
+        ESP_LOGI(TAG, "Terminating conn %d for removed camera %02X:%02X:%02X:%02X:%02X:%02X",
+                 desc.conn_handle, a[5], a[4], a[3], a[2], a[1], a[0]);
+        ble_gap_terminate(desc.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+
+    /* Remove just this camera's bond from the NimBLE peer-security store. */
+    ble_store_util_delete_peer(&s_remove_bond_addr);
+    ESP_LOGI(TAG, "Removed bond for %02X:%02X:%02X:%02X:%02X:%02X",
+             a[5], a[4], a[3], a[2], a[1], a[0]);
+    log_bond_count();
+}
+
+void ble_core_remove_bond(const ble_addr_t *addr)
+{
+    s_remove_bond_addr = *addr;
+    ble_npl_event_init(&s_remove_bond_event, remove_bond_cb, NULL);
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_remove_bond_event);
+}
+
+/* -------------------------------------------------------------------------
  * GAP connection event callback
  *
  * Fires on_connected, on_encrypted, and on_disconnected callbacks so the

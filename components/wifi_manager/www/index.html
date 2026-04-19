@@ -10,9 +10,6 @@
         #status  { color: #555; margin: 0.5em 0 1em; min-height: 1.2em; }
         #scan-btn { padding: 0.6em 1.4em; font-size: 1em; cursor: pointer; }
         #scan-btn:disabled { opacity: 0.5; cursor: default; }
-        #reset-btn { padding: 0.6em 1.4em; font-size: 1em; cursor: pointer;
-                     margin-left: 0.6em; background: #c0392b; color: #fff; border: none; border-radius: 3px; }
-        #reset-btn:disabled { opacity: 0.5; cursor: default; }
         #control-bar { display: flex; gap: 0.8em; margin: 1.2em 0 0.4em; }
         #start-btn { padding: 0.7em 1.6em; font-size: 1.05em; font-weight: bold;
                      background: #27ae60; color: #fff; border: none; border-radius: 4px; cursor: pointer; flex: 1; }
@@ -41,6 +38,10 @@
         .badge-recording    { background: #e74c3c; color: #fff; }
         .badge-not_recording{ background: #eaf5ea; color: #2e7d32; }
         #cam-status-empty   { color: #888; font-size: 0.9em; }
+        .remove-btn { padding: 0.2em 0.55em; font-size: 0.85em; cursor: pointer;
+                      background: none; border: 1px solid #c0392b; color: #c0392b;
+                      border-radius: 3px; line-height: 1; }
+        .remove-btn:hover { background: #c0392b; color: #fff; }
 
         /* RaceCapture logging state pill + UTC row */
         #status-row { display: flex; align-items: center; gap: 0.8em; margin: 0.4em 0 0.6em; flex-wrap: wrap; }
@@ -62,7 +63,6 @@
     </div>
     <div id="scan-row">
         <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
-        <button id="reset-btn" onclick="resetBonds()">Reset Bonds</button>
     </div>
 
     <div id="control-bar">
@@ -104,10 +104,14 @@
                     var html = '';
                     cameras.forEach(function(cam) {
                         var label = BADGE_LABEL[cam.status] || cam.status;
+                        var safeName = cam.name.replace(/"/g, '&quot;');
                         html += '<div class="cam-row">'
                               + '<div><span class="cam-id">#' + cam.index + '</span>'
                               + '<span class="cam-addr">' + cam.addr + '</span></div>'
-                              + '<div class="cam-badge badge-' + cam.status + '">' + label + '</div>'
+                              + '<div style="display:flex;align-items:center;gap:0.5em">'
+                              + '<span class="cam-badge badge-' + cam.status + '">' + label + '</span>'
+                              + '<button class="remove-btn" onclick="removeCamera(' + cam.slot + ',\'' + safeName + '\')" title="Remove camera">&times;</button>'
+                              + '</div>'
                               + '</div>';
                     });
                     list.innerHTML = html;
@@ -207,15 +211,19 @@
             div.innerHTML = html;
         }
 
-        function resetBonds() {
-            if (!confirm('Delete all stored BLE bonds? Cameras will need to re-pair.')) return;
-            var btn = document.getElementById('reset-btn');
-            btn.disabled = true;
-            fetch('/api/reset-bonds', { method: 'POST' })
-                .then(function(r) { return r.json(); })
-                .then(function() { setStatus('All bonds cleared.'); })
-                .catch(function() { setStatus('Error clearing bonds.'); })
-                .finally(function() { btn.disabled = false; });
+        function removeCamera(slot, name) {
+            if (!confirm('Remove "' + name + '"?\nIt will need to re-pair before it can reconnect.')) return;
+            fetch('/api/remove-camera', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ slot: slot })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function() {
+                setStatus('Camera removed.');
+                refreshCameraStatus();
+            })
+            .catch(function() { setStatus('Error removing camera.'); });
         }
 
         function pairCamera(addr, addrType) {

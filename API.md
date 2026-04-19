@@ -137,12 +137,16 @@ Returns all configured camera slots with their current live status.
 ```json
 [
   {
+    "slot": 0,
     "index": 1,
+    "name": "GoPro EEFF",
     "addr": "AA:BB:CC:DD:EE:FF",
     "status": "recording"
   },
   {
+    "slot": 1,
     "index": 2,
+    "name": "GoPro 5566",
     "addr": "11:22:33:44:55:66",
     "status": "disconnected"
   }
@@ -151,7 +155,9 @@ Returns all configured camera slots with their current live status.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `index` | integer | Camera slot index (1-based, 1 to `CAMERA_MAX_SLOTS`). |
+| `slot` | integer | 0-based slot index used for API calls such as `/api/remove-camera`. |
+| `index` | integer | 1-based display number shown in the web UI. |
+| `name` | string | Camera name (advertised name at pairing time, e.g. `"GoPro XXYY"`). |
 | `addr` | string | BLE MAC address of the paired camera. |
 | `status` | string | Live status string (see table below). |
 
@@ -162,6 +168,37 @@ Returns all configured camera slots with their current live status.
 | `"disconnected"` | Camera is paired but no active BLE connection. |
 | `"not_recording"` | Connected and GATT-ready, but not currently recording. |
 | `"recording"` | Connected and actively recording. |
+
+---
+
+### `POST /api/remove-camera`
+
+Removes a single paired camera. Clears the camera slot from NVS and RAM, terminates its active BLE connection (if any), and deletes its BLE bond from the NimBLE bond store. The camera will need to be re-paired via `/api/scan` and `/api/pair` to reconnect.
+
+**Request body** (`Content-Type: application/json`):
+
+```json
+{ "slot": 0 }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `slot` | integer | 0-based slot index from `/api/paired-cameras`. |
+
+**Response**
+
+```json
+{ "status": "removed" }
+```
+
+**Error responses**
+
+| HTTP status | Body | Cause |
+|-------------|------|-------|
+| 400 | `Empty body` | Request body was missing. |
+| 400 | `Missing slot` | JSON field `"slot"` was not found. |
+| 400 | `Invalid slot` | Slot index is out of range. |
+| 400 | `Slot not configured` | Slot exists but has no camera assigned. |
 
 ---
 
@@ -200,22 +237,6 @@ This command **does** update the desired recording state tracked by `camera_mana
 | 400 | `Empty body` | Request body was missing. |
 | 400 | `Missing 'on' field` | JSON field `"on"` was not found. |
 | 400 | `Invalid 'on' value` | `"on"` was not `true` or `false`. |
-
----
-
-### `POST /api/reset-bonds`
-
-Deletes all stored BLE bonds from the NimBLE bond store. Cameras will need to be re-paired via `/api/scan` and `/api/pair`.
-
-> **Warning:** This is irreversible. All paired cameras will need to go through the pairing process again.
-
-**Request body:** none
-
-**Response**
-
-```json
-{ "status": "bonds cleared" }
-```
 
 ---
 
@@ -391,6 +412,13 @@ Request a connection to a specific BLE address. The connection is initiated the 
 void ble_core_purge_unknown_bonds(const ble_addr_t *keep, int keep_count);
 ```
 Delete all NimBLE bonds except those in the `keep` array. Pass `NULL` / `0` to delete all bonds.
+
+---
+
+```c
+void ble_core_remove_bond(const ble_addr_t *addr);
+```
+Remove the BLE bond for a single camera. Terminates the active connection to `addr` (if one exists) and deletes `addr`'s entry from the NimBLE peer-security store. The caller must remove the camera from `camera_manager` first so that `is_known_addr` returns false before the disconnect event fires, preventing an automatic reconnect. Safe to call from any task — the actual work is posted to the NimBLE host task.
 
 ---
 
@@ -930,4 +958,3 @@ struct camera_driver {
 ```
 
 All three function pointers receive the per-camera `ctx` allocated by the driver's factory function. `get_recording_status` must be non-blocking and return a cached value. `start_recording` and `stop_recording` dispatch commands asynchronously and return `ESP_OK` if the command was sent, or `ESP_ERR_INVALID_STATE` if the camera is not ready or a start command is already in flight (see `start_cmd_pending` in the `open_gopro_ble` section).
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            

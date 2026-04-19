@@ -28,7 +28,6 @@ A companion Wi-Fi web interface lets you pair cameras, check status, and manuall
 
 ## TODO
 Known bugs:
- - Clearing the camera pairing from the web interface is not working
  - WiFi and BLE are fighting each other on the chip. This may need to be smoothed out
 
 ---
@@ -254,7 +253,7 @@ Cameras are paired via the built-in web interface. You do **not** need to use th
 
 Paired cameras are stored in NVS and reconnect automatically every time the controller boots — you only need to pair once.
 
-To remove all camera pairings, tap **Reset Bonds** on the web page.
+To remove a camera, tap the **✕** button next to it in the **Camera Status** section. The camera is immediately disconnected and its pairing is erased. It will need to be re-paired before it can reconnect.
 
 ---
 
@@ -374,5 +373,4 @@ esp32_gopro_canbus_controller/
 │   ├── can_manager/            # CAN bus (TWAI) driver wrapper
 │   │   ├── include/can_manager.h
 │   │   └── can_manager.c
-│   └── wifi_manager/           # Soft-AP + HTTP server
-│       ├── include/wifi_manag
+│   └── wifi_
