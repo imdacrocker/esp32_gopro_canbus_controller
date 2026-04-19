@@ -5,7 +5,7 @@ This project is currently in a working prrof-of-concept phase!  The project has 
 
 An ESP32-S3 firmware that bridges GoPro cameras (controlled over BLE) with a [RaceCapture](https://autosportlabs.com/racecapture/) data logger (connected over CAN bus). When RaceCapture starts logging, all paired GoPro cameras start recording automatically. Camera connection status is broadcast back to RaceCapture in real time.
 
-A companion Wi-Fi web interface lets you pair cameras, check status, and manually trigger recording — no laptop or serial terminal required in the field.
+A companion Wi-Fi web interface lets you pair cameras, check status, manually trigger recording, and override automatic recording control — no laptop or serial terminal required in the field.
 
 ---
 
@@ -130,7 +130,11 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 4. A one-shot start/stop command is immediately dispatched to all GATT-ready cameras.
 5. The tick timer continues retrying for any cameras not yet in the desired state, and will apply the command to cameras that reconnect later.
 
-> If RaceCapture is actively sending `0x600` frames, the CAN and web UI paths will write to the same desired-state flag and can overwrite each other. This is intentional — the web UI is designed for diagnostics when CAN is disconnected.
+> If RaceCapture is actively sending `0x600` frames and **Automatic Control** is enabled, the CAN and web UI paths write to the same desired-state flag and can overwrite each other. This is intentional — the web UI is designed for diagnostics when CAN is disconnected.
+
+**Automatic camera control:**
+
+The web UI exposes an **Automatic Control** toggle (on by default, always resets to on at boot). When enabled, the CAN logging state drives camera recording as described above. When disabled, `0x600` transitions are ignored — cameras hold whatever state they were in when the toggle was switched off, and can only be controlled manually via the web UI shutter buttons or `POST /api/shutter`. The flag is RAM-only and never stored in NVS.
 
 ---
 
@@ -140,7 +144,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 |-----------|---------|
 | `ble_core` | NimBLE stack wrapper. Owns scan, connect, encrypt, GATT write, and bond management. Camera-agnostic. |
 | `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). The camera is considered ready as soon as CCCD subscriptions complete — no polling loop is needed. `GetHardwareInfo` is sent automatically after every GATT setup to populate the camera's model name (e.g. `"HERO12 Black"`) in `camera_slot_info_t`. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
-| `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. |
+| `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. Owns the RAM-only `automatic_camera_control` flag that gates CAN-driven recording. |
 | `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` (isLogging) and `0x602` (UTC timestamp) frames; broadcasts `0x601` camera status at 5 Hz. Exposes `can_manager_get_utc_ms()` for on-demand UTC retrieval with monotonic-clock extrapolation. Thread-safe. |
 | `wifi_manager` | Soft-AP + HTTP server. Serves the embedded web UI and all `/api/*` endpoints. |
 
@@ -327,6 +331,7 @@ The script broadcasts a 64-bit millisecond Unix epoch timestamp at 25 Hz on CAN 
 - Confirm both devices are configured for 1 Mbps.
 
 **Recording does not start when RaceCapture logs**
+- Check that **Automatic Control** is enabled in the web UI. If it was toggled off, CAN logging transitions are intentionally ignored. The serial log will show `automatic_camera_control disabled — ignoring logging state change` from `main`.
 - Confirm the `0x600` frame is being transmitted by RaceCapture (use the serial monitor to watch for `0x600 RX` log lines from `can_manager`).
 - Confirm the command is reaching the camera: look for `conn=X cmd_write=0xXXXX: sending Start Recording` in the serial log from `open_gopro_ble`.
 - Confirm the camera accepted the command: look for `SetShutter command accepted by camera` immediately after. A `SetShutter command rejected` warning with a non-zero status code means the camera is refusing the command (wrong mode, not in video mode, etc.).

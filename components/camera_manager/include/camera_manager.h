@@ -55,6 +55,27 @@ void camera_manager_register_driver(camera_type_t type,
                                      void *(*create_ctx)(void));
 
 /**
+ * @brief Enable or disable automatic camera control via the CAN logging state.
+ *
+ * When enabled (the default on every boot), the on_logging_state_changed
+ * callback in main.c will start/stop cameras in response to RaceCapture
+ * isLogging transitions.  When disabled, those transitions are ignored and
+ * cameras must be controlled manually via the web UI shutter buttons.
+ *
+ * The flag always resets to true on restart — it is never stored in NVS.
+ *
+ * @param enabled  true = automatic control active, false = manual only.
+ */
+void camera_manager_set_auto_control(bool enabled);
+
+/**
+ * @brief Return the current automatic camera control state.
+ *
+ * @return true if automatic control is active, false if overridden to manual.
+ */
+bool camera_manager_get_auto_control(void);
+
+/**
  * @brief Callback fired when a camera slot's derived status changes.
  *
  * Invoked from camera_manager_tick() (every 2 s) and immediately from

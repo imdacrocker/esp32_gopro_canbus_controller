@@ -67,6 +67,11 @@ static void on_utc_acquired(void *user_ctx)
 
 static void on_logging_state_changed(logging_state_t state, void *user_ctx)
 {
+    if (!camera_manager_get_auto_control()) {
+        ESP_LOGI(TAG, "automatic_camera_control disabled — ignoring logging state change");
+        return;
+    }
+
     switch (state) {
         case LOGGING_STATE_LOGGING:
             ESP_LOGI(TAG, "RaceCapture logging STARTED — commanding cameras to record");

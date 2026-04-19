@@ -382,6 +382,75 @@ static const httpd_uri_t api_utc_uri = {
     .handler = api_utc_handler,
 };
 
+/* GET /api/auto-control — return the current automatic_camera_control flag
+ *
+ * Returns: {"enabled":true} or {"enabled":false}
+ */
+static esp_err_t api_auto_control_get_handler(httpd_req_t *req)
+{
+    char buf[24];
+    snprintf(buf, sizeof(buf), "{\"enabled\":%s}",
+             camera_manager_get_auto_control() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_auto_control_get_uri = {
+    .uri     = "/api/auto-control",
+    .method  = HTTP_GET,
+    .handler = api_auto_control_get_handler,
+};
+
+/* POST /api/auto-control — body: {"enabled":true} or {"enabled":false}
+ *
+ * Sets the automatic_camera_control flag.  Does not change the current camera
+ * recording state — cameras continue whatever they were doing.
+ *
+ * Returns: {"enabled":true} or {"enabled":false} reflecting the new state.
+ */
+static esp_err_t api_auto_control_post_handler(httpd_req_t *req)
+{
+    char body[64] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+
+    char *p = strstr(body, "\"enabled\":");
+    if (!p) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'enabled' field");
+        return ESP_FAIL;
+    }
+    p += 10; /* skip past "enabled": */
+    while (*p == ' ') p++;
+
+    bool enabled;
+    if (strncmp(p, "true", 4) == 0) {
+        enabled = true;
+    } else if (strncmp(p, "false", 5) == 0) {
+        enabled = false;
+    } else {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid 'enabled' value");
+        return ESP_FAIL;
+    }
+
+    camera_manager_set_auto_control(enabled);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "{\"enabled\":%s}", enabled ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_auto_control_post_uri = {
+    .uri     = "/api/auto-control",
+    .method  = HTTP_POST,
+    .handler = api_auto_control_post_handler,
+};
+
 /* POST /api/shutter — body: {"on":true} or {"on":false}
  *
  * Sends a start/stop recording command to every connected, GATT-ready camera.
@@ -441,7 +510,7 @@ static const httpd_uri_t api_shutter_uri = {
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;  /* default is 8; bump to fit current 10 + headroom */
+    config.max_uri_handlers = 14;  /* default is 8; bump to fit current 12 + headroom */
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -455,6 +524,8 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_paired_cameras_uri);
         httpd_register_uri_handler(server, &api_logging_state_uri);
         httpd_register_uri_handler(server, &api_utc_uri);
+        httpd_register_uri_handler(server, &api_auto_control_get_uri);
+        httpd_register_uri_handler(server, &api_auto_control_post_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");

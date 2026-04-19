@@ -208,7 +208,7 @@ Manually sends a start or stop recording command to all currently connected, GAT
 
 This command **does** update the desired recording state tracked by `camera_manager`. If a camera is currently disconnected and reconnects later, the tick timer will automatically retry the command to bring it into the desired state. Sending `{"on": false}` clears the desired state, preventing the tick timer from re-enabling recording even if CAN previously set it.
 
-> **Note:** If RaceCapture is actively sending `0x600` logging frames, those will overwrite the desired state on the next frame received. The web UI and CAN path will "fight" each other — this is expected behaviour. The web UI is intended for diagnostics when CAN is disconnected.
+> **Note:** If RaceCapture is actively sending `0x600` logging frames **and Automatic Control is enabled**, those will overwrite the desired state on the next frame received. The web UI and CAN path will "fight" each other — this is expected behaviour. The web UI shutter buttons are intended for diagnostics when CAN is disconnected, or when Automatic Control has been disabled via `/api/auto-control`.
 
 **Request body** (`Content-Type: application/json`):
 
@@ -240,6 +240,60 @@ This command **does** update the desired recording state tracked by `camera_mana
 
 ---
 
+### `GET /api/auto-control`
+
+Returns the current state of the automatic camera control flag.
+
+When `enabled` is `true` (the default on every boot), `isLogging` transitions received on the CAN bus automatically start and stop recording on all cameras. When `false`, CAN logging transitions are ignored — cameras hold their current state and can only be controlled manually via the web UI or `/api/shutter`.
+
+The flag is never stored in NVS. It always resets to `true` when the controller reboots.
+
+**Response**
+
+```json
+{ "enabled": true }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | boolean | `true` = automatic control active; `false` = manual override. |
+
+---
+
+### `POST /api/auto-control`
+
+Enable or disable automatic camera control.
+
+Changing this flag does **not** affect the current recording state of any camera. Cameras continue whatever they were doing. The flag only gates future `0x600` CAN logging transitions.
+
+When re-enabling automatic control, the controller does **not** immediately resync to the current CAN logging state — it waits for the next `isLogging` transition from RaceCapture.
+
+**Request body** (`Content-Type: application/json`):
+
+```json
+{ "enabled": false }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | boolean | `true` to enable automatic control; `false` to suppress CAN-driven recording. |
+
+**Response** — reflects the state that was applied:
+
+```json
+{ "enabled": false }
+```
+
+**Error responses**
+
+| HTTP status | Body | Cause |
+|-------------|------|-------|
+| 400 | `Empty body` | Request body was missing. |
+| 400 | `Missing 'enabled' field` | JSON field `"enabled"` was not found. |
+| 400 | `Invalid 'enabled' value` | `"enabled"` was not `true` or `false`. |
+
+---
+
 ## CAN Bus Protocol
 
 The controller communicates with RaceCapture over a **1 Mbps CAN bus** using **standard 11-bit frame IDs** and classic (non-FD) 8-byte data frames.
@@ -265,7 +319,7 @@ The controller communicates with RaceCapture over a **1 Mbps CAN bus** using **s
 
 ### `0x600` — RaceCapture → ESP32 (Command frame)
 
-Sent by RaceCapture to command the controller's logging state. The controller fires its internal `on_logging_state_changed` callback only when `isLogging` changes value — repeated identical frames are silently ignored.
+Sent by RaceCapture to command the controller's logging state. The controller fires its internal `on_logging_state_changed` callback only when `isLogging` changes value — repeated identical frames are silently ignored. If automatic camera control has been disabled via `/api/auto-control`, the callback still fires but returns immediately without acting on the cameras.
 
 | Byte | Field | Type | Values |
 |------|-------|------|--------|
@@ -781,6 +835,20 @@ Immediately dispatch a start/stop command to all connected, GATT-ready cameras. 
 bool camera_manager_is_known_addr(const ble_addr_t *addr);
 ```
 Returns `true` if `addr` matches any configured slot. Used by `ble_core` as the `is_known_addr` callback to decide whether to auto-reconnect an advertising device.
+
+---
+
+```c
+void camera_manager_set_auto_control(bool enabled);
+```
+Enable or disable automatic camera control. When `enabled` is `true` (the default on every boot), `on_logging_state_changed` in `main.c` will start and stop cameras in response to RaceCapture `isLogging` transitions. When `false`, those transitions are silently ignored and cameras must be controlled manually. The flag is RAM-only — it is never written to NVS and resets to `true` on every boot.
+
+---
+
+```c
+bool camera_manager_get_auto_control(void);
+```
+Returns the current automatic control state. Called by `on_logging_state_changed` in `main.c` before acting on any `0x600` logging transition, and by `wifi_manager` to serve `GET /api/auto-control`.
 
 ---
 

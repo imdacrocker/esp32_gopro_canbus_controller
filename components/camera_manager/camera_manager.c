@@ -42,6 +42,12 @@ typedef struct {
 
 static camera_slot_t s_slots[CAMERA_MAX_SLOTS];
 
+/* Automatic camera control flag.
+ * When true (the default on every boot), the CAN logging state drives camera
+ * recording.  When false, CAN transitions are ignored and the camera must be
+ * controlled manually via the web UI.  Never persisted to NVS. */
+static bool s_auto_control = true;
+
 /* Driver registry for decoupled driver loading */
 typedef struct {
     camera_type_t        type;
@@ -521,6 +527,17 @@ int camera_manager_stop_recording_all(void)
 bool camera_manager_is_known_addr(const ble_addr_t *addr)
 {
     return camera_manager_find_by_addr(addr) >= 0;
+}
+
+void camera_manager_set_auto_control(bool enabled)
+{
+    s_auto_control = enabled;
+    ESP_LOGI(TAG, "automatic_camera_control = %s", enabled ? "true" : "false");
+}
+
+bool camera_manager_get_auto_control(void)
+{
+    return s_auto_control;
 }
 
 bool camera_manager_has_disconnected_cameras(void)

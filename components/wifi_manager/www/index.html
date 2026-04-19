@@ -53,6 +53,19 @@
         .rc-unknown     { background: #f39c12; color: #fff; }
         #utc-display { font-size: 0.9em; color: #555; font-family: monospace; }
         #scan-row { margin-bottom: 0.6em; }
+
+        /* Automatic control toggle row */
+        #auto-control-row { display: flex; align-items: center; gap: 0.6em; margin: 0.2em 0 0.6em; }
+        #auto-control-label { font-size: 0.9em; color: #333; }
+        .toggle-switch { position: relative; display: inline-block; width: 42px; height: 24px; flex-shrink: 0; }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider { position: absolute; cursor: pointer; inset: 0;
+                         background: #ccc; border-radius: 24px; transition: background 0.2s; }
+        .toggle-slider:before { content: ''; position: absolute; width: 18px; height: 18px;
+                                 left: 3px; bottom: 3px; background: #fff; border-radius: 50%;
+                                 transition: transform 0.2s; }
+        .toggle-switch input:checked + .toggle-slider { background: #27ae60; }
+        .toggle-switch input:checked + .toggle-slider:before { transform: translateX(18px); }
     </style>
 </head>
 <body>
@@ -60,6 +73,13 @@
     <div id="status-row">
         <div id="rc-logging-pill" class="rc-unknown">RC: Unknown</div>
         <span id="utc-display">--:--:-- UTC</span>
+    </div>
+    <div id="auto-control-row">
+        <label class="toggle-switch">
+            <input type="checkbox" id="auto-control-toggle" onchange="setAutoControl(this.checked)" checked>
+            <span class="toggle-slider"></span>
+        </label>
+        <span id="auto-control-label">Automatic Control</span>
     </div>
     <div id="scan-row">
         <button id="scan-btn" onclick="startScan()">Scan for Cameras</button>
@@ -155,10 +175,39 @@
                     }
                 })
                 .catch(function() {});
+
+            fetch('/api/auto-control')
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    document.getElementById('auto-control-toggle').checked = !!data.enabled;
+                })
+                .catch(function() {});
         }
 
         refreshLoggingState();
         setInterval(refreshLoggingState, 2000);
+
+        function setAutoControl(enabled) {
+            fetch('/api/auto-control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabled })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                /* Sync the toggle to whatever the server confirms */
+                document.getElementById('auto-control-toggle').checked = !!data.enabled;
+            })
+            .catch(function() {
+                /* On error, re-fetch the real state so the toggle isn't left lying */
+                fetch('/api/auto-control')
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        document.getElementById('auto-control-toggle').checked = !!data.enabled;
+                    })
+                    .catch(function() {});
+            });
+        }
 
         function startScan() {
             document.getElementById('scan-btn').disabled = true;
@@ -269,3 +318,4 @@
     </script>
 </body>
 </html>
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
