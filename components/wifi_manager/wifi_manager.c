@@ -215,7 +215,7 @@ static const httpd_uri_t api_status_uri = {
  */
 static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
 {
-    char buf[1024];
+    char buf[1536];
     int  pos   = 0;
     bool first = true;
 
@@ -242,11 +242,13 @@ static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
             "{\"slot\":%d,"
             "\"index\":%d,"
             "\"name\":\"%s\","
+            "\"model_name\":\"%s\","
             "\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
             "\"status\":\"%s\"}",
             i,
             i + 1,
             info.name,
+            info.model_name,
             v[5], v[4], v[3], v[2], v[1], v[0],
             status_str);
     }
