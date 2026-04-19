@@ -9,16 +9,81 @@ static const char *TAG = "open_gopro_ble";
 #define GP_QUERY_GET_STATUS   0x13
 #define GP_STATUS_ID_ENCODING 0x08
 
-/* Parse a raw Query Response notification (from GP-0077) and update the
- * camera's cached recording status.
+/* Feature ID for Protobuf Preset responses that arrive on GP-0077.
+ * Must match PRESET_FEATURE_ID in presets.c. */
+#define GP_PRESET_FEATURE_ID  0xF5
+#define GP_PRESET_ACTION_RESP 0xF2
+
+/*
+ * Parse a raw Query Response notification (from GP-0077) and route to the
+ * correct handler based on GPBS frame type and content.
  *
- * OpenGoPro TLV layout:
- *   [length][query_id=0x13][result=0x00][status_id][value_len][value...]
+ * Two response types share GP-0077:
+ *
+ *   TLV status poll response (query_id = 0x13) — always single-packet:
+ *     [GPBS_hdr][0x13][result][status_id][value_len][value...]
+ *
+ *   Protobuf Preset response (Feature ID = 0xF5) — typically fragmented:
+ *     Single-packet:     [GPBS_hdr][0xF5][0xF2][protobuf...]
+ *     First fragment:    [GPBS_hdr0][GPBS_hdr1][0xF5][0xF2][protobuf...]
+ *     Continuation:      [seq_byte][protobuf...]
+ *
+ * GPBS frame types (bits [7:5] of byte 0, using 3-bit mask per OpenGoPro):
+ *   0b000 (0) — single-packet,   payload at byte 1
+ *   0b001 (1) — first fragment,  payload at byte 2
+ *   0b010+ (2+) — continuation,  payload at byte 1
+ *
+ * Recording-status responses (0x13) are always single-packet.  Any
+ * fragmented response on GP-0077 must therefore be a Preset response.
  */
-static void handle_query_response(int slot, const uint8_t *data, uint16_t len)
+static void handle_query_response(uint16_t conn_handle, int slot,
+                                   const uint8_t *data, uint16_t len)
 {
-    /* Minimum valid packet: 6 bytes */
-    if (slot < 0 || data == NULL || len < 6) {
+    if (slot < 0 || data == NULL || len < 2) {
+        return;
+    }
+
+    uint8_t frame_type = (data[0] >> 5) & 0x07;
+
+    /* ------------------------------------------------------------------
+     * Continuation fragment — always a Preset response on GP-0077.
+     * ------------------------------------------------------------------ */
+    if (frame_type >= 0x02) {
+        gopro_presets_handle_query_fragment(conn_handle, data, len);
+        return;
+    }
+
+    /* ------------------------------------------------------------------
+     * Single-packet (0) or first-fragment (1) — identify by Feature/Query ID.
+     * For single-packet:  payload at byte 1, so data[1] = Feature/Query ID.
+     * For first-fragment: payload at byte 2, so data[2] = Feature/Query ID.
+     * ------------------------------------------------------------------ */
+    int     payload_off = (frame_type == 0x00) ? 1 : 2;
+    uint8_t first_byte  = (len > (uint16_t)payload_off) ? data[payload_off] : 0;
+
+    if (first_byte == GP_PRESET_FEATURE_ID) {
+        /* Preset Protobuf response. */
+        if (frame_type == 0x00) {
+            /* Single-packet: verify Action ID and dispatch directly. */
+            if (len >= 4 && data[payload_off + 1] == GP_PRESET_ACTION_RESP) {
+                gopro_presets_handle_notify_status(conn_handle, data, len);
+            } else {
+                ESP_LOGD(TAG, "slot %d: unhandled Preset action=0x%02x",
+                         slot, len > (uint16_t)(payload_off + 1)
+                               ? data[payload_off + 1] : 0xFF);
+            }
+        } else {
+            /* First fragment: start reassembly. */
+            gopro_presets_handle_query_fragment(conn_handle, data, len);
+        }
+        return;
+    }
+
+    /* ------------------------------------------------------------------
+     * TLV recording-status poll response — minimum 6 bytes for a valid
+     * single-packet with at least one status entry.
+     * ------------------------------------------------------------------ */
+    if (len < 6) {
         return;
     }
 
@@ -135,7 +200,7 @@ void gopro_on_notify_rx_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     if (attr_handle == ctx->gatt.query_resp_notify) {
-        handle_query_response(slot, data, len);
+        handle_query_response(conn_handle, slot, data, len);
         return;
     }
     /* Future: handle settings_resp_notify, etc. */

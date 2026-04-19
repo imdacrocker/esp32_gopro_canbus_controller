@@ -380,6 +380,18 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
         return;
     }
 
+    /* Handle Load Preset command response: cmd_id=0x40 */
+    if (cmd_id == 0x40) {
+        if (status == 0x00) {
+            ESP_LOGI(TAG, "query slot %d: Load Preset accepted — camera in Video mode",
+                     slot);
+        } else {
+            ESP_LOGW(TAG, "query slot %d: Load Preset rejected — status=0x%02x",
+                     slot, status);
+        }
+        return;
+    }
+
     /* Only handle GetHardwareInfo responses; ignore everything else. */
     if (cmd_id != CMD_GET_HW_INFO) {
         ESP_LOGD(TAG, "query slot %d: unhandled cmd response cmd_id=0x%02x status=0x%02x",

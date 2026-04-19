@@ -95,5 +95,8 @@ void gopro_on_disconnected_cb(uint16_t conn_handle, const ble_addr_t *addr, int 
     /* Release any in-progress query reassembly context for this handle. */
     gopro_query_free(conn_handle);
 
+    /* Release any in-progress preset reassembly context for this handle. */
+    gopro_presets_free(conn_handle);
+
     ESP_LOGI(TAG, "Disconnected (slot %d, reason %d)", slot, reason);
 }

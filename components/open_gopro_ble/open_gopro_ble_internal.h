@@ -106,3 +106,40 @@ void control_send_pairing_complete(uint16_t conn_handle);
  * The caller is responsible for any retry logic in that case.
  */
 esp_err_t control_send_set_date_time(uint16_t conn_handle);
+
+/* -------------------------------------------------------------------------
+ * presets.c — OpenGoPro preset commands
+ *
+ * gopro_presets_request_video()
+ *   Phase 1 of the two-phase preset flow.  Sends RequestGetPresetStatus
+ *   (Protobuf, Feature 0xF5, Action 0x72) to GP-0076 (query_write).  Must
+ *   be called after GATT discovery and CCCD subscriptions are complete.
+ *   The response arrives asynchronously on GP-0077 and is routed to
+ *   gopro_presets_handle_notify_status() by notify.c.
+ *
+ * gopro_presets_handle_notify_status()
+ *   Phase 2 of the two-phase preset flow.  Called by notify.c when a
+ *   GP-0077 notification carries Feature ID 0xF5 (Preset feature).
+ *   Parses the NotifyPresetStatus Protobuf payload to find the first preset
+ *   in the Video group, then sends Load Preset (TLV 0x40) to GP-0072.
+ *   The Load Preset response on GP-0073 is handled by the 0x40 case in
+ *   gopro_query_handle_cmd_response() (query.c).
+ * ------------------------------------------------------------------------- */
+
+void gopro_presets_request_video(uint16_t conn_handle);
+
+/** Handle a single-packet NotifyPresetStatus notification on GP-0077.
+ *  Called by notify.c when frame_type=0 and Feature ID=0xF5. */
+void gopro_presets_handle_notify_status(uint16_t conn_handle,
+                                         const uint8_t *data, uint16_t len);
+
+/** Handle a first-fragment or continuation-fragment GP-0077 notification
+ *  belonging to the Preset Protobuf feature.  Called by notify.c for
+ *  frame_type >= 1 when Feature ID=0xF5 or any continuation fragment.
+ *  Manages reassembly; calls load_first_video_preset() when complete. */
+void gopro_presets_handle_query_fragment(uint16_t conn_handle,
+                                          const uint8_t *data, uint16_t len);
+
+/** Release any in-progress preset reassembly context for this connection.
+ *  Must be called from gopro_on_disconnected_cb() in pairing.c. */
+void gopro_presets_free(uint16_t conn_handle);
