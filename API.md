@@ -521,8 +521,9 @@ OpenGoPro BLE driver implementing the [OpenGoPro BLE 2.0](https://gopro.github.i
 | `driver.c` | `camera_driver_t` vtable, per-camera context allocation, discovery list, component init |
 | `gatt.c` | GATT service/characteristic discovery, MTU negotiation, CCCD subscription |
 | `pairing.c` | BLE lifecycle callbacks: connected, encrypted, disconnected |
-| `notify.c` | ATT notification routing (recording status transitions, `start_cmd_pending` management, command responses) |
-| `query.c` | On-demand query commands — `GetHardwareInfo` (0x3C) send + GPBS-aware response parsing |
+| `notify.c` | ATT notification routing (recording status transitions, `start_cmd_pending` management, Preset Protobuf responses on GP-0077, command responses) |
+| `presets.c` | Two-phase Video preset loading: `RequestGetPresetStatus` (Phase 1) + `NotifyPresetStatus` parse + `Load Preset` (Phase 2); GPBS reassembly for fragmented GP-0077 responses |
+| `query.c` | On-demand query commands — `GetHardwareInfo` (0x3C) send + GPBS-aware response parsing; `Load Preset` (0x40) response handler |
 
 #### Types
 
@@ -682,6 +683,47 @@ The response arrives on GP-0073 (`cmd_resp_notify`) and is dispatched to `gopro_
 - Any other status → logged at WARN with the rejection code
 
 If UTC is not yet available when `control_send_set_date_time()` is called (e.g. GPS lock not yet acquired on the RaceCapture), the command is skipped with a warning and will not be retried for that connection.
+
+**Video Preset Loading (two-phase flow)**
+
+Initiated automatically by `gatt.c` immediately after all CCCD subscriptions complete, on every connection (first pairing and all reconnections), alongside `SetDateTime` and `GetHardwareInfo`.
+
+*Phase 1 — `gopro_presets_request_video()` (`presets.c`)*
+
+Sends `RequestGetPresetStatus` to GP-0076 (`query_write`):
+
+| Byte | Value | Description |
+|------|-------|-------------|
+| 0 | `0x06` | GPBS single-packet length (6 bytes follow) |
+| 1 | `0xF5` | Feature ID — Preset |
+| 2 | `0x72` | Action ID — RequestGetPresetStatus |
+| 3–5 | `0x08 0x01 0x00` | Protobuf: `register_preset_status: false` (query only) |
+
+*Phase 2 — `NotifyPresetStatus` parse + `Load Preset`*
+
+The camera responds asynchronously on GP-0077 (`query_resp_notify`) with a `NotifyPresetStatus` Protobuf payload. For cameras with many custom presets (e.g. HERO13 Black), this response is fragmented across multiple ATT notifications using GPBS application-layer framing. `presets.c` manages per-connection reassembly (mirrors the pattern in `query.c` for `GetHardwareInfo`).
+
+`notify.c` routes GP-0077 notifications to `presets.c` based on the GPBS frame type and Feature ID (`0xF5`):
+- **Continuation fragment** (frame_type ≥ 2): always routed to `gopro_presets_handle_query_fragment()`
+- **Single-packet** (frame_type = 0, Feature ID = 0xF5, Action ID = 0xF2): routed to `gopro_presets_handle_notify_status()`
+- **First fragment** (frame_type = 1, Feature ID = 0xF5): starts reassembly in `gopro_presets_handle_query_fragment()`
+
+Once the complete payload is assembled, `presets.c` parses the Protobuf to find the first preset in the Video group (`EnumPresetGroup = 1000`) and sends a `Load Preset` command to GP-0072 (`cmd_write`):
+
+| Byte | Value | Description |
+|------|-------|-------------|
+| 0 | `0x06` | GPBS single-packet length (6 bytes follow) |
+| 1 | `0x40` | Load Preset command ID |
+| 2 | `0x04` | Parameter length (4 bytes) |
+| 3–6 | preset ID | Big-endian `uint32` preset ID from `NotifyPresetStatus` |
+
+The camera's response arrives on GP-0073 (`cmd_resp_notify`) and is handled by the `0x40` case in `gopro_query_handle_cmd_response()` (`query.c`):
+- Status `0x00` → logged at INFO: `Load Preset accepted — camera in Video mode`
+- Any other status → logged at WARN with the rejection code
+
+Disconnect cleanup: `gopro_presets_free()` is called from `gopro_on_disconnected_cb()` in `pairing.c` to release any in-progress reassembly context.
+
+---
 
 **`SetShutter` response (cmd 0x01)**
 
