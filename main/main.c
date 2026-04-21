@@ -5,6 +5,7 @@
 #include "camera_manager.h"
 #include "wifi_manager.h"
 #include "can_manager.h"
+#include "legacy_gopro.h"
 
 static const char *TAG = "main";
 
@@ -136,6 +137,11 @@ void app_main(void)
     camera_manager_init();
 
     wifi_manager_init();
+
+    /* Start the legacy GoPro (Hero4) Wi-Fi component.  Must come after
+     * camera_manager_init() and wifi_manager_init() since it registers
+     * cameras into existing slots and receives events from the AP. */
+    legacy_gopro_init();
 
     /* Wait for the AP beacon to be on air before starting BLE.
      * The ESP32 shares one antenna between WiFi and BLE.  If BLE begins

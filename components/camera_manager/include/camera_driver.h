@@ -47,8 +47,9 @@ typedef enum {
  * Persisted to NVS so the correct driver can be reloaded on boot.
  */
 typedef enum {
-    CAMERA_TYPE_NONE      = 0, /**< Slot is unconfigured — no driver assigned. */
-    CAMERA_TYPE_GOPRO_BLE,     /**< GoPro camera controlled via BLE (gopro_ble component). */
+    CAMERA_TYPE_NONE        = 0, /**< Slot is unconfigured — no driver assigned. */
+    CAMERA_TYPE_GOPRO_BLE,       /**< GoPro camera controlled via BLE (Open GoPro). */
+    CAMERA_TYPE_LEGACY_WIFI,     /**< Legacy GoPro (Hero4 etc.) controlled via Wi-Fi HTTP API. */
 } camera_type_t;
 
 /* ============================================================

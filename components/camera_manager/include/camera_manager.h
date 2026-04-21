@@ -66,6 +66,49 @@ int  camera_manager_stop_recording_all(void);
 int  camera_manager_set_recording_slot(int slot, bool on);
 bool camera_manager_is_known_addr(const ble_addr_t *addr);
 bool camera_manager_has_disconnected_cameras(void);
+
+/* -----------------------------------------------------------------------
+ * Legacy Wi-Fi camera API (CAMERA_TYPE_LEGACY_WIFI)
+ *
+ * Wi-Fi cameras (e.g. GoPro Hero4) connect to the ESP32 SoftAP and are
+ * controlled via the gpControl HTTP API.  Unlike BLE cameras they are NOT
+ * persisted to NVS — they re-probe on every reconnect.
+ * ----------------------------------------------------------------------- */
+
+/**
+ * @brief Register a newly-identified Wi-Fi camera.
+ *
+ * Looks up an existing slot by MAC address first; if found, updates the
+ * driver and context pointer (handles reconnects).  If not found, allocates
+ * a new slot.  Does NOT save to NVS.
+ *
+ * @param mac        Station MAC address (6 bytes).
+ * @param name       Human-readable camera name (e.g. from gpControl status).
+ * @param driver     Pointer to the driver vtable.
+ * @param driver_ctx Per-camera driver context (must remain valid for the slot lifetime).
+ * @return           Slot index on success, -1 if no slots are available.
+ */
+int camera_manager_register_wifi_camera(const uint8_t mac[6], const char *name,
+                                         const camera_driver_t *driver, void *driver_ctx);
+
+/**
+ * @brief Mark a Wi-Fi camera slot as connected and store its current IP.
+ *
+ * @param slot  0-based slot index returned by camera_manager_register_wifi_camera().
+ * @param ip    Station IPv4 address (network-byte-order uint32_t).
+ */
+void camera_manager_on_wifi_connected(int slot, uint32_t ip);
+
+/**
+ * @brief Mark the Wi-Fi camera with the given MAC as disconnected.
+ *
+ * Looks up the slot by MAC and clears the wifi_connected flag.  The slot
+ * remains allocated so the camera shows as "disconnected" in the UI until
+ * it reconnects and re-probes.
+ *
+ * @param mac  MAC address of the disconnected station (6 bytes).
+ */
+void camera_manager_on_wifi_disconnected_by_mac(const uint8_t mac[6]);
 void camera_manager_register_driver(camera_type_t type,
                                      const camera_driver_t *driver,
                                      void *(*create_ctx)(void));

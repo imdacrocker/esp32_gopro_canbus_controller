@@ -8,12 +8,14 @@
 #include "esp_wifi.h"
 #include "esp_http_server.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/sockets.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "open_gopro_ble.h"
 #include "camera_manager.h"
 #include "ble_core.h"
 #include "can_manager.h"
+#include "legacy_gopro.h"
 
 #define AP_CHANNEL          6   /* ch.6 is the 2.4 GHz center channel; avoids HT40+
                                  * regulatory issues that ch.1 has with iOS clients */
@@ -63,11 +65,49 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
     } else if (id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *ev = (wifi_event_ap_staconnected_t *)data;
-        ESP_LOGI(TAG, "Station connected — AID=%d", ev->aid);
+        ESP_LOGI(TAG, "Station connected — AID=%d  MAC=%02X:%02X:%02X:%02X:%02X:%02X",
+                 ev->aid,
+                 ev->mac[0], ev->mac[1], ev->mac[2],
+                 ev->mac[3], ev->mac[4], ev->mac[5]);
+        /* IP is not available yet — wait for IP_EVENT_AP_STAIPASSIGNED before
+         * probing.  The probe is triggered from ip_event_handler() below. */
 
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *ev = (wifi_event_ap_stadisconnected_t *)data;
-        ESP_LOGI(TAG, "Station disconnected — AID=%d reason=%d", ev->aid, ev->reason);
+        ESP_LOGI(TAG, "Station disconnected — AID=%d reason=%d  MAC=%02X:%02X:%02X:%02X:%02X:%02X",
+                 ev->aid, ev->reason,
+                 ev->mac[0], ev->mac[1], ev->mac[2],
+                 ev->mac[3], ev->mac[4], ev->mac[5]);
+        legacy_gopro_on_station_disconnected(ev->mac);
+    }
+}
+
+/* ============================================================
+ * IP Event Handler
+ * ============================================================ */
+
+/**
+ * Fired by lwIP / esp_netif when the DHCP server assigns an IP to a client.
+ * This is the right moment to probe — the station now has a routable address.
+ *
+ * ip_event_ap_staipassigned_t fields:
+ *   .ip.addr  — assigned IPv4 in network-byte-order uint32_t
+ *   .mac[6]   — station MAC address
+ */
+static void ip_event_handler(void *arg, esp_event_base_t base,
+                              int32_t id, void *data)
+{
+    if (id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
+        ip_event_assigned_ip_to_client_t *ev = (ip_event_assigned_ip_to_client_t *)data;
+        uint32_t ip = ev->ip.addr;
+
+        ESP_LOGI(TAG, "DHCP assigned %d.%d.%d.%d to %02X:%02X:%02X:%02X:%02X:%02X",
+                 (int)(ip & 0xFF), (int)((ip >> 8) & 0xFF),
+                 (int)((ip >> 16) & 0xFF), (int)((ip >> 24) & 0xFF),
+                 ev->mac[0], ev->mac[1], ev->mac[2],
+                 ev->mac[3], ev->mac[4], ev->mac[5]);
+
+        legacy_gopro_on_station_connected(ip, ev->mac);
     }
 }
 
@@ -253,19 +293,23 @@ static esp_err_t api_paired_cameras_handler(httpd_req_t *req)
         if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
         first = false;
 
+        const char *type_str = legacy_gopro_is_managed_slot(i) ? "legacy_wifi" : "ble";
+
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             "{\"slot\":%d,"
             "\"index\":%d,"
             "\"name\":\"%s\","
             "\"model_name\":\"%s\","
             "\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
-            "\"status\":\"%s\"}",
+            "\"status\":\"%s\","
+            "\"type\":\"%s\"}",
             i,
             i + 1,
             info.name,
             info.model_name,
             v[5], v[4], v[3], v[2], v[1], v[0],
-            status_str);
+            status_str,
+            type_str);
     }
 
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
@@ -318,14 +362,16 @@ static esp_err_t api_remove_camera_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    /* Save MAC before the slot is cleared. */
-    ble_addr_t mac = info.mac_address;
-
-    /* Step 2: clear camera_manager slot (RAM + NVS). */
-    camera_manager_remove_slot(slot);
-
-    /* Step 3: async disconnect + bond removal on the NimBLE task. */
-    ble_core_remove_bond(&mac);
+    if (legacy_gopro_is_managed_slot(slot)) {
+        /* Legacy Wi-Fi camera: delegate removal to legacy_gopro (async).
+         * It will call camera_manager_remove_slot() internally. */
+        legacy_gopro_remove_camera(info.mac_address.val);
+    } else {
+        /* BLE camera: clear camera_manager slot then remove NimBLE bond. */
+        ble_addr_t mac = info.mac_address;
+        camera_manager_remove_slot(slot);
+        ble_core_remove_bond(&mac);
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"removed\"}");
@@ -528,6 +574,160 @@ static const httpd_uri_t api_shutter_uri = {
     .handler = api_shutter_handler,
 };
 
+/* GET /api/legacy/discovered — AP stations that are connected but not yet
+ * added to camera_manager by the user.
+ *
+ * Returns: [{"addr":"XX:XX:XX:XX:XX:XX"}, ...]
+ *
+ * The device making this request is automatically excluded from the list so
+ * the phone/browser that opens the settings page never shows itself as a
+ * candidate camera.  Devices that are already managed (paired) are also
+ * excluded since they appear in /api/paired-cameras.
+ */
+static esp_err_t api_legacy_discovered_handler(httpd_req_t *req)
+{
+    /* Determine the requester's IP so we can exclude it from the list. */
+    uint32_t requester_ip = 0;
+    int sock = httpd_req_to_sockfd(req);
+    if (sock >= 0) {
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof(peer);
+        if (getpeername(sock, (struct sockaddr *)&peer, &peer_len) == 0) {
+            requester_ip = peer.sin_addr.s_addr;
+        }
+    }
+
+    legacy_discovered_camera_t all[4];
+    int total = legacy_gopro_get_discovered(all, 4);
+
+    char buf[512];
+    int  pos   = 0;
+    bool first = true;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "[");
+    for (int i = 0; i < total; i++) {
+        /* Skip the device that is loading the web page. */
+        if (requester_ip && all[i].ip_addr == requester_ip) continue;
+
+        const uint8_t *m = all[i].mac;
+        if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
+        first = false;
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "{\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}",
+            m[0], m[1], m[2], m[3], m[4], m[5]);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_legacy_discovered_uri = {
+    .uri     = "/api/legacy/discovered",
+    .method  = HTTP_GET,
+    .handler = api_legacy_discovered_handler,
+};
+
+/* POST /api/legacy/add — promote a discovered Hero4 to managed status.
+ *
+ * Body: {"addr":"XX:XX:XX:XX:XX:XX"}
+ *
+ * The operation is asynchronous — legacy_gopro posts a CMD_ADD_CAMERA to its
+ * internal task queue.  The camera will appear in /api/paired-cameras within
+ * ~3 seconds (settle loop).
+ */
+static esp_err_t api_legacy_add_handler(httpd_req_t *req)
+{
+    char body[64] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+
+    char *p = strstr(body, "\"addr\":\"");
+    if (!p) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing addr");
+        return ESP_FAIL;
+    }
+    p += 8;
+
+    unsigned int v[6];
+    if (sscanf(p, "%02X:%02X:%02X:%02X:%02X:%02X",
+               &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad addr format");
+        return ESP_FAIL;
+    }
+
+    uint8_t mac[6];
+    for (int i = 0; i < 6; i++) mac[i] = (uint8_t)v[i];
+
+    if (!legacy_gopro_add_camera(mac)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Queue full");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"adding\"}");
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_legacy_add_uri = {
+    .uri     = "/api/legacy/add",
+    .method  = HTTP_POST,
+    .handler = api_legacy_add_handler,
+};
+
+/* POST /api/legacy/remove — un-manage a legacy camera.
+ *
+ * Body: {"addr":"XX:XX:XX:XX:XX:XX"}
+ *
+ * Delegates to legacy_gopro_remove_camera() which posts CMD_REMOVE_CAMERA.
+ * The camera slot will be freed and removed from NVS.  If the camera is still
+ * physically connected it will reappear in /api/legacy/discovered.
+ */
+static esp_err_t api_legacy_remove_handler(httpd_req_t *req)
+{
+    char body[64] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+
+    char *p = strstr(body, "\"addr\":\"");
+    if (!p) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing addr");
+        return ESP_FAIL;
+    }
+    p += 8;
+
+    unsigned int v[6];
+    if (sscanf(p, "%02X:%02X:%02X:%02X:%02X:%02X",
+               &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad addr format");
+        return ESP_FAIL;
+    }
+
+    uint8_t mac[6];
+    for (int i = 0; i < 6; i++) mac[i] = (uint8_t)v[i];
+
+    if (!legacy_gopro_remove_camera(mac)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Queue full");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"removed\"}");
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_legacy_remove_uri = {
+    .uri     = "/api/legacy/remove",
+    .method  = HTTP_POST,
+    .handler = api_legacy_remove_handler,
+};
+
 /* ============================================================
  * HTTP Server
  * ============================================================ */
@@ -535,7 +735,7 @@ static const httpd_uri_t api_shutter_uri = {
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 14;  /* default is 8; bump to fit current 13 + headroom */
+    config.max_uri_handlers = 18;  /* 13 original + 3 legacy + 2 headroom */
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -552,6 +752,9 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_utc_uri);
         httpd_register_uri_handler(server, &api_auto_control_get_uri);
         httpd_register_uri_handler(server, &api_auto_control_post_uri);
+        httpd_register_uri_handler(server, &api_legacy_discovered_uri);
+        httpd_register_uri_handler(server, &api_legacy_add_uri);
+        httpd_register_uri_handler(server, &api_legacy_remove_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");
@@ -594,14 +797,48 @@ void wifi_manager_init(void)
                                                         NULL,
                                                         NULL));
 
+    /* Register for DHCP IP-assigned event so we know when a station has a
+     * routable address and can be probed by legacy_gopro. */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_ASSIGNED_IP_TO_CLIENT,
+                                                        &ip_event_handler,
+                                                        NULL,
+                                                        NULL));
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 
-    /* Build SSID from last 3 bytes of AP MAC address.
-     * esp_wifi_get_mac() is safe to call after esp_wifi_init() + set_mode().
-     * Validate the result — an all-zero suffix means the read failed and we
-     * fall back to a static name rather than broadcasting a garbage SSID. */
+    /* Read the chip's factory MAC so we can preserve the last three bytes
+     * (the device-unique portion) in our spoofed address.
+     * esp_wifi_get_mac() is safe to call after esp_wifi_init() + set_mode(). */
     uint8_t mac[6] = {0};
     esp_err_t mac_err = esp_wifi_get_mac(WIFI_IF_AP, mac);
+
+    /* Override the OUI to d8:96:85 so the ESP32 presents itself as a GoPro
+     * RC Wi-Fi remote.  Hero4 (and other legacy GoPro) cameras auto-connect
+     * to an AP whose SSID is "HERO-RC-XXXXXX" and whose source MAC starts
+     * with this OUI.  The last three bytes are kept from the factory MAC so
+     * the address stays unique across devices.
+     *
+     * NOTE: ESP-IDF v5.x validates that bit 1 of the first MAC octet (the
+     * "locally administered" bit) is set before accepting a custom MAC.
+     * 0xD8 (1101 1000) does NOT have that bit set, so esp_wifi_set_mac()
+     * may return ESP_ERR_WIFI_MAC on newer IDF builds.  If that happens the
+     * AP will start with the factory OUI and the Hero4 will not auto-connect;
+     * the IDF validation will need to be patched or bypassed. */
+    uint8_t gopro_mac[6] = {0xd8, 0x96, 0x85, mac[3], mac[4], mac[5]};
+    esp_err_t set_mac_err = esp_wifi_set_mac(WIFI_IF_AP, gopro_mac);
+    if (set_mac_err != ESP_OK) {
+        ESP_LOGW(TAG, "Custom MAC (d8:96:85:%02X:%02X:%02X) rejected: %s — "
+                      "Hero4 auto-connect will NOT work with factory OUI",
+                 mac[3], mac[4], mac[5], esp_err_to_name(set_mac_err));
+    } else {
+        ESP_LOGI(TAG, "AP MAC overridden to d8:96:85:%02X:%02X:%02X",
+                 mac[3], mac[4], mac[5]);
+    }
+
+    /* Build SSID from the same last-3-byte suffix used in the MAC above.
+     * Validate — an all-zero suffix means the factory MAC read failed and we
+     * fall back to a static name rather than broadcasting a garbage SSID. */
     char ap_ssid[16];
     if (mac_err != ESP_OK || (mac[3] == 0 && mac[4] == 0 && mac[5] == 0)) {
         ESP_LOGW(TAG, "MAC read failed (%s) — using fallback SSID",
