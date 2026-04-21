@@ -42,16 +42,38 @@ typedef struct {
 void legacy_gopro_init(void);
 
 /**
+ * @brief Notify the component that an unknown station has completed Wi-Fi L2
+ *        association (WIFI_EVENT_AP_STACONNECTED) but has not yet obtained an IP.
+ *
+ * Called for every station that associates on the SoftAP.  Two cases:
+ *
+ *  - **Known MAC (in NVS)**: The camera's last-known IP is fetched from NVS and
+ *    CMD_STATION_CONNECT is posted immediately, bypassing DHCP.  An HTTP probe
+ *    is performed at the saved IP before auto-promoting to managed.
+ *
+ *  - **Unknown MAC**: CMD_WIFI_ASSOCIATED is posted.  The task waits 1 s for the
+ *    link to settle and then probes HERO4_EXPECTED_IP (10.71.79.2).  If the
+ *    camera responds it is added to the discovered list so the user can click Add.
+ *    DHCP-capable devices (phones) will arrive separately via
+ *    legacy_gopro_on_station_connected() from the DHCP assigned-IP event.
+ *
+ * Safe to call from any context (ISR-safe queue post).
+ *
+ * @param mac  Station MAC address (6 bytes).
+ */
+void legacy_gopro_on_station_wifi_associated(const uint8_t mac[6]);
+
+/**
  * @brief Notify the component that a Wi-Fi station has been assigned a DHCP
  *        IP address on the SoftAP.
  *
- * Posts an asynchronous CMD_STATION_CONNECT.  The station is recorded in the
- * internal table and will appear in the discovered list returned by
- * legacy_gopro_get_discovered().  No HTTP probe is performed at this point;
- * probing happens only when the user explicitly adds the camera.
+ * Posts an asynchronous CMD_STATION_CONNECT.  Typically reached only by
+ * DHCP-capable devices (phones); the Hero4 does not DHCP after its first
+ * pairing and arrives instead via legacy_gopro_on_station_wifi_associated().
  *
- * If the station's MAC matches a previously saved (managed) MAC it is
- * automatically promoted to managed without requiring user action.
+ * If the station's MAC matches a saved managed MAC it is auto-promoted
+ * (though this path is now unusual; managed cameras normally come through
+ * legacy_gopro_on_station_wifi_associated with the NVS-stored IP).
  *
  * Safe to call from any context.
  *

@@ -11,14 +11,25 @@
  *
  * Managed vs Discovered cameras
  * --------------------------------
- * On DHCP assignment, legacy_gopro probes the station via HTTP to determine
- * if it is a Hero4.  Probed cameras are "discovered" but NOT registered with
- * camera_manager until the user explicitly adds them via /api/legacy/add.
+ * The Hero4 in RC-remote mode does NOT perform DHCP after its first pairing;
+ * it unconditionally self-assigns 10.71.79.2 (HERO4_EXPECTED_IP).
+ *
+ * Connection flow:
+ *  1. WIFI_EVENT_AP_STACONNECTED fires → wifi_manager calls
+ *     legacy_gopro_on_station_wifi_associated(mac).
+ *  2a. Known MAC (in NVS): saved IP is looked up and CMD_STATION_CONNECT is
+ *      posted with that IP.  An HTTP probe verifies the camera is present
+ *      before it is promoted to managed.
+ *  2b. Unknown MAC: CMD_WIFI_ASSOCIATED is posted.  After a 1-s settle delay
+ *      the task probes HERO4_EXPECTED_IP.  If the camera responds it is placed
+ *      in the discovered list and the user can click Add.  DHCP-capable devices
+ *      (phones) arrive later via IP_EVENT_ASSIGNED_IP_TO_CLIENT and are handled
+ *      by legacy_gopro_on_station_connected().
  *
  * Once added, a camera is "managed": it is registered with camera_manager,
  * receives keepalives every 2 s, is polled for recording status, and responds
- * to shutter commands.  Its MAC is saved to NVS so that subsequent reconnects
- * auto-promote it to managed without user action.
+ * to shutter commands.  Its MAC and IP are saved to NVS so that subsequent
+ * reconnects auto-promote it to managed without user action or DHCP.
  *
  * Shutter commands bypass the queue.  A single UDP broadcast to
  * 255.255.255.255:8484 reaches all managed cameras simultaneously, providing
@@ -72,9 +83,25 @@ static const char *TAG = "LEGACY_GOPRO";
 #define GOPRO_KEEPALIVE_STR     "_GPHD_:0:0:2:0.000000\n"
 #define GOPRO_KEEPALIVE_LEN     22
 
-/* NVS storage for managed camera MACs */
+/* Reconnect probe: HTTP timeout used when verifying a managed camera is reachable
+ * at its saved IP immediately after Wi-Fi association.  On timeout we bail and
+ * let the 60-second inactive timer evict the station cleanly. */
+#define PROBE_ON_RECONNECT_TIMEOUT_MS 2000
+
+/* Hero4 expected static IP in RC-remote mode (10.71.79.2, network byte order).
+ * The Hero4 does not DHCP after its first pairing to a remote; it unconditionally
+ * self-assigns this address.  Used for first-time discovery probes. */
+#define HERO4_EXPECTED_IP  ((uint32_t)(10u | (71u << 8) | (79u << 16) | (2u << 24)))
+
+/* Wake-on-LAN */
+#define WOL_ENABLED             0       /* set to 1 to re-enable WOL broadcasts */
+#define WOL_PORT                9       /* standard WOL UDP destination port */
+#define WOL_TIMEOUT_MS          5000    /* send WOL if camera silent for this long */
+#define WOL_BURST_COUNT         5       /* packets per WOL burst for reliability */
+
+/* NVS storage for managed cameras (MAC + last-known IP) */
 #define NVS_NAMESPACE           "lgcy_gopro"
-#define NVS_KEY_MANAGED_MACS    "managed_macs"
+#define NVS_KEY_MANAGED_MACS    "managed_cams"
 
 /* ============================================================
  * Hero4 UDP command payloads
@@ -99,11 +126,23 @@ static const uint8_t UDP_STATUS_REQ[] = {
  * ============================================================ */
 
 typedef enum {
-    CMD_STATION_CONNECT, /* new station got a DHCP IP: record MAC+IP, no probe */
-    CMD_DISCONNECT,      /* station left the AP */
-    CMD_ADD_CAMERA,      /* user clicked Add: probe then promote if Hero4 */
-    CMD_REMOVE_CAMERA,   /* un-manage a camera */
+    CMD_STATION_CONNECT,  /* station has a known IP (saved NVS or DHCP): record MAC+IP */
+    CMD_WIFI_ASSOCIATED,  /* unknown MAC associated at L2 — try first-time Hero4 probe */
+    CMD_DISCONNECT,       /* station left the AP */
+    CMD_ADD_CAMERA,       /* user clicked Add: probe then promote if Hero4 */
+    CMD_REMOVE_CAMERA,    /* un-manage a camera */
 } legacy_cmd_type_t;
+
+/**
+ * @brief Per-camera persistent record stored in NVS.
+ *
+ * Packed so the NVS blob size is exactly LEGACY_MAX_CAMERAS × 10 bytes
+ * and the layout is unambiguous across builds.
+ */
+typedef struct {
+    uint8_t  mac[6];     /**< Station MAC address */
+    uint32_t ip_addr;    /**< Last known IP in network byte order; 0 if unknown */
+} __attribute__((packed)) legacy_saved_camera_t;
 
 typedef struct {
     legacy_cmd_type_t type;
@@ -124,6 +163,7 @@ typedef struct {
     int      slot;            /**< camera_manager slot; -1 until managed */
     char     name[LEGACY_CAMERA_NAME_LEN]; /**< name from probe response */
     camera_recording_status_t recording_status;
+    volatile TickType_t last_response_tick; /**< FreeRTOS tick of last UDP response; 0 = never */
 } legacy_camera_t;
 
 /* ============================================================
@@ -142,9 +182,9 @@ static bool            s_shutter_active = false;
 /* UDP socket bound to GOPRO_UDP_LOCAL_PORT (8383) — opened once in init. */
 static int             s_udp_sock = -1;
 
-/* NVS-persisted managed MACs — loaded at init, updated on add/remove. */
-static uint8_t         s_saved_macs[LEGACY_MAX_CAMERAS][6];
-static int             s_saved_mac_count = 0;
+/* NVS-persisted managed cameras (MAC + last-known IP) — loaded at init, updated on add/remove. */
+static legacy_saved_camera_t s_saved_cameras[LEGACY_MAX_CAMERAS];
+static int                   s_saved_camera_count = 0;
 
 /* HTTP response buffer — only accessed from the task context. */
 static char s_http_buf[HTTP_BUF_SIZE];
@@ -210,20 +250,47 @@ static int find_camera_by_ip(uint32_t ip)
     return -1;
 }
 
+/** Like find_camera_by_ip but also matches inactive managed entries (pre-registered at boot). */
+static int find_any_camera_by_ip(uint32_t ip)
+{
+    for (int i = 0; i < LEGACY_MAX_CAMERAS; i++) {
+        if ((s_cameras[i].active || s_cameras[i].managed) && s_cameras[i].ip_addr == ip) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 /* ============================================================
  * NVS helpers
  * ============================================================ */
 
-/** Return true if mac is in the saved managed-MAC list. */
-static bool nvs_mac_is_saved(const uint8_t mac[6])
+/** Return the index in s_saved_cameras[] for a MAC, or -1 if not found. */
+static int nvs_find_saved_idx(const uint8_t mac[6])
 {
-    for (int i = 0; i < s_saved_mac_count; i++) {
-        if (memcmp(s_saved_macs[i], mac, 6) == 0) return true;
+    for (int i = 0; i < s_saved_camera_count; i++) {
+        if (memcmp(s_saved_cameras[i].mac, mac, 6) == 0) return i;
     }
-    return false;
+    return -1;
 }
 
-/** Write the current s_saved_macs[] array to NVS. */
+/** Return true if mac is in the saved managed-camera list. */
+static bool nvs_mac_is_saved(const uint8_t mac[6])
+{
+    return nvs_find_saved_idx(mac) >= 0;
+}
+
+/**
+ * Return the saved IP address for a MAC (network byte order), or 0 if not found.
+ * Called from legacy_gopro_on_station_wifi_associated() in ISR-safe context.
+ */
+static uint32_t nvs_get_saved_ip(const uint8_t mac[6])
+{
+    int idx = nvs_find_saved_idx(mac);
+    return (idx >= 0) ? s_saved_cameras[idx].ip_addr : 0;
+}
+
+/** Write the current s_saved_cameras[] array to NVS. */
 static void nvs_persist(void)
 {
     nvs_handle_t h;
@@ -232,11 +299,12 @@ static void nvs_persist(void)
         ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(err));
         return;
     }
-    if (s_saved_mac_count == 0) {
+    if (s_saved_camera_count == 0) {
         nvs_erase_key(h, NVS_KEY_MANAGED_MACS);
     } else {
         err = nvs_set_blob(h, NVS_KEY_MANAGED_MACS,
-                           s_saved_macs, (size_t)(s_saved_mac_count * 6));
+                           s_saved_cameras,
+                           (size_t)(s_saved_camera_count * sizeof(legacy_saved_camera_t)));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "NVS set_blob failed: %s", esp_err_to_name(err));
         }
@@ -245,10 +313,11 @@ static void nvs_persist(void)
     nvs_close(h);
 }
 
-/** Load managed MACs from NVS into s_saved_macs[]. */
-static void nvs_load_managed_macs(void)
+/** Load managed cameras (MAC+IP) from NVS into s_saved_cameras[]. */
+static void nvs_load_managed_cameras(void)
 {
-    s_saved_mac_count = 0;
+    s_saved_camera_count = 0;
+    memset(s_saved_cameras, 0, sizeof(s_saved_cameras));
 
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
@@ -258,8 +327,8 @@ static void nvs_load_managed_macs(void)
         return;
     }
 
-    size_t blob_len = sizeof(s_saved_macs);
-    err = nvs_get_blob(h, NVS_KEY_MANAGED_MACS, s_saved_macs, &blob_len);
+    size_t blob_len = sizeof(s_saved_cameras);
+    err = nvs_get_blob(h, NVS_KEY_MANAGED_MACS, s_saved_cameras, &blob_len);
     nvs_close(h);
 
     if (err == ESP_ERR_NVS_NOT_FOUND) return;
@@ -268,39 +337,54 @@ static void nvs_load_managed_macs(void)
         return;
     }
 
-    s_saved_mac_count = (int)(blob_len / 6);
-    ESP_LOGI(TAG, "Loaded %d managed MAC(s) from NVS", s_saved_mac_count);
-    for (int i = 0; i < s_saved_mac_count; i++) {
-        const uint8_t *m = s_saved_macs[i];
-        ESP_LOGI(TAG, "  [%d] %02X:%02X:%02X:%02X:%02X:%02X",
-                 i, m[0], m[1], m[2], m[3], m[4], m[5]);
+    s_saved_camera_count = (int)(blob_len / sizeof(legacy_saved_camera_t));
+    ESP_LOGI(TAG, "Loaded %d managed camera(s) from NVS", s_saved_camera_count);
+    for (int i = 0; i < s_saved_camera_count; i++) {
+        const uint8_t *m = s_saved_cameras[i].mac;
+        char ip_str[16];
+        ip_to_str(s_saved_cameras[i].ip_addr, ip_str, sizeof(ip_str));
+        ESP_LOGI(TAG, "  [%d] %02X:%02X:%02X:%02X:%02X:%02X  IP=%s",
+                 i, m[0], m[1], m[2], m[3], m[4], m[5], ip_str);
     }
 }
 
-/** Add a MAC to the saved list (no-op if already present) and persist. */
-static void nvs_add_managed_mac(const uint8_t mac[6])
+/**
+ * Add or update a camera in the saved list and persist to NVS.
+ *
+ * If the MAC is already saved, updates its IP (e.g. if it changed between
+ * connections).  If new, appends it.  No-ops if the list is full.
+ */
+static void nvs_add_managed_camera(const uint8_t mac[6], uint32_t ip_addr)
 {
-    if (nvs_mac_is_saved(mac)) return;
-    if (s_saved_mac_count >= LEGACY_MAX_CAMERAS) {
-        ESP_LOGW(TAG, "NVS managed MAC list full — cannot save");
-        return;
+    int idx = nvs_find_saved_idx(mac);
+    if (idx >= 0) {
+        /* Update existing entry's IP */
+        s_saved_cameras[idx].ip_addr = ip_addr;
+    } else {
+        if (s_saved_camera_count >= LEGACY_MAX_CAMERAS) {
+            ESP_LOGW(TAG, "NVS managed camera list full — cannot save");
+            return;
+        }
+        idx = s_saved_camera_count++;
+        memcpy(s_saved_cameras[idx].mac, mac, 6);
+        s_saved_cameras[idx].ip_addr = ip_addr;
     }
-    memcpy(s_saved_macs[s_saved_mac_count++], mac, 6);
     nvs_persist();
 }
 
-/** Remove a MAC from the saved list and persist. */
+/** Remove a camera from the saved list and persist. */
 static void nvs_remove_managed_mac(const uint8_t mac[6])
 {
-    for (int i = 0; i < s_saved_mac_count; i++) {
-        if (memcmp(s_saved_macs[i], mac, 6) == 0) {
-            memmove(s_saved_macs[i], s_saved_macs[i + 1],
-                    (size_t)((s_saved_mac_count - i - 1) * 6));
-            s_saved_mac_count--;
-            nvs_persist();
-            return;
-        }
+    int idx = nvs_find_saved_idx(mac);
+    if (idx < 0) return;
+
+    int remaining = s_saved_camera_count - idx - 1;
+    if (remaining > 0) {
+        memmove(&s_saved_cameras[idx], &s_saved_cameras[idx + 1],
+                (size_t)(remaining * sizeof(legacy_saved_camera_t)));
     }
+    s_saved_camera_count--;
+    nvs_persist();
 }
 
 /* ============================================================
@@ -373,6 +457,30 @@ static void do_udp_shutter(bool on)
     do_udp_send(payload, GOPRO_UDP_CMD_LEN,
                 htonl(INADDR_BROADCAST), GOPRO_UDP_CMD_PORT,
                 on ? "shutter-ON(bcast)" : "shutter-OFF(bcast)");
+}
+
+/**
+ * Send a Wake-on-LAN magic packet for a specific camera MAC.
+ *
+ * Magic packet: 6 bytes of 0xFF followed by the target MAC repeated 16 times
+ * (102 bytes total).  Broadcast to 255.255.255.255:WOL_PORT (port 9) using the
+ * existing s_udp_sock, which already has SO_BROADCAST enabled.  Sent
+ * WOL_BURST_COUNT times in rapid succession for reliability.
+ */
+static void do_wol_packet(const uint8_t mac[6])
+{
+    uint8_t packet[102];
+    memset(packet, 0xFF, 6);
+    for (int i = 0; i < 16; i++) {
+        memcpy(packet + 6 + i * 6, mac, 6);
+    }
+    ESP_LOGE(TAG, "WOL → %02X:%02X:%02X:%02X:%02X:%02X (×%d)",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], WOL_BURST_COUNT);
+    for (int i = 0; i < WOL_BURST_COUNT; i++) {
+        do_udp_send(packet, sizeof(packet),
+                    htonl(INADDR_BROADCAST), WOL_PORT, "WOL");
+        vTaskDelay(pdMS_TO_TICKS(10)); /* let the TX queue drain between packets */
+    }
 }
 
 /**
@@ -623,14 +731,34 @@ static void handle_station_connect(const legacy_cmd_t *cmd)
     bool auto_manage = cam->managed || nvs_mac_is_saved(cmd->mac);
     if (auto_manage) {
         cam->managed = true;
-        /* Ensure a non-empty name — camera_manager requires one.
-         * The real name (from gpControl/status) was set by handle_add_camera()
-         * the first time the camera was added; on reconnect it is preserved in
-         * the cam->name field.  At boot we use the NVS-restored default "Hero4"
-         * because we don't re-probe on reconnect. */
         if (cam->name[0] == '\0') {
             strncpy(cam->name, "Hero4", LEGACY_CAMERA_NAME_LEN);
         }
+
+        /* Verify the camera is actually reachable at its saved IP before
+         * promoting.  The Hero4 does not DHCP, so the IP came from NVS.
+         * If the probe times out it means the camera is still booting or the
+         * saved IP is stale — bail out and let the 60-second inactive timer
+         * evict the AP station cleanly. */
+        char url[72];
+        snprintf(url, sizeof(url), "http://%s/gp/gpControl/status", ip_str);
+        ESP_LOGI(TAG, "Probing managed Hero4 at %s (timeout %d ms)...",
+                 ip_str, PROBE_ON_RECONNECT_TIMEOUT_MS);
+        int len = do_http_get(url, PROBE_ON_RECONNECT_TIMEOUT_MS);
+        if (len <= 0) {
+            ESP_LOGW(TAG, "Hero4 at %s did not respond — leaving inactive; "
+                         "60-second timer will evict the AP station", ip_str);
+            return;
+        }
+
+        /* Update the camera name from the live response. */
+        char name[LEGACY_CAMERA_NAME_LEN] = "Hero4";
+        parse_status_json(s_http_buf, name, sizeof(name));
+        if (name[0] != '\0') {
+            strncpy(cam->name, name, LEGACY_CAMERA_NAME_LEN);
+            cam->name[LEGACY_CAMERA_NAME_LEN - 1] = '\0';
+        }
+
         promote_to_managed_settled(cam_idx);
     }
     /* Otherwise the station appears in the discovered list until the user adds it. */
@@ -723,7 +851,8 @@ static void handle_add_camera(const legacy_cmd_t *cmd)
     strncpy(cam->name, name, LEGACY_CAMERA_NAME_LEN);
     cam->name[LEGACY_CAMERA_NAME_LEN - 1] = '\0';
     cam->managed = true;
-    nvs_add_managed_mac(cmd->mac);
+    /* Save both MAC and IP so subsequent reconnects don't need DHCP. */
+    nvs_add_managed_camera(cmd->mac, cam->ip_addr);
 
     ESP_LOGI(TAG, "Hero4 '%s' at %s confirmed — promoting to managed", name, ip_str);
     promote_to_managed_settled(cam_idx);
@@ -769,6 +898,87 @@ static void handle_remove_camera(const legacy_cmd_t *cmd)
     ESP_LOGI(TAG, "Camera removed from managed list");
 }
 
+/**
+ * Handle CMD_WIFI_ASSOCIATED — fired when an UNKNOWN MAC associates at L2 before
+ * any DHCP exchange.  The Hero4 in RC-remote mode does not DHCP after its first
+ * pairing; it self-assigns HERO4_EXPECTED_IP unconditionally.
+ *
+ * Strategy:
+ *  1. Skip if we already have an active or managed entry at HERO4_EXPECTED_IP
+ *     (handles the case where the camera was already discovered or managed).
+ *  2. Wait 1 s for the L2 link to stabilise.
+ *  3. Probe HERO4_EXPECTED_IP via HTTP.  A 200 response with the gpControl JSON
+ *     body means this is a Hero4.  Any other device type will simply time out.
+ *  4. If the probe succeeds, create a discovered entry so the camera appears in
+ *     /api/legacy/discovered and the user can click Add.
+ *
+ * All other devices (phones, etc.) DHCP and arrive via CMD_STATION_CONNECT
+ * through legacy_gopro_on_station_connected(); they never trigger this path.
+ */
+static void handle_wifi_associated(const legacy_cmd_t *cmd)
+{
+    char mac_str[18];
+    snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             cmd->mac[0], cmd->mac[1], cmd->mac[2],
+             cmd->mac[3], cmd->mac[4], cmd->mac[5]);
+
+    /* If the MAC is already tracked (was just disconnected and reconnected
+     * faster than the inactive timer evicted it), nothing to do. */
+    int cam_idx = find_camera_by_mac(cmd->mac);
+    if (cam_idx >= 0 && s_cameras[cam_idx].active) {
+        ESP_LOGD(TAG, "wifi-associated: %s already active — skipping probe", mac_str);
+        return;
+    }
+
+    /* If HERO4_EXPECTED_IP is already claimed by another entry, don't overwrite. */
+    if (find_any_camera_by_ip(HERO4_EXPECTED_IP) >= 0) {
+        ESP_LOGD(TAG, "wifi-associated: %s — Hero4 IP already claimed; ignoring", mac_str);
+        return;
+    }
+
+    /* Allow the Wi-Fi association to settle before attempting TCP. */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    char ip_str[16];
+    ip_to_str(HERO4_EXPECTED_IP, ip_str, sizeof(ip_str));
+    char url[72];
+    snprintf(url, sizeof(url), "http://%s/gp/gpControl/status", ip_str);
+
+    ESP_LOGI(TAG, "Unknown station %s associated — probing Hero4 expected IP %s...",
+             mac_str, ip_str);
+
+    int len = do_http_get(url, PROBE_ON_RECONNECT_TIMEOUT_MS);
+    if (len <= 0) {
+        ESP_LOGD(TAG, "No Hero4 response at %s — station is not a Hero4 (or not ready)",
+                 ip_str);
+        return;
+    }
+
+    /* Camera responded — create a discovered entry for it. */
+    if (cam_idx < 0) {
+        cam_idx = find_free_camera_entry();
+        if (cam_idx < 0) {
+            ESP_LOGW(TAG, "No free camera entries for first-time Hero4 at %s", ip_str);
+            return;
+        }
+        s_cameras[cam_idx].slot    = -1;
+        s_cameras[cam_idx].managed = false;
+    }
+
+    legacy_camera_t *cam = &s_cameras[cam_idx];
+    cam->active           = true;
+    cam->managed          = false;
+    cam->wifi_connected   = false;
+    cam->ip_addr          = HERO4_EXPECTED_IP;
+    cam->recording_status = CAMERA_RECORDING_UNKNOWN;
+    memcpy(cam->mac, cmd->mac, 6);
+    /* Name is filled in properly by handle_add_camera(); use a placeholder for now. */
+    strncpy(cam->name, "Hero4", LEGACY_CAMERA_NAME_LEN);
+
+    ESP_LOGI(TAG, "Hero4 discovered at %s (MAC %s) — awaiting user Add",
+             ip_str, mac_str);
+}
+
 /* ============================================================
  * Periodic work (called on queue timeout)
  * ============================================================ */
@@ -777,9 +987,26 @@ static void poll_all_cameras(void)
 {
     do_udp_keepalive(0);
 
+    TickType_t now = xTaskGetTickCount();
+
     for (int i = 0; i < LEGACY_MAX_CAMERAS; i++) {
+        /* WOL: send for any managed camera that has not responded recently.
+         * Intentionally ignores wifi_connected / active — Hero4 Wi-Fi quirks
+         * mean the camera may still be reachable via broadcast even when the
+         * DHCP/AP state is unclear.  last_response_tick == 0 (never responded)
+         * will always satisfy the condition once WOL_TIMEOUT_MS has elapsed
+         * from boot, which is the desired behaviour.
+         * Set WOL_ENABLED to 1 (in the constants block above) to activate. */
+#if WOL_ENABLED
+        if (s_cameras[i].managed &&
+            (now - s_cameras[i].last_response_tick) > pdMS_TO_TICKS(WOL_TIMEOUT_MS)) {
+            do_wol_packet(s_cameras[i].mac);
+        }
+#endif
+
+        /* Status poll: only for fully-connected cameras */
         if (!s_cameras[i].active)         continue;
-        if (!s_cameras[i].managed)        continue;  /* only managed cameras */
+        if (!s_cameras[i].managed)        continue;
         if (!s_cameras[i].wifi_connected) continue;
         if (s_cameras[i].slot < 0)        continue;
 
@@ -864,6 +1091,10 @@ static void legacy_gopro_rx_task(void *arg)
         if (n >= 14 && buf[0] == 0x5F) {
             /* Keepalive ACK: "_GPHD_:0:0:2:\x01" — camera confirms RC pairing */
             ESP_LOGD(TAG, "Keepalive ACK from %s", ip_str);
+            int cam_idx = find_camera_by_ip(src_addr.sin_addr.s_addr);
+            if (cam_idx >= 0) {
+                s_cameras[cam_idx].last_response_tick = xTaskGetTickCount();
+            }
 
         } else if (n >= 20 && buf[11] == 0x73 && buf[12] == 0x74) {
             /* Status response */
@@ -877,7 +1108,8 @@ static void legacy_gopro_rx_task(void *arg)
 
             int cam_idx = find_camera_by_ip(src_addr.sin_addr.s_addr);
             if (cam_idx >= 0) {
-                s_cameras[cam_idx].recording_status = status;
+                s_cameras[cam_idx].recording_status   = status;
+                s_cameras[cam_idx].last_response_tick = xTaskGetTickCount();
                 ESP_LOGD(TAG, "Status from %s (slot %d): %s", ip_str,
                          s_cameras[cam_idx].slot,
                          status == CAMERA_RECORDING_ACTIVE ? "recording" : "idle");
@@ -916,10 +1148,11 @@ static void legacy_gopro_task(void *arg)
     while (1) {
         if (xQueueReceive(s_queue, &cmd, poll_ticks) == pdTRUE) {
             switch (cmd.type) {
-                case CMD_STATION_CONNECT: handle_station_connect(&cmd); break;
-                case CMD_DISCONNECT:      handle_disconnect(&cmd);      break;
-                case CMD_ADD_CAMERA:      handle_add_camera(&cmd);      break;
-                case CMD_REMOVE_CAMERA:   handle_remove_camera(&cmd);   break;
+                case CMD_STATION_CONNECT:  handle_station_connect(&cmd);   break;
+                case CMD_WIFI_ASSOCIATED:  handle_wifi_associated(&cmd);   break;
+                case CMD_DISCONNECT:       handle_disconnect(&cmd);        break;
+                case CMD_ADD_CAMERA:       handle_add_camera(&cmd);        break;
+                case CMD_REMOVE_CAMERA:    handle_remove_camera(&cmd);     break;
             }
         } else {
             poll_all_cameras();
@@ -938,34 +1171,38 @@ void legacy_gopro_init(void)
         s_cameras[i].slot = -1;
     }
 
-    nvs_load_managed_macs();
+    nvs_load_managed_cameras();
 
     /* Pre-register previously-managed cameras with camera_manager so they
      * appear as "disconnected" in /api/paired-cameras immediately after boot,
      * before the camera physically reconnects.  This mirrors the BLE behaviour
-     * where bonded cameras are always visible in the slot list. */
-    for (int i = 0; i < s_saved_mac_count; i++) {
+     * where bonded cameras are always visible in the slot list.
+     * The saved IP is stored in the entry so that when the camera associates
+     * (without DHCP) we can immediately attempt a TCP probe at that address. */
+    for (int i = 0; i < s_saved_camera_count; i++) {
         int cam_idx = find_free_camera_entry();
         if (cam_idx < 0) {
             ESP_LOGW(TAG, "No free camera entries for pre-registration [%d]", i);
             break;
         }
         legacy_camera_t *cam = &s_cameras[cam_idx];
-        cam->managed      = true;
-        cam->active       = false;   /* not yet on AP */
+        cam->managed        = true;
+        cam->active         = false;   /* not yet on AP */
         cam->wifi_connected = false;
-        cam->slot         = -1;
-        cam->ip_addr      = 0;
-        memcpy(cam->mac, s_saved_macs[i], 6);
+        cam->slot           = -1;
+        cam->ip_addr        = s_saved_cameras[i].ip_addr;  /* may be 0 on first boot */
+        memcpy(cam->mac, s_saved_cameras[i].mac, 6);
         strncpy(cam->name, "Hero4", LEGACY_CAMERA_NAME_LEN);
 
         int slot = camera_manager_register_wifi_camera(
                        cam->mac, cam->name, &s_legacy_driver, cam);
         if (slot >= 0) {
             cam->slot = slot;
-            ESP_LOGI(TAG, "Pre-registered saved camera %02X:%02X:%02X:%02X:%02X:%02X → slot %d",
+            char ip_str[16];
+            ip_to_str(cam->ip_addr, ip_str, sizeof(ip_str));
+            ESP_LOGI(TAG, "Pre-registered %02X:%02X:%02X:%02X:%02X:%02X  IP=%s → slot %d",
                      cam->mac[0], cam->mac[1], cam->mac[2],
-                     cam->mac[3], cam->mac[4], cam->mac[5], slot);
+                     cam->mac[3], cam->mac[4], cam->mac[5], ip_str, slot);
         } else {
             ESP_LOGE(TAG, "Pre-registration failed for saved camera [%d]", i);
             memset(cam, 0, sizeof(*cam));
@@ -986,8 +1223,8 @@ void legacy_gopro_init(void)
                       2048, NULL, 4, &s_rx_task);
     configASSERT(ret == pdPASS);
 
-    ESP_LOGI(TAG, "Initialized (%d managed MAC(s) in NVS, UDP socket %s)",
-             s_saved_mac_count, s_udp_sock >= 0 ? "ready" : "FAILED");
+    ESP_LOGI(TAG, "Initialized (%d managed camera(s) in NVS, UDP socket %s)",
+             s_saved_camera_count, s_udp_sock >= 0 ? "ready" : "FAILED");
 }
 
 void legacy_gopro_on_station_connected(uint32_t ip, const uint8_t mac[6])
@@ -996,6 +1233,29 @@ void legacy_gopro_on_station_connected(uint32_t ip, const uint8_t mac[6])
     memcpy(cmd.mac, mac, 6);
     if (xQueueSend(s_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "Command queue full — station connect notification dropped");
+    }
+}
+
+void legacy_gopro_on_station_wifi_associated(const uint8_t mac[6])
+{
+    uint32_t saved_ip = nvs_get_saved_ip(mac);
+
+    if (saved_ip != 0) {
+        /* Known managed camera: skip DHCP entirely and probe at the saved IP. */
+        legacy_cmd_t cmd = { .type = CMD_STATION_CONNECT, .ip = saved_ip };
+        memcpy(cmd.mac, mac, 6);
+        if (xQueueSend(s_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "Command queue full — managed camera reconnect dropped");
+        }
+    } else {
+        /* Unknown MAC — attempt a first-time Hero4 discovery probe.
+         * DHCP-capable devices (phones) will arrive via legacy_gopro_on_station_connected()
+         * from the IP_EVENT_ASSIGNED_IP_TO_CLIENT handler and are handled there. */
+        legacy_cmd_t cmd = { .type = CMD_WIFI_ASSOCIATED, .ip = 0 };
+        memcpy(cmd.mac, mac, 6);
+        if (xQueueSend(s_queue, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "Command queue full — wifi associated notification dropped");
+        }
     }
 }
 
@@ -1012,8 +1272,9 @@ int legacy_gopro_get_discovered(legacy_discovered_camera_t *out, int max_count)
 {
     int count = 0;
     for (int i = 0; i < LEGACY_MAX_CAMERAS && count < max_count; i++) {
-        if (!s_cameras[i].active)  continue;   /* not on the AP */
-        if (s_cameras[i].managed)  continue;   /* already managed — shown in paired list */
+        if (!s_cameras[i].active)        continue;   /* not on the AP */
+        if (s_cameras[i].managed)        continue;   /* already managed — shown in paired list */
+        if (s_cameras[i].ip_addr == 0)   continue;   /* no IP yet — probe still in progress */
         memcpy(out[count].mac, s_cameras[i].mac, 6);
         out[count].ip_addr = s_cameras[i].ip_addr;
         count++;

@@ -9,6 +9,7 @@
 #include "esp_http_server.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/sockets.h"
+#include "apps/dhcpserver/dhcpserver.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "open_gopro_ble.h"
@@ -69,8 +70,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                  ev->aid,
                  ev->mac[0], ev->mac[1], ev->mac[2],
                  ev->mac[3], ev->mac[4], ev->mac[5]);
-        /* IP is not available yet — wait for IP_EVENT_AP_STAIPASSIGNED before
-         * probing.  The probe is triggered from ip_event_handler() below. */
+        /* Notify legacy_gopro of the L2 association.  For known managed cameras
+         * (MAC in NVS) this triggers an immediate probe at the saved IP, bypassing
+         * DHCP entirely.  For unknown MACs it attempts a first-time Hero4 discovery
+         * probe at 10.71.79.2 (the Hero4's hardcoded self-assigned IP). */
+        legacy_gopro_on_station_wifi_associated(ev->mac);
 
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *ev = (wifi_event_ap_stadisconnected_t *)data;
@@ -88,7 +92,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
 /**
  * Fired by lwIP / esp_netif when the DHCP server assigns an IP to a client.
- * This is the right moment to probe — the station now has a routable address.
+ *
+ * The Hero4 in RC-remote mode does NOT trigger this event — it self-assigns
+ * 10.71.79.2 without performing a DHCP request.  Hero4 reconnects are handled
+ * by legacy_gopro_on_station_wifi_associated() via WIFI_EVENT_AP_STACONNECTED.
+ *
+ * This handler is reached only by DHCP-capable stations (phones, etc.) and by
+ * a Hero4 on its very first-ever connection to an AP (before it has saved the
+ * AP credentials and learned to skip DHCP).
  *
  * ip_event_ap_staipassigned_t fields:
  *   .ip.addr  — assigned IPv4 in network-byte-order uint32_t
@@ -782,6 +793,19 @@ void wifi_manager_init(void)
     IP4_ADDR((ip4_addr_t *)&ip_info.netmask, 255, 255, 255,  0);
     ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
     ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
+
+    /* Restrict the DHCP pool to 10.71.79.3–10.71.79.50.
+     * 10.71.79.2 is intentionally excluded: the Hero4 in RC-remote mode
+     * self-assigns that address unconditionally without performing a DHCP
+     * request.  Reserving it here prevents the DHCP server from handing it
+     * to a phone or any other DHCP-capable device and causing an IP conflict. */
+    dhcps_lease_t lease;
+    IP4_ADDR(&lease.start_ip, 10, 71, 79,  3);
+    IP4_ADDR(&lease.end_ip,   10, 71, 79, 50);
+    esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_REQUESTED_IP_ADDRESS,
+                           &lease, sizeof(lease));
+
     ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -868,6 +892,27 @@ void wifi_manager_init(void)
     /* Start the AP.  The event handler will fire WIFI_EVENT_AP_START once the
      * beacon is on air, apply HT20 bandwidth, and set AP_STARTED_BIT. */
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Shorten the AP inactive-time from the default 300 s to 15 s.
+     *
+     * The ESP32 SoftAP tracks each station's inactivity (no received data
+     * frames) and sends a deauth when the timer expires.  The default 300 s
+     * means a camera that silently drops its connection (e.g. Hero4 auth-
+     * expire) stays in the ARP/association table as "connected" for up to
+     * five minutes, causing every subsequent unicast send to stall on ARP
+     * resolution and return ENOMEM.
+     *
+     * 15 s is safe because our keepalive sends every 2 s elicit a UDP ACK
+     * from any camera that is actually alive, which counts as received-data
+     * and resets the inactivity timer.  A camera that has gone silent is
+     * cleanly evicted in 15 s, triggering a fresh DHCP handshake on reconnect
+     * rather than an unexpected auth-expire deauth mid-session. */
+    esp_err_t inactive_err = esp_wifi_set_inactive_time(WIFI_IF_AP, 60);
+    if (inactive_err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_inactive_time failed: %s", esp_err_to_name(inactive_err));
+    } else {
+        ESP_LOGI(TAG, "AP inactive time set to 60 s");
+    }
 
     ESP_LOGI(TAG, "WiFi AP starting — SSID: %s  IP: 10.71.79.1", ap_ssid);
 
