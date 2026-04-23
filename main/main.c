@@ -63,7 +63,8 @@ static void on_utc_acquired(void *user_ctx)
 {
     (void)user_ctx;
     ESP_LOGI(TAG, "UTC acquired — syncing time to all connected cameras");
-    open_gopro_ble_sync_time_all();
+    open_gopro_ble_sync_time_all();      /* BLE cameras (OpenGoPro TLV cmd 0x0D) */
+    legacy_gopro_sync_time_all();        /* Wi-Fi cameras (Hero4 HTTP gpControl)  */
 }
 
 static void on_logging_state_changed(logging_state_t state, void *user_ctx)

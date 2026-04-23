@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -65,6 +67,30 @@ void wifi_manager_init(void);
  * sequence on the shared antenna.
  */
 void wifi_manager_wait_for_ap_ready(void);
+
+/**
+ * @brief Per-station record returned by wifi_manager_get_connected_stations().
+ */
+typedef struct {
+    uint8_t  mac[6];
+    uint32_t ip_addr;   /**< DHCP-assigned IP (network-byte-order); 0 if not yet assigned */
+} wifi_mgr_sta_info_t;
+
+/**
+ * @brief Return a snapshot of all stations currently associated with the SoftAP.
+ *
+ * Includes stations that have completed L2 association but have not yet
+ * received a DHCP address (ip_addr == 0).  The Hero4 in RC-remote mode
+ * never performs a DHCP request and will always appear with ip_addr == 0.
+ *
+ * The snapshot is read lock-free from the internal station table; minor
+ * races are acceptable for display purposes.
+ *
+ * @param out        Caller-provided array (must hold at least @p max_count entries).
+ * @param max_count  Maximum entries to write.
+ * @return           Number of associated stations written to @p out.
+ */
+int wifi_manager_get_connected_stations(wifi_mgr_sta_info_t *out, int max_count);
 
 #ifdef __cplusplus
 }

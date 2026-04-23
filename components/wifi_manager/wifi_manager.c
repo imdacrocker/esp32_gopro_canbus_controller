@@ -26,6 +26,71 @@
 
 static const char *TAG = "WIFI_MGR";
 
+/* ============================================================
+ * Connected station table
+ *
+ * Tracks every station that has associated at L2 on the SoftAP.
+ * ip_addr is filled in when the DHCP server assigns an address;
+ * it remains 0 for devices that use a static IP (Hero4 in RC mode).
+ *
+ * Written from the Wi-Fi and IP event callbacks; read from HTTP
+ * handlers.  Lock-free — minor races are acceptable for display.
+ * ============================================================ */
+
+typedef struct {
+    bool     active;
+    uint8_t  mac[6];
+    uint32_t ip_addr;
+} sta_entry_t;
+
+static sta_entry_t s_stations[AP_MAX_CONN];
+
+static int sta_find_by_mac(const uint8_t mac[6])
+{
+    for (int i = 0; i < AP_MAX_CONN; i++) {
+        if (s_stations[i].active && memcmp(s_stations[i].mac, mac, 6) == 0) return i;
+    }
+    return -1;
+}
+
+static void sta_add(const uint8_t mac[6])
+{
+    if (sta_find_by_mac(mac) >= 0) return;  /* already tracked */
+    for (int i = 0; i < AP_MAX_CONN; i++) {
+        if (!s_stations[i].active) {
+            s_stations[i].active  = true;
+            s_stations[i].ip_addr = 0;
+            memcpy(s_stations[i].mac, mac, 6);
+            return;
+        }
+    }
+    ESP_LOGW(TAG, "Station table full — cannot track new station");
+}
+
+static void sta_update_ip(const uint8_t mac[6], uint32_t ip)
+{
+    int idx = sta_find_by_mac(mac);
+    if (idx >= 0) s_stations[idx].ip_addr = ip;
+}
+
+static void sta_remove(const uint8_t mac[6])
+{
+    int idx = sta_find_by_mac(mac);
+    if (idx >= 0) memset(&s_stations[idx], 0, sizeof(s_stations[idx]));
+}
+
+int wifi_manager_get_connected_stations(wifi_mgr_sta_info_t *out, int max_count)
+{
+    int count = 0;
+    for (int i = 0; i < AP_MAX_CONN && count < max_count; i++) {
+        if (!s_stations[i].active) continue;
+        memcpy(out[count].mac, s_stations[i].mac, 6);
+        out[count].ip_addr = s_stations[i].ip_addr;
+        count++;
+    }
+    return count;
+}
+
 /* Event group used to signal that the AP has successfully started.
  * wifi_manager_wait_for_ap_ready() blocks on this bit so that callers
  * (e.g. ble_core_init) do not start radio-intensive work until the AP
@@ -70,10 +135,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                  ev->aid,
                  ev->mac[0], ev->mac[1], ev->mac[2],
                  ev->mac[3], ev->mac[4], ev->mac[5]);
-        /* Notify legacy_gopro of the L2 association.  For known managed cameras
-         * (MAC in NVS) this triggers an immediate probe at the saved IP, bypassing
-         * DHCP entirely.  For unknown MACs it attempts a first-time Hero4 discovery
-         * probe at 10.71.79.2 (the Hero4's hardcoded self-assigned IP). */
+        /* Track in the station table (ip_addr starts at 0; filled in by the
+         * DHCP event below once the station acquires an address). */
+        sta_add(ev->mac);
+        /* Notify legacy_gopro so it can auto-reconnect managed cameras whose
+         * MAC is in NVS, bypassing DHCP.  Unknown MACs are silently ignored. */
         legacy_gopro_on_station_wifi_associated(ev->mac);
 
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
@@ -82,6 +148,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                  ev->aid, ev->reason,
                  ev->mac[0], ev->mac[1], ev->mac[2],
                  ev->mac[3], ev->mac[4], ev->mac[5]);
+        sta_remove(ev->mac);
         legacy_gopro_on_station_disconnected(ev->mac);
     }
 }
@@ -118,6 +185,11 @@ static void ip_event_handler(void *arg, esp_event_base_t base,
                  ev->mac[0], ev->mac[1], ev->mac[2],
                  ev->mac[3], ev->mac[4], ev->mac[5]);
 
+        /* Update the station table with the newly-assigned IP. */
+        sta_update_ip(ev->mac, ip);
+
+        /* Notify legacy_gopro in case this is a managed camera that arrived via
+         * DHCP instead of the normal static-IP path (unusual but handled). */
         legacy_gopro_on_station_connected(ip, ev->mac);
     }
 }
@@ -585,15 +657,16 @@ static const httpd_uri_t api_shutter_uri = {
     .handler = api_shutter_handler,
 };
 
-/* GET /api/legacy/discovered — AP stations that are connected but not yet
- * added to camera_manager by the user.
+/* GET /api/legacy/discovered — SoftAP stations that are unmanaged and have a
+ * DHCP IP address.
  *
- * Returns: [{"addr":"XX:XX:XX:XX:XX:XX"}, ...]
+ * Returns: [{"addr":"XX:XX:XX:XX:XX:XX","ip":"10.71.79.3"}, ...]
  *
- * The device making this request is automatically excluded from the list so
- * the phone/browser that opens the settings page never shows itself as a
- * candidate camera.  Devices that are already managed (paired) are also
- * excluded since they appear in /api/paired-cameras.
+ * Stations that have not yet obtained a DHCP address are omitted entirely —
+ * they will appear once DHCP completes.  The device making this request is
+ * excluded so the phone or laptop loading the web page never appears as a
+ * candidate camera.  Cameras that are already managed are also excluded —
+ * they appear in /api/paired-cameras instead.
  */
 static esp_err_t api_legacy_discovered_handler(httpd_req_t *req)
 {
@@ -608,23 +681,33 @@ static esp_err_t api_legacy_discovered_handler(httpd_req_t *req)
         }
     }
 
-    legacy_discovered_camera_t all[4];
-    int total = legacy_gopro_get_discovered(all, 4);
+    wifi_mgr_sta_info_t stations[AP_MAX_CONN];
+    int total = wifi_manager_get_connected_stations(stations, AP_MAX_CONN);
 
     char buf[512];
     int  pos   = 0;
     bool first = true;
     pos += snprintf(buf + pos, sizeof(buf) - pos, "[");
     for (int i = 0; i < total; i++) {
-        /* Skip the device that is loading the web page. */
-        if (requester_ip && all[i].ip_addr == requester_ip) continue;
+        /* Skip stations that have not yet obtained a DHCP address. */
+        if (stations[i].ip_addr == 0) continue;
+        /* Skip the device loading the web page. */
+        if (requester_ip && stations[i].ip_addr == requester_ip) continue;
+        /* Skip cameras already under management. */
+        if (legacy_gopro_is_managed_mac(stations[i].mac)) continue;
 
-        const uint8_t *m = all[i].mac;
+        char ip_str[16];
+        uint32_t ip = stations[i].ip_addr;
+        snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+                 (int)(ip & 0xFF), (int)((ip >> 8) & 0xFF),
+                 (int)((ip >> 16) & 0xFF), (int)((ip >> 24) & 0xFF));
+
+        const uint8_t *m = stations[i].mac;
         if (!first) pos += snprintf(buf + pos, sizeof(buf) - pos, ",");
         first = false;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "{\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}",
-            m[0], m[1], m[2], m[3], m[4], m[5]);
+            "{\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ip\":\"%s\"}",
+            m[0], m[1], m[2], m[3], m[4], m[5], ip_str);
     }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]");
 
@@ -639,17 +722,21 @@ static const httpd_uri_t api_legacy_discovered_uri = {
     .handler = api_legacy_discovered_handler,
 };
 
-/* POST /api/legacy/add — promote a discovered Hero4 to managed status.
+/* POST /api/legacy/add — probe a connected station and add it if it is a Hero4.
  *
- * Body: {"addr":"XX:XX:XX:XX:XX:XX"}
+ * Body: {"addr":"XX:XX:XX:XX:XX:XX","ip":"10.71.79.3"}
+ *
+ * Both fields are required.  The IP must match the station's DHCP-assigned
+ * address as returned by /api/legacy/discovered.
  *
  * The operation is asynchronous — legacy_gopro posts a CMD_ADD_CAMERA to its
- * internal task queue.  The camera will appear in /api/paired-cameras within
- * ~3 seconds (settle loop).
+ * internal task queue.  The client should poll /api/legacy/discovered after
+ * ~15 s: if the MAC has disappeared the camera was successfully promoted to
+ * managed status; if it is still present the probe failed.
  */
 static esp_err_t api_legacy_add_handler(httpd_req_t *req)
 {
-    char body[64] = {0};
+    char body[96] = {0};
     int received = httpd_req_recv(req, body, sizeof(body) - 1);
     if (received <= 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
@@ -673,7 +760,18 @@ static esp_err_t api_legacy_add_handler(httpd_req_t *req)
     uint8_t mac[6];
     for (int i = 0; i < 6; i++) mac[i] = (uint8_t)v[i];
 
-    if (!legacy_gopro_add_camera(mac)) {
+    /* Parse optional IP address supplied by the UI from the station table. */
+    uint32_t ip = 0;
+    char *ip_p = strstr(body, "\"ip\":\"");
+    if (ip_p) {
+        ip_p += 6;
+        unsigned int a, b, c, d;
+        if (sscanf(ip_p, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+            ip = (uint32_t)(a | (b << 8) | (c << 16) | (d << 24));
+        }
+    }
+
+    if (!legacy_gopro_add_camera(mac, ip)) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Queue full");
         return ESP_FAIL;
     }
@@ -794,13 +892,13 @@ void wifi_manager_init(void)
     ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
     ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
 
-    /* Restrict the DHCP pool to 10.71.79.3–10.71.79.50.
-     * 10.71.79.2 is intentionally excluded: the Hero4 in RC-remote mode
-     * self-assigns that address unconditionally without performing a DHCP
-     * request.  Reserving it here prevents the DHCP server from handing it
-     * to a phone or any other DHCP-capable device and causing an IP conflict. */
+    /* DHCP pool: 10.71.79.2–10.71.79.50.
+     * Cameras request their previously-assigned IP via DHCP option 50 on
+     * reconnect, so addresses are naturally stable without static reservations.
+     * The saved MAC→IP mapping in legacy_gopro's NVS is updated whenever a
+     * camera acquires a new lease. */
     dhcps_lease_t lease;
-    IP4_ADDR(&lease.start_ip, 10, 71, 79,  3);
+    IP4_ADDR(&lease.start_ip, 10, 71, 79,  2);
     IP4_ADDR(&lease.end_ip,   10, 71, 79, 50);
     esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
                            ESP_NETIF_REQUESTED_IP_ADDRESS,

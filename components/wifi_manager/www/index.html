@@ -456,7 +456,7 @@
             <div class="modal-section" style="padding-top:16px;">
                 <div class="modal-section-title">Add Legacy Camera</div>
                 <button id="legacy-add-btn" onclick="refreshLegacyDiscovered()">Refresh List</button>
-                <p id="legacy-status">Tap Refresh to see connected devices.</p>
+                <p id="legacy-status">Searching for connected devices&hellip;</p>
                 <div id="legacy-results"></div>
             </div>
 
@@ -551,7 +551,7 @@
                 '<p class="empty-msg">No cameras paired.</p>';
             setScanStatus('');
             document.getElementById('legacy-status').textContent =
-                'Tap Refresh to see connected devices.';
+                'Searching for connected devices\u2026';
 
             document.getElementById('modal-overlay').classList.add('hidden');
         }
@@ -659,13 +659,17 @@
                     var html = '';
                     devices.forEach(function (dev) {
                         var safeAddr = dev.addr.replace(/'/g, "\\'");
+                        var safeIp   = (dev.ip || '').replace(/'/g, "\\'");
+                        var ipLabel  = dev.ip ? dev.ip : 'IP pending';
                         html += '<div class="found-camera-row">'
                               + '<div>'
                               + '<div class="found-cam-name">Unknown Device</div>'
-                              + '<div class="found-cam-addr">' + dev.addr + '</div>'
+                              + '<div class="found-cam-addr">'
+                              + dev.addr + ' \u2014 ' + ipLabel
+                              + '</div>'
                               + '</div>'
                               + '<button class="pair-this-btn" '
-                              +   'onclick="addLegacyCamera(\'' + safeAddr + '\')">'
+                              +   'onclick="addLegacyCamera(\'' + safeAddr + '\',\'' + safeIp + '\')">'
                               + 'Add</button>'
                               + '</div>';
                     });
@@ -685,10 +689,18 @@
          *   - no longer there  → it was probed, promoted, and is now a managed camera
          *   - still there       → probe failed; device is not a GoPro
          */
-        function addLegacyCamera(addr) {
+        function addLegacyCamera(addr, ip) {
             var status = document.getElementById('legacy-status');
             var div    = document.getElementById('legacy-results');
             var btn    = document.getElementById('legacy-add-btn');
+
+            /* Guard: ip should always be set (the server filters out ip=0
+             * stations), but reject gracefully if somehow it isn't. */
+            if (!ip) {
+                status.textContent = 'Cannot add — IP address not yet assigned. ' +
+                                     'Wait a moment and click Refresh List.';
+                return;
+            }
 
             /* Lock the UI while probing */
             div.innerHTML = '';
@@ -698,7 +710,7 @@
             fetch('/api/legacy/add', {
                 method:  'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body:    JSON.stringify({ addr: addr })
+                body:    JSON.stringify({ addr: addr, ip: ip || '' })
             })
             .then(function (r) {
                 if (!r.ok) { throw new Error('add request failed'); }
