@@ -1,3 +1,27 @@
+/**
+ * @file ble_scan.c
+ * @brief BLE discovery scan management — active scans, passive background scans.
+ *
+ * Two scan modes are used:
+ *
+ *  Active discovery scan (30 s):
+ *    Started by ble_core_start_discovery().  Surfaces all advertisement packets
+ *    to the on_disc callback with deduplication disabled.  Used when the user
+ *    requests a camera scan from the web UI.  Cancelled by
+ *    ble_core_stop_discovery(), which transitions back to the passive background
+ *    scan if any cameras are still disconnected.
+ *
+ *  Passive background scan:
+ *    Started automatically after boot reconnect (ble_init.c) if any known
+ *    cameras are not yet connected, and after an active scan ends.  Only sends
+ *    advertisements to the BLE stack for reconnect processing — the on_disc
+ *    callback is NOT invoked during passive scans.  Suppressed when
+ *    has_disconnected_cameras() returns false (all cameras connected).
+ *
+ * The BLE_GAP_EVENT_DISC_COMPLETE event fires at the end of the 30-second
+ * active scan window and is handled here to restart the background scan.
+ */
+
 #include "ble_core_internal.h"
 
 #include <string.h>
@@ -29,7 +53,7 @@ void start_scan(void)
         /* Deduplicate so the host task is not called for every advertisement
          * from an already-seen device.  The filter resets each scan interval,
          * so cameras that come back online are still detected. */
-        .filter_duplicates = 1,
+        //.filter_duplicates = 1, // Disabled this, as we are now scanning forever.  I think this is correct?  - DAC
     };
 
     int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER,
@@ -40,7 +64,7 @@ void start_scan(void)
 }
 
 /* --------------------------------------------------------------------------
- * Discovery scan — passive, runs for 30 seconds, no deduplication so every
+ * Discovery scan — passive, runs for 120 seconds, no deduplication so every
  * advertisement packet is surfaced to the on_disc callback.
  * Runs on the NimBLE host task (posted via event queue).
  * -------------------------------------------------------------------------- */
@@ -57,12 +81,12 @@ static void start_discovery_cb(struct ble_npl_event *ev)
 
     ble_gap_disc_cancel(); /* stop background scan; ignore error if not running */
 
-    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, 30000,
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, 120000,
                           &disc_params, scan_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_disc (discovery) failed: %d", rc);
     } else {
-        ESP_LOGI(TAG, "Discovery scan started — 30 seconds");
+        ESP_LOGI(TAG, "Discovery scan started — 120 seconds");
     }
 }
 

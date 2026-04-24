@@ -4,11 +4,22 @@
  *
  * wifi_manager starts the ESP32 in soft-AP mode and hosts a single-page web
  * application that allows a connected phone or laptop to:
- *  - Scan for nearby GoPro cameras.
- *  - Pair (bond) a camera to the controller.
- *  - View live camera status.
- *  - Manually start / stop recording on all cameras.
- *  - Reset all stored BLE bonds.
+ *  - Scan for nearby GoPro cameras (BLE) and pair them.
+ *  - Discover legacy Wi-Fi cameras (Hero4) connected to the AP and add them.
+ *  - View live camera status for all connected cameras.
+ *  - Manually start / stop recording on all cameras or individual slots.
+ *  - Enable or disable automatic CAN-driven recording control.
+ *  - Perform a factory reset (erase NVS, reboot).
+ *
+ * Legacy camera (Hero4) management:
+ *  - /api/legacy/discovered — lists unmanaged stations with DHCP addresses.
+ *  - /api/legacy/add — probes and promotes a station to managed.
+ *  - /api/legacy/remove — unregisters a managed camera.
+ *
+ * Station event routing to legacy_gopro:
+ *  - WIFI_EVENT_AP_STACONNECTED → legacy_gopro_on_station_wifi_associated()
+ *  - IP_EVENT_ASSIGNED_IP_TO_CLIENT → legacy_gopro_on_station_connected()
+ *  - WIFI_EVENT_AP_STADISCONNECTED → legacy_gopro_on_station_disconnected()
  *
  * Network details:
  *  - SSID: HERO-RC-XXXXXX (last 3 bytes of AP MAC address)
@@ -91,6 +102,16 @@ typedef struct {
  * @return           Number of associated stations written to @p out.
  */
 int wifi_manager_get_connected_stations(wifi_mgr_sta_info_t *out, int max_count);
+
+
+/**
+ * @brief Return the DHCP-assigned IP for a single station by MAC address.
+ *
+ * @param mac  6-byte MAC address of the station to look up.
+ * @return     IP address in network byte order, or 0 if the station is not
+ *             associated or has not yet been assigned an address by DHCP.
+ */
+uint32_t wifi_manager_get_station_ip(const uint8_t mac[6]);
 
 #ifdef __cplusplus
 }

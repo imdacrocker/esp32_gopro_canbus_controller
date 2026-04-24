@@ -6,6 +6,28 @@ This document covers all three API layers of the ESP32 GoPro CAN Bus Controller:
 2. [CAN Bus Protocol](#can-bus-protocol) — the binary frame protocol used between the controller and RaceCapture.
 3. [C Component APIs](#c-component-apis) — the public C headers for each firmware component.
 
+### HTTP endpoint summary
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Embedded web UI |
+| `GET` | `/api/status` | Remembered and connected camera counts |
+| `POST` | `/api/scan` | Start 30 s BLE discovery scan |
+| `POST` | `/api/scan-cancel` | Cancel running discovery scan |
+| `GET` | `/api/cameras` | Discovered BLE cameras (poll during scan) |
+| `POST` | `/api/pair` | Pair a discovered BLE camera |
+| `GET` | `/api/paired-cameras` | All camera slots with live status |
+| `POST` | `/api/remove-camera` | Remove a paired BLE camera |
+| `POST` | `/api/shutter` | Start or stop recording (all cameras or one slot) |
+| `GET` | `/api/logging-state` | Current RaceCapture logging state |
+| `GET` | `/api/utc` | Current GPS-derived UTC timestamp |
+| `GET` | `/api/auto-control` | Read automatic CAN-driven recording flag |
+| `POST` | `/api/auto-control` | Enable or disable automatic CAN-driven recording |
+| `GET` | `/api/legacy/discovered` | Unmanaged Wi-Fi stations with DHCP addresses |
+| `POST` | `/api/legacy/add` | Probe and add a Hero4 as a managed camera |
+| `POST` | `/api/legacy/remove` | Remove a managed legacy camera |
+| `POST` | `/api/factory-reset` | Erase all NVS data and reboot |
+
 ---
 
 ## HTTP REST API
@@ -263,6 +285,47 @@ This command **does** update the desired recording state tracked by `camera_mana
 
 ---
 
+### `GET /api/logging-state`
+
+Returns the current RaceCapture logging state as last reported on CAN ID `0x600`. The state reverts to `"unknown"` if no `0x600` frame has been received within the past 5 seconds (configurable via `CAN_MANAGER_LOGGING_TIMEOUT_MS`).
+
+**Response**
+
+```json
+{ "state": "logging" }
+```
+
+| Value | Meaning |
+|-------|---------|
+| `"logging"` | RaceCapture is currently logging (`isLogging = 1`). |
+| `"not_logging"` | RaceCapture is present but not logging (`isLogging = 0`). |
+| `"unknown"` | No `0x600` frame received recently — RaceCapture may be absent or rebooting. |
+
+---
+
+### `GET /api/utc`
+
+Returns the current best-estimate UTC derived from the RaceCapture GPS clock broadcast on CAN ID `0x602`. The ESP32 extrapolates forward from the last received frame using its monotonic timer (`esp_timer_get_time`), so sub-second accuracy is maintained between CAN frames.
+
+**Response — GPS lock acquired:**
+
+```json
+{ "valid": true, "epoch_ms": 1744727527412 }
+```
+
+**Response — GPS lock not yet acquired:**
+
+```json
+{ "valid": false }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `valid` | boolean | `true` if a valid `0x602` frame has been received (year > 2020). |
+| `epoch_ms` | integer | Milliseconds since Unix epoch (only present when `valid` is `true`). |
+
+---
+
 ### `GET /api/auto-control`
 
 Returns the current state of the automatic camera control flag.
@@ -314,6 +377,122 @@ When re-enabling automatic control, the controller does **not** immediately resy
 | 400 | `Empty body` | Request body was missing. |
 | 400 | `Missing 'enabled' field` | JSON field `"enabled"` was not found. |
 | 400 | `Invalid 'enabled' value` | `"enabled"` was not `true` or `false`. |
+
+---
+
+---
+
+### `GET /api/legacy/discovered`
+
+Returns the list of Wi-Fi stations currently connected to the controller's Soft-AP that are **not** already managed (i.e. not yet in `camera_manager`), have a DHCP-assigned IP address, and are not the requesting device itself.
+
+Use this endpoint to find Hero4 cameras that have connected to the AP and are waiting to be added. Poll this endpoint after connecting a Hero4 in RC Mode — the device will typically appear within a few seconds of obtaining a DHCP lease.
+
+**Response** — array of discovered station objects (may be empty):
+
+```json
+[
+  {
+    "addr": "D8:96:85:AA:BB:CC",
+    "ip": "10.71.79.2"
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `addr` | string | Station Wi-Fi MAC address in `XX:XX:XX:XX:XX:XX` format. |
+| `ip` | string | DHCP-assigned IPv4 address in dotted-decimal format. |
+
+Stations that have not yet completed DHCP negotiation are omitted; they appear automatically once their address is assigned.
+
+---
+
+### `POST /api/legacy/add`
+
+Probes a connected station over HTTP and adds it as a managed legacy camera if it responds to the Hero4 `gpControl` API.
+
+The operation is **asynchronous** — the controller posts a probe task to the `legacy_gopro` internal queue and responds immediately. The HTTP probe (up to 3 retries, 5 s timeout) runs in the background. Poll `GET /api/legacy/discovered` after approximately 15 seconds: if the MAC has disappeared, the camera was successfully promoted to managed status and will appear in `GET /api/paired-cameras`. If the MAC is still present, the probe failed.
+
+On success, the camera's MAC and IP are saved to NVS. On subsequent reconnects, the controller auto-promotes the camera without requiring user action.
+
+**Request body** (`Content-Type: application/json`):
+
+```json
+{
+  "addr": "D8:96:85:AA:BB:CC",
+  "ip": "10.71.79.2"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `addr` | string | Yes | Wi-Fi MAC address from `GET /api/legacy/discovered`. |
+| `ip` | string | No | Station IP from `GET /api/legacy/discovered`. If omitted or `0`, the probe attempts to use the IP stored in the station table. |
+
+**Response**
+
+```json
+{ "status": "adding" }
+```
+
+**Error responses**
+
+| HTTP status | Body | Cause |
+|-------------|------|-------|
+| 400 | `Empty body` | Request body was missing. |
+| 400 | `Missing addr` | JSON field `"addr"` was not found. |
+| 400 | `Bad addr format` | MAC address could not be parsed. |
+| 500 | `Queue full` | Internal command queue is full — retry after a moment. |
+
+---
+
+### `POST /api/legacy/remove`
+
+Removes a managed legacy camera. Unregisters the camera from `camera_manager`, frees its slot, and deletes its MAC and IP from NVS. The camera's Wi-Fi connection to the AP is not dropped — if still physically connected, it will reappear in `GET /api/legacy/discovered` after removal.
+
+**Request body** (`Content-Type: application/json`):
+
+```json
+{ "addr": "D8:96:85:AA:BB:CC" }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `addr` | string | Wi-Fi MAC address of the managed camera to remove. |
+
+**Response**
+
+```json
+{ "status": "removed" }
+```
+
+**Error responses**
+
+| HTTP status | Body | Cause |
+|-------------|------|-------|
+| 400 | `Empty body` | Request body was missing. |
+| 400 | `Missing addr` | JSON field `"addr"` was not found. |
+| 400 | `Bad addr format` | MAC address could not be parsed. |
+| 500 | `Queue full` | Internal command queue is full — retry after a moment. |
+
+---
+
+### `POST /api/factory-reset`
+
+Erases all NVS partitions (paired cameras, legacy camera records, all stored settings) and reboots the ESP32. **This is irreversible.** All paired BLE cameras and managed legacy cameras must be re-added after a factory reset.
+
+The HTTP response is flushed before the erase begins so the caller receives a confirmation before the device goes offline.
+
+**Request body:** none
+
+**Response** (received before the device reboots):
+
+```json
+{ "status": "rebooting" }
+```
+
+The device will be unreachable for approximately 5–10 seconds while it restarts and the AP reinitialises.
 
 ---
 
@@ -1054,18 +1233,149 @@ Returns `true` and writes to `*epoch_ms_out` if a valid UTC has been received fr
 
 ---
 
+### `legacy_gopro`
+
+**Header:** `components/legacy_gopro/include/legacy_gopro.h`
+
+Legacy GoPro (Hero4) Wi-Fi driver. Manages camera discovery via the Soft-AP station table, HTTP probing, NVS persistence, and UDP-based shutter/keepalive control. Registers a `camera_driver_t` vtable with `camera_manager`.
+
+#### Internal file layout
+
+| File | Responsibility |
+|------|---------------|
+| `legacy_gopro.c` | FreeRTOS task state machine, NVS load/save, command queue processing, public API |
+| `control.c` | UDP shutter broadcast, UDP keepalive/status-request, HTTP probe and date-time sync |
+| `legacy_gopro_internal.h` | Shared `legacy_camera_t` struct and `s_cameras[]` / `s_udp_sock` declarations (internal only) |
+
+#### Hero4 UDP RC-remote protocol
+
+| Packet | Direction | Destination | Description |
+|--------|-----------|-------------|-------------|
+| `_GPHD_:0:0:2:0.000000\n` (22 bytes, ASCII) | ESP32 → Camera | Unicast per camera, port 8484 | Keepalive — must be sent every 2 s |
+| `00 00 00 00 00 00 00 00 00 01 00 53 48 02` (14 bytes) | ESP32 → Camera | Broadcast `255.255.255.255:8484` | Shutter ON (start recording) |
+| `00 00 00 00 00 00 00 00 00 01 00 53 48 00` (14 bytes) | ESP32 → Camera | Broadcast `255.255.255.255:8484` | Shutter OFF (stop recording) |
+| `00 00 00 00 00 00 00 00 00 00 00 73 74` (13 bytes) | ESP32 → Camera | Unicast per camera, port 8484 | Status request |
+
+The shutter broadcast reaches all cameras simultaneously regardless of how many are connected, providing the best recording-start synchronisation achievable over UDP.
+
+#### Types
+
+**`legacy_camera_t`** — per-camera runtime state (internal, defined in `legacy_gopro_internal.h`).
+
+```c
+typedef struct {
+    bool     active;          // true while station is connected to the Soft-AP
+    bool     managed;         // true after user adds the camera via /api/legacy/add
+    bool     wifi_connected;  // true while camera is connected and keepalives are flowing
+    uint32_t ip_addr;         // current IP, network byte order
+    uint8_t  mac[6];
+    int      slot;            // camera_manager slot; -1 until managed
+    char     name[LEGACY_CAMERA_NAME_LEN];
+    camera_recording_status_t recording_status;
+    volatile TickType_t last_response_tick; // FreeRTOS tick of last UDP response; 0 = never
+} legacy_camera_t;
+```
+
+> This struct is internal. The `driver_ctx` pointer stored in `camera_manager` points directly into the `s_cameras[]` array — entries must not be moved after registration.
+
+#### Functions
+
+```c
+void legacy_gopro_init(void);
+```
+Load managed MACs from NVS, open the UDP socket (port 8383), and start the internal FreeRTOS task and UDP RX task. Must be called after `camera_manager_init()` and `wifi_manager_init()`.
+
+---
+
+```c
+void legacy_gopro_on_station_wifi_associated(const uint8_t mac[6]);
+```
+Notify the component that a station has completed Wi-Fi L2 association on the Soft-AP. If the MAC is in NVS (previously managed camera), a `CMD_STATION_CONNECT` is posted with the saved IP, triggering an HTTP probe. Unknown MACs are ignored — they appear in `/api/legacy/discovered` once they have a DHCP address. Safe to call from any context (ISR-safe queue post). Called by `wifi_manager` from the `WIFI_EVENT_AP_STACONNECTED` handler.
+
+---
+
+```c
+void legacy_gopro_on_station_connected(uint32_t ip, const uint8_t mac[6]);
+```
+Notify the component that a station has been assigned a DHCP IP. Only acts on MACs that are already in NVS (managed cameras) — posts `CMD_IP_UPDATE` to update the live IP and redirect keepalives if the address changed. Unknown MACs are ignored. Safe to call from any context. Called by `wifi_manager` from the `IP_EVENT_ASSIGNED_IP_TO_CLIENT` handler.
+
+---
+
+```c
+void legacy_gopro_on_station_disconnected(const uint8_t mac[6]);
+```
+Notify the component that a station has disconnected from the Soft-AP. Managed cameras are kept in the table (slot remains visible as disconnected) and auto-promoted on reconnect. Safe to call from any context.
+
+---
+
+```c
+bool legacy_gopro_add_camera(const uint8_t mac[6], uint32_t ip);
+```
+Probe a connected station and promote it to managed if it responds to the Hero4 HTTP API. Posts an asynchronous `CMD_ADD_CAMERA` to the internal task queue. Returns `true` if the command was queued, `false` if the queue is full. The HTTP probe (up to 3 retries) runs on the task. Called by `wifi_manager` from `POST /api/legacy/add`.
+
+---
+
+```c
+bool legacy_gopro_remove_camera(const uint8_t mac[6]);
+```
+Remove a managed camera. Posts an asynchronous `CMD_REMOVE_CAMERA` that unregisters the camera, frees the `camera_manager` slot, and removes the MAC from NVS. Returns `true` if queued. Called by `wifi_manager` from `POST /api/legacy/remove`.
+
+---
+
+```c
+bool legacy_gopro_is_managed_slot(int slot);
+```
+Returns `true` if the given `camera_manager` slot belongs to a managed legacy Wi-Fi camera. Used by `wifi_manager` to determine whether `POST /api/remove-camera` should call `ble_core_remove_bond()` (BLE camera) or `legacy_gopro_remove_camera()` (Wi-Fi camera).
+
+---
+
+```c
+bool legacy_gopro_is_managed_mac(const uint8_t mac[6]);
+```
+Returns `true` if the MAC belongs to a currently managed legacy camera. Used by `wifi_manager` to filter managed cameras out of `/api/legacy/discovered`. Lock-free read; safe to call from any context.
+
+---
+
+```c
+void legacy_gopro_sync_time_all(void);
+```
+Push the current UTC date/time to all managed and connected Wi-Fi cameras via the Hero4 HTTP date/time endpoint. Posts an asynchronous `CMD_SYNC_TIME` to the internal task queue. If UTC is not yet available (no GPS lock on the RaceCapture), the HTTP call is silently skipped per camera. Called from `main.c`'s `on_utc_acquired` callback alongside `open_gopro_ble_sync_time_all()`. Safe to call from any context.
+
+---
+
 ### `wifi_manager`
 
 **Header:** `components/wifi_manager/include/wifi_manager.h`
 
-Wi-Fi soft-AP and HTTP server. Serves the embedded web UI and all `/api/*` endpoints.
+Wi-Fi soft-AP and HTTP server. Serves the embedded web UI and all `/api/*` endpoints, including the `/api/legacy/*` sub-tree. Owns the connected-station table and routes L2 and DHCP events to `legacy_gopro`.
 
 #### Functions
 
 ```c
 void wifi_manager_init(void);
 ```
-Initialise the Wi-Fi AP interface, assign static IP `10.71.79.1`, start the DHCP server, bring up the AP (SSID `HERO-RC-XXXXXX`, open auth), and register all HTTP URI handlers. Call once from `app_main()` after `camera_manager_init()` and `ble_core_init()`.
+Initialise the Wi-Fi AP interface, assign static IP `10.71.79.1`, configure the DHCP pool (`10.71.79.2–10.71.79.50`), bring up the AP (SSID `HERO-RC-XXXXXX`, open auth, channel 6), and register all HTTP URI handlers. Call once from `app_main()` after `camera_manager_init()` and before `legacy_gopro_init()`.
+
+---
+
+```c
+void wifi_manager_wait_for_ap_ready(void);
+```
+Block until `WIFI_EVENT_AP_START` has fired (up to 5 seconds). Call this from `app_main()` between `wifi_manager_init()` and `ble_core_init()` to ensure the AP beacon is on air before BLE starts its radio-intensive connection procedures. The ESP32 shares one antenna between Wi-Fi and BLE; starting BLE before the AP is ready can starve the coexistence scheduler.
+
+---
+
+```c
+uint32_t wifi_manager_get_station_ip(const uint8_t mac[6]);
+```
+Return the DHCP-assigned IP (network byte order) for a connected station by MAC address, or `0` if the station is not found or has no IP yet.
+
+---
+
+```c
+int wifi_manager_get_connected_stations(wifi_mgr_sta_info_t *out, int max_count);
+```
+Copy up to `max_count` connected-station entries into `out`. Returns the number of entries written. Used by the `/api/legacy/discovered` handler to enumerate stations.
 
 ---
 
@@ -1091,8 +1401,9 @@ typedef enum {
 
 ```c
 typedef enum {
-    CAMERA_TYPE_NONE      = 0,  // Unconfigured slot
-    CAMERA_TYPE_GOPRO_BLE,      // GoPro via BLE (open_gopro_ble component)
+    CAMERA_TYPE_NONE        = 0,  // Unconfigured slot
+    CAMERA_TYPE_GOPRO_BLE,        // GoPro via BLE (open_gopro_ble component)
+    CAMERA_TYPE_LEGACY_WIFI,      // Legacy GoPro (Hero4) via Wi-Fi HTTP/UDP (legacy_gopro component)
 } camera_type_t;
 ```
 

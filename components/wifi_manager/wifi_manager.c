@@ -1,3 +1,43 @@
+/**
+ * @file wifi_manager.c
+ * @brief Wi-Fi Soft-AP, HTTP server, and station event routing.
+ *
+ * Responsibilities
+ * ----------------
+ *  - Brings up the ESP32 Soft-AP (SSID HERO-RC-XXXXXX, IP 10.71.79.1).
+ *  - Manages the connected-station table (MAC → IP mapping).
+ *  - Routes WIFI_EVENT_AP_STACONNECTED / IP_EVENT_ASSIGNED_IP_TO_CLIENT /
+ *    WIFI_EVENT_AP_STADISCONNECTED events to legacy_gopro for Hero4 tracking.
+ *  - Hosts the ESP-IDF HTTP server with all /api/* handlers.
+ *  - Serves the embedded web UI (index.html) from flash.
+ *
+ * HTTP endpoint summary (see API.md for full documentation):
+ *  GET  /                         → index.html
+ *  GET  /api/status               → remembered + connected counts
+ *  POST /api/scan                 → start BLE discovery
+ *  POST /api/scan-cancel          → cancel BLE discovery
+ *  GET  /api/cameras              → discovered BLE cameras
+ *  POST /api/pair                 → pair a BLE camera
+ *  GET  /api/paired-cameras       → all camera slots + live status
+ *  POST /api/remove-camera        → remove a paired BLE camera
+ *  POST /api/shutter              → start/stop recording
+ *  GET  /api/logging-state        → current RaceCapture logging state
+ *  GET  /api/utc                  → GPS-derived UTC timestamp
+ *  GET  /api/auto-control         → read automatic-control flag
+ *  POST /api/auto-control         → set automatic-control flag
+ *  GET  /api/legacy/discovered    → unmanaged AP stations with DHCP IPs
+ *  POST /api/legacy/add           → probe and add a Hero4 camera
+ *  POST /api/legacy/remove        → remove a managed legacy camera
+ *  POST /api/factory-reset        → erase NVS and reboot
+ *
+ * Station table
+ * -------------
+ * s_stations[] tracks every station that has associated at L2.  ip_addr is
+ * filled in by the DHCP server's IP_EVENT; it remains 0 until DHCP completes.
+ * Written from Wi-Fi/IP event callbacks; read from HTTP handlers.  Lock-free
+ * — minor races are acceptable for display purposes.
+ */
+
 #include "wifi_manager.h"
 #include <string.h>
 #include <stdio.h>
@@ -12,6 +52,7 @@
 #include "apps/dhcpserver/dhcpserver.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "nvs_flash.h"
 #include "open_gopro_ble.h"
 #include "camera_manager.h"
 #include "ble_core.h"
@@ -79,6 +120,12 @@ static void sta_remove(const uint8_t mac[6])
     if (idx >= 0) memset(&s_stations[idx], 0, sizeof(s_stations[idx]));
 }
 
+uint32_t wifi_manager_get_station_ip(const uint8_t mac[6])
+{
+    int idx = sta_find_by_mac(mac);
+    return (idx >= 0) ? s_stations[idx].ip_addr : 0;
+}
+
 int wifi_manager_get_connected_stations(wifi_mgr_sta_info_t *out, int max_count)
 {
     int count = 0;
@@ -128,6 +175,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ESP_LOGW(TAG, "AP stopped unexpectedly — restarting");
         xEventGroupClearBits(s_ap_event_group, AP_STARTED_BIT);
         esp_wifi_start();
+        // Disable the WiFi power savings
+        esp_wifi_set_ps(WIFI_PS_NONE);
 
     } else if (id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *ev = (wifi_event_ap_staconnected_t *)data;
@@ -211,7 +260,7 @@ static const httpd_uri_t root_uri = {
     .handler = root_handler,
 };
 
-/* POST /api/scan — start a 30-second discovery scan */
+/* POST /api/scan — start a 120-second discovery scan */
 static esp_err_t api_scan_handler(httpd_req_t *req)
 {
     open_gopro_ble_start_discovery();
@@ -838,13 +887,43 @@ static const httpd_uri_t api_legacy_remove_uri = {
 };
 
 /* ============================================================
+ * Factory Reset
+ * ============================================================ */
+
+/* POST /api/factory-reset
+ * Erases all NVS partitions and reboots the ESP32.
+ * The response is flushed before the erase so the caller receives it. */
+static esp_err_t api_factory_reset_handler(httpd_req_t *req)
+{
+    ESP_LOGW(TAG, "Factory reset requested via HTTP — erasing NVS and rebooting");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
+
+    /* Give the TCP stack time to flush the response before we erase */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    nvs_flash_erase();
+    esp_restart();
+
+    return ESP_OK; /* never reached */
+}
+
+static const httpd_uri_t api_factory_reset_uri = {
+    .uri     = "/api/factory-reset",
+    .method  = HTTP_POST,
+    .handler = api_factory_reset_handler,
+};
+
+/* ============================================================
  * HTTP Server
  * ============================================================ */
 
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 18;  /* 13 original + 3 legacy + 2 headroom */
+    config.max_uri_handlers = 19;  /* 13 original + 3 legacy + 1 factory-reset + 2 headroom */
+    config.max_open_sockets = 4;
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -864,6 +943,7 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_legacy_discovered_uri);
         httpd_register_uri_handler(server, &api_legacy_add_uri);
         httpd_register_uri_handler(server, &api_legacy_remove_uri);
+        httpd_register_uri_handler(server, &api_factory_reset_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");
@@ -991,7 +1071,10 @@ void wifi_manager_init(void)
      * beacon is on air, apply HT20 bandwidth, and set AP_STARTED_BIT. */
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Shorten the AP inactive-time from the default 300 s to 15 s.
+    // Disable the WiFi power savings
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    /* Shorten the AP inactive-time from the default 300 s to 60 s.
      *
      * The ESP32 SoftAP tracks each station's inactivity (no received data
      * frames) and sends a deauth when the timer expires.  The default 300 s
@@ -1000,7 +1083,7 @@ void wifi_manager_init(void)
      * five minutes, causing every subsequent unicast send to stall on ARP
      * resolution and return ENOMEM.
      *
-     * 15 s is safe because our keepalive sends every 2 s elicit a UDP ACK
+     * 60 s is safe because our keepalive sends every 2 s elicit a UDP ACK
      * from any camera that is actually alive, which counts as received-data
      * and resets the inactivity timer.  A camera that has gone silent is
      * cleanly evicted in 15 s, triggering a fresh DHCP handshake on reconnect

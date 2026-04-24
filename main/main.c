@@ -1,3 +1,27 @@
+/**
+ * @file main.c
+ * @brief Application entry point — wires all components together.
+ *
+ * Initialisation order
+ * --------------------
+ *  1. NVS flash (required by BLE bond store and camera_manager NVS).
+ *  2. open_gopro_ble_init()  — registers the BLE driver with camera_manager.
+ *  3. State-change callback registered with camera_manager.
+ *  4. camera_manager_init() — loads NVS, starts 2 s tick timer.
+ *  5. wifi_manager_init()   — starts Soft-AP and HTTP server.
+ *  6. legacy_gopro_init()   — loads managed MACs from NVS, opens UDP socket,
+ *                              starts internal task.
+ *  7. wifi_manager_wait_for_ap_ready() — blocks until AP beacon is on air.
+ *  8. ble_core_init()       — starts NimBLE stack, kicks off boot reconnect.
+ *  9. CAN callbacks registered; can_manager_init() starts TWAI node.
+ *
+ * Callbacks registered here
+ * -------------------------
+ *  on_camera_state_changed  — bridges camera status to CAN 0x601 broadcasts.
+ *  on_logging_state_changed — starts/stops cameras on RaceCapture 0x600 events.
+ *  on_utc_acquired          — syncs clocks to all cameras on first GPS lock.
+ */
+
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "ble_core.h"
@@ -45,19 +69,13 @@ static void on_camera_state_changed(int slot, int status, void *user_ctx)
  * ============================================================ */
 
 /**
- * Called by can_manager when the RaceCapture logging state changes (0x600).
- *
- * Sets the desired recording state on all camera slots so the tick timer
- * keeps retrying if a camera is mid-reconnect, then immediately dispatches
- * the start/stop command to every camera that is already GATT-ready.
- */
-/**
  * Called by can_manager exactly once, the first time a valid UTC timestamp
  * is received on 0x602 (i.e. the RaceCapture has acquired GPS lock).
  *
  * Sends SetDateTime to any cameras that were already connected and GATT-ready
  * before UTC became available.  Cameras that connect later have their clocks
- * set directly from gatt.c when their CCCD subscriptions complete.
+ * set directly from gatt.c (BLE) or the legacy_gopro task (Wi-Fi) when their
+ * connection setup completes.
  */
 static void on_utc_acquired(void *user_ctx)
 {
@@ -67,6 +85,17 @@ static void on_utc_acquired(void *user_ctx)
     legacy_gopro_sync_time_all();        /* Wi-Fi cameras (Hero4 HTTP gpControl)  */
 }
 
+/**
+ * Called by can_manager when the RaceCapture logging state changes (0x600).
+ *
+ * Sets the desired recording state on all camera slots so the tick timer
+ * keeps retrying if a camera is mid-reconnect, then immediately dispatches
+ * the start/stop command to every camera that is already connected and ready.
+ *
+ * If automatic_camera_control is disabled (user toggled it off in the web UI),
+ * this function returns immediately without acting on cameras — CAN transitions
+ * are silently ignored until the flag is re-enabled.
+ */
 static void on_logging_state_changed(logging_state_t state, void *user_ctx)
 {
     if (!camera_manager_get_auto_control()) {

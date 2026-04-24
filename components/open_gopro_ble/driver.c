@@ -1,3 +1,18 @@
+/**
+ * @file driver.c
+ * @brief OpenGoPro BLE driver — camera_driver_t vtable, context allocation, and init.
+ *
+ * Responsibilities
+ * ----------------
+ *  - Provides the camera_driver_t vtable (start_recording, stop_recording,
+ *    get_recording_status) registered with camera_manager.
+ *  - Allocates and zeroes per-camera gopro_ble_ctx_t contexts via
+ *    open_gopro_ble_create_driver_ctx().
+ *  - Maintains the discovery list (gopro_device_t[GOPRO_MAX_DISCOVERED]) populated
+ *    during BLE scans.
+ *  - Wires ble_core callbacks to the pairing.c handlers on init.
+ */
+
 #include "open_gopro_ble_internal.h"
 
 #include <string.h>

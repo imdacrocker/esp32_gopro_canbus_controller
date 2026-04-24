@@ -1,3 +1,14 @@
+/**
+ * @file ble_gatt_write.c
+ * @brief ATT Write Without Response helper.
+ *
+ * Wraps ble_gattc_write_no_rsp() with an os_mbuf allocation and a consistent
+ * error-logging pattern.  All OpenGoPro command writes use ATT Write Without
+ * Response (ATT opcode 0x52) so there is no per-write ACK — delivery is
+ * best-effort at the ATT layer; the application layer (GPBS response on
+ * cmd_resp_notify) provides the acknowledgement.
+ */
+
 #include "ble_core.h"
 
 #include <string.h>

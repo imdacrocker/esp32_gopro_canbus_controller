@@ -56,6 +56,7 @@
 #include "legacy_gopro_internal.h"
 #include "camera_manager.h"
 #include "camera_driver.h"
+#include "wifi_manager.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -90,7 +91,11 @@ static const char *TAG = "LEGACY_GOPRO";
 #define POLL_INTERVAL_MS        2000    /* keepalive + status poll cadence */
 #define HTTP_BUF_SIZE           2560
 #define TASK_STACK_SIZE         8192
-#define QUEUE_DEPTH             8
+#define QUEUE_DEPTH             16  /* increased from 8: a 21 s probe loop can queue up
+                                     * many CMD_DISCONNECTs while blocked; a depth of 8
+                                     * left no room for the follow-on CMD_STATION_CONNECT,
+                                     * causing it to be silently dropped ("not always
+                                     * trying to pair"). */
 #define SETTLE_DURATION_MS      2000    /* keepalive settle before on_wifi_connected */
 #define SETTLE_STEP_MS          500
 
@@ -588,8 +593,36 @@ static void promote_to_managed_settled(int cam_idx)
 
 static void handle_station_connect(const legacy_cmd_t *cmd)
 {
+    /* Wait briefly for DHCP to complete before committing to a probe IP.
+     * WIFI_EVENT_AP_STACONNECTED fires before the camera sends its DHCP
+     * Discover, so the station table IP is often still 0 when we arrive here.
+     * Polling for up to DHCP_SETTLE_MAX_MS avoids burning 21 s probing the
+     * stale saved IP when the camera has already received a different address. */
+#define DHCP_SETTLE_POLL_MS   100
+#define DHCP_SETTLE_MAX_MS   1500
+
+    uint32_t probe_ip = cmd->ip;
+    for (int w = 0; w * DHCP_SETTLE_POLL_MS < DHCP_SETTLE_MAX_MS; w++) {
+        uint32_t live = wifi_manager_get_station_ip(cmd->mac);
+        if (live != 0) {
+            if (live != probe_ip) {
+                char old_str[16], new_str[16];
+                ip_to_str(probe_ip, old_str, sizeof(old_str));
+                ip_to_str(live, new_str, sizeof(new_str));
+                ESP_LOGI(TAG, "DHCP settled at %s (saved was %s) — using new IP",
+                         new_str, old_str);
+                probe_ip = live;
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(DHCP_SETTLE_POLL_MS));
+    }
+    /* If the wait expired without a DHCP event (camera uses a cached/static
+     * IP and won't send a DHCP request), probe_ip is still the saved IP,
+     * which is the correct behaviour. */
+
     char ip_str[16];
-    ip_to_str(cmd->ip, ip_str, sizeof(ip_str));
+    ip_to_str(probe_ip, ip_str, sizeof(ip_str));
 
     /* CMD_STATION_CONNECT is only ever posted for MACs that are in NVS, so
      * the camera must be pre-loaded into s_cameras by legacy_gopro_init(). */
@@ -604,7 +637,7 @@ static void handle_station_connect(const legacy_cmd_t *cmd)
     cam->active           = true;
     cam->managed          = true;
     cam->wifi_connected   = false;   /* set true inside promote_to_managed_settled */
-    cam->ip_addr          = cmd->ip;
+    cam->ip_addr          = probe_ip;
     cam->recording_status = CAMERA_RECORDING_UNKNOWN;
     memcpy(cam->mac, cmd->mac, 6);
     if (cam->name[0] == '\0') {
@@ -666,6 +699,12 @@ static void handle_disconnect(const legacy_cmd_t *cmd)
              ip_str, cam->managed, cam->slot);
 
     if (cam->managed) {
+        /* Idempotency guard: multiple CMD_DISCONNECTs queue up while the task
+         * is blocked in a probe loop.  Only the first one needs to do anything;
+         * subsequent calls for the same MAC while wifi_connected is already
+         * false are no-ops, preventing redundant camera_manager notifications. */
+        if (!cam->wifi_connected) return;
+
         /* Keep the entry active so it auto-promotes on reconnect and the
          * camera_manager slot stays visible as "disconnected" in the UI. */
         cam->wifi_connected   = false;
@@ -864,9 +903,13 @@ static void handle_ip_update(const legacy_cmd_t *cmd)
         if (cam->slot >= 0) {
             camera_manager_on_wifi_connected(cam->slot, cam->ip_addr);
         }
-    } else if (cam->active) {
-        /* Camera is associated at L2 but the probe at the old IP either failed
-         * or is still running.  Queue a fresh attempt at the new IP. */
+    } else if (cam->active || cam->managed) {
+        /* Camera is associated at L2 but the probe at the old IP either failed,
+         * is still running, or never started (managed placeholder with ip=0 in
+         * NVS — on_station_wifi_associated ignored it because saved_ip was 0,
+         * so this DHCP event is the first opportunity to probe it).
+         * Mark active so subsequent disconnect/reconnect bookkeeping is correct. */
+        cam->active = true;
         legacy_cmd_t reconnect = { .type = CMD_STATION_CONNECT, .ip = cmd->ip };
         memcpy(reconnect.mac, cmd->mac, 6);
         if (xQueueSend(s_queue, &reconnect, pdMS_TO_TICKS(100)) != pdTRUE) {

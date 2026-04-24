@@ -1,3 +1,20 @@
+/**
+ * @file pairing.c
+ * @brief OpenGoPro BLE lifecycle callbacks — connected, encrypted, disconnected.
+ *
+ * Registered with ble_core as part of open_gopro_ble_init().  These callbacks
+ * are the primary entry points for camera lifecycle transitions:
+ *
+ *  gopro_on_connected_cb()    — maps conn_handle to a camera slot; notifies
+ *                               camera_manager.
+ *  gopro_on_encrypted_cb()    — triggers GATT discovery (gatt.c) once the
+ *                               link is encrypted and safe to use.
+ *  gopro_on_disconnected_cb() — clears the slot's GATT handles and
+ *                               start_cmd_pending flag; releases any in-progress
+ *                               GPBS reassembly context (presets.c/query.c);
+ *                               notifies camera_manager.
+ */
+
 #include "open_gopro_ble_internal.h"
 
 #include <string.h>

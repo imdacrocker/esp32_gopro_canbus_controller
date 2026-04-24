@@ -1,3 +1,31 @@
+/**
+ * @file can_manager.c
+ * @brief CAN bus (TWAI) driver — RaceCapture ↔ ESP32 protocol implementation.
+ *
+ * Frame handling
+ * --------------
+ *  0x600 (RaceCapture → ESP32): isLogging byte in payload[0].
+ *    - Compared against the previous value; fires on_logging_state_changed
+ *      only on transitions.  State times out to LOGGING_STATE_UNKNOWN after
+ *      CAN_MANAGER_LOGGING_TIMEOUT_MS with no new frame.
+ *
+ *  0x601 (ESP32 → RaceCapture): camera state broadcast at 5 Hz.
+ *    - Bytes 0–3 hold CAMERA_STATE_* values for slots 0–3.
+ *    - Sent by a periodic esp_timer callback regardless of bus activity.
+ *
+ *  0x602 (RaceCapture → ESP32): GPS UTC timestamp (uint64_t ms epoch, LE).
+ *    - First valid frame (year > 2020) fires the can_utc_acquired_cb_t
+ *      callback exactly once and logs the human-readable timestamp at INFO.
+ *    - Subsequent frames update the stored epoch + monotonic reference pair
+ *      used by can_manager_get_utc_ms() for extrapolation.
+ *
+ * Threading model
+ * ---------------
+ * A single FreeRTOS task (s_rx_task) dequeues received frames from s_rx_queue
+ * and processes them.  The TWAI ISR enqueues raw frames.  State accessible to
+ * callers (camera states, logging state, UTC) is protected by s_state_mutex.
+ */
+
 #include "can_manager.h"
 
 #include <string.h>

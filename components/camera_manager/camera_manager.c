@@ -1,3 +1,34 @@
+/**
+ * @file camera_manager.c
+ * @brief Camera slot state machine — protocol-agnostic lifecycle management.
+ *
+ * State machine overview
+ * ----------------------
+ * Each slot transitions through the following states (CAMERA_STATUS_*):
+ *
+ *   NOT_CONFIGURED → configured on pair/register
+ *   DISCONNECTED   → default after configure; also after BLE/Wi-Fi drop
+ *   CONNECTED      → BLE: after on_connected; Wi-Fi: after probe success
+ *   RECORDING      → after driver confirms CAMERA_RECORDING_ACTIVE
+ *
+ * The 2-second tick timer drives the retry logic:
+ *  - For each configured slot: read driver->get_recording_status().
+ *  - If desired_recording is true and status is not ACTIVE: call start_recording().
+ *  - If desired_recording is false and status is ACTIVE: call stop_recording()
+ *    (handles the case where a camera starts recording on its own).
+ *  - Fire the state_change callback whenever the derived CAMERA_STATUS_* changes.
+ *
+ * NVS layout
+ * ----------
+ * Each BLE camera occupies its own NVS namespace "cam_N" (N = slot index).
+ * The persisted record is camera_nv_record_t: name, BLE MAC, configured flag,
+ * and camera_type_t.  Per-slot desired_recording is NOT persisted — it always
+ * resets to false at boot.
+ *
+ * Legacy Wi-Fi cameras (CAMERA_TYPE_LEGACY_WIFI) are NOT saved through this
+ * NVS path.  legacy_gopro maintains its own NVS namespace for MAC→IP mapping.
+ */
+
 #include "camera_manager.h"
 
 #include <string.h>

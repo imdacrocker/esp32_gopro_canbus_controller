@@ -1,3 +1,33 @@
+/**
+ * @file gatt.c
+ * @brief OpenGoPro GATT service discovery, MTU negotiation, and CCCD subscription.
+ *
+ * After BLE encryption is established (on_encrypted callback), this file:
+ *  1. Negotiates ATT MTU to BLE_ATT_MTU_MAX (527) for large GPBS payloads.
+ *  2. Discovers all OpenGoPro GATT services and characteristics (GP-0072 through
+ *     GP-0092) using ble_gattc_disc_all_svcs / ble_gattc_disc_all_chrs.
+ *  3. Subscribes to all notification/indication CCCDs.
+ *  4. On completion, calls camera_manager_set_gatt_ready(slot, true) and triggers:
+ *       - control_send_set_date_time()   (if UTC is available)
+ *       - gopro_query_send_hw_info()     (populates model name in camera_manager)
+ *       - gopro_presets_request_video()  (Phase 1 of the Video preset flow)
+ *
+ * OpenGoPro UUIDs discovered
+ * --------------------------
+ *  GP-0072  cmd_write             (command write)
+ *  GP-0073  cmd_resp_notify       (command response notifications)
+ *  GP-0074  settings_write        (settings write / keep-alive)
+ *  GP-0075  settings_resp_notify  (settings response notifications)
+ *  GP-0076  query_write           (query write)
+ *  GP-0077  query_resp_notify     (query response notifications)
+ *  GP-0091  net_mgmt_cmd_write    (network management command)
+ *  GP-0092  net_mgmt_resp_notify  (network management response)
+ *  GP-0002  wifi_ssid_read        (Wi-Fi AP SSID — read only)
+ *  GP-0003  wifi_pass_read        (Wi-Fi AP password — read only)
+ *  GP-0001  wifi_power_write      (Wi-Fi AP power control)
+ *  GP-0004  wifi_state_indicate   (Wi-Fi AP state indications)
+ */
+
 #include "open_gopro_ble_internal.h"
 
 #include <string.h>

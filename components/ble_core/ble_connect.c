@@ -1,3 +1,23 @@
+/**
+ * @file ble_connect.c
+ * @brief BLE connection event handler — connection, encryption, and disconnect.
+ *
+ * Handles all BLE_GAP_EVENT_CONNECT and related events from the NimBLE stack:
+ *
+ *  BLE_GAP_EVENT_CONNECT (success):
+ *    Stores the connection handle and initiates encryption (ble_gap_security_initiate).
+ *    The upper layer (open_gopro_ble/pairing.c) is notified via on_connected.
+ *
+ *  BLE_GAP_EVENT_ENCRYPT_CHANGE:
+ *    On successful encryption, fires on_encrypted so GATT discovery can begin.
+ *    Failed encryption is logged at WARN; the connection is not dropped.
+ *
+ *  BLE_GAP_EVENT_CONNECT (failure) / BLE_GAP_EVENT_DISCONNECT:
+ *    Fires on_disconnected.  If the peer address is known (is_known_addr returns
+ *    true), restarts the passive background scan so the camera is picked up when
+ *    it next advertises.
+ */
+
 #include "ble_core_internal.h"
 
 #include <string.h>

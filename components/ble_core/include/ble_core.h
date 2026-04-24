@@ -166,11 +166,11 @@ void ble_core_register_callbacks(const ble_core_callbacks_t *cbs);
 void ble_core_init(void);
 
 /**
- * @brief Start a 30-second active discovery scan.
+ * @brief Start a 120-second active discovery scan.
  *
  * All advertisement packets received during the scan are forwarded to the
  * on_disc callback.  Deduplication is disabled so every packet is surfaced.
- * At the end of 30 seconds the scan automatically returns to the passive
+ * At the end of 120 seconds the scan automatically returns to the passive
  * background scan.
  *
  * Safe to call from any task — the request is posted to the NimBLE event queue.

@@ -1,3 +1,20 @@
+/**
+ * @file ble_init.c
+ * @brief NimBLE stack initialisation and on_sync boot reconnect.
+ *
+ * Calls nimble_port_init(), configures the security manager for bonding (Just
+ * Works / no I/O capability), and launches the NimBLE host task.
+ *
+ * The on_sync callback fires once the NimBLE stack is ready.  It:
+ *  1. Iterates all stored NimBLE bonds.
+ *  2. For each bonded address where is_known_addr() returns true, calls
+ *     ble_core_connect_by_addr() to initiate a reconnect.
+ *  3. If any bonded cameras are not yet connected, starts a passive background
+ *     scan to catch cameras that begin advertising after boot.
+ *  4. If has_disconnected_cameras() returns false (all cameras connected), or
+ *     if no cameras are paired, the background scan is suppressed.
+ */
+
 #include "ble_core_internal.h"
 
 #include <string.h>
@@ -84,7 +101,11 @@ void ble_core_init(void)
     ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
-    ble_svc_gap_device_name_set("ESP32 Controller");
+    ble_svc_gap_init();
+
+    /* Set the default device name. */
+    rc = ble_svc_gap_device_name_set("ESP32 Controller");
+    assert(rc == 0);
 
     nimble_port_freertos_init(ble_host_task);
 

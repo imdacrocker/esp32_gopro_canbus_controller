@@ -1,6 +1,6 @@
 # ESP32 GoPro CAN Bus Controller
 
-This project is currently in a working prrof-of-concept phase!  The project has been tested against a GoPro Hero13 black, but currently no more than that.
+This project is currently in a working proof-of-concept phase. It has been tested against a GoPro Hero13 Black (OpenGoPro BLE) and a GoPro Hero4 (legacy Wi-Fi control).
 
 
 An ESP32-S3 firmware that bridges GoPro cameras (controlled over BLE) with a [RaceCapture](https://autosportlabs.com/racecapture/) data logger (connected over CAN bus). When RaceCapture starts logging, all paired GoPro cameras start recording automatically. Camera connection status is broadcast back to RaceCapture in real time.
@@ -19,6 +19,7 @@ A companion Wi-Fi web interface lets you pair and manage cameras, monitor live r
 - [Building and Flashing](#building-and-flashing)
 - [Configuration](#configuration)
 - [First-Run: Pairing Cameras](#first-run-pairing-cameras)
+- [First-Run: Adding Legacy Wi-Fi Cameras (Hero4)](#first-run-adding-legacy-wi-fi-cameras-hero4)
 - [CAN Bus Wiring](#can-bus-wiring)
 - [Troubleshooting](#troubleshooting)
 - [Project Structure](#project-structure)
@@ -66,32 +67,26 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 │  (slot state,   │◄───────────►│  (TWAI node,    │
 │   NVS persist,  │  state CB   │   0x600 RX,     │
 │   tick timer)   │             │   0x601 TX 5Hz, │
-└────────┬────────┘             │   0x602 RX UTC) │
-         │                      └─────────────────┘
-         │ driver vtable
-         ▼
-┌─────────────────┐
-│ open_gopro_ble  │
-│  (OpenGoPro     │
-│   BLE protocol, │
-│   GATT handles, │
-│   status poll,  │
-│   keep-alive)   │
-└────────┬────────┘
-         │ BLE callbacks
-         ▼
-┌─────────────────┐
-│    ble_core     │
-│  (NimBLE stack, │
-│   scan, connect,│
-│   bond store)   │
-└─────────────────┘
-
-┌─────────────────┐
-│  wifi_manager   │
-│  (Soft-AP,      │
-│   HTTP server,  │
-│   embedded UI)  │
+└──────┬──────────┘             │   0x602 RX UTC) │
+       │                        └─────────────────┘
+       │ driver vtable
+       ├──────────────────────────────┐
+       ▼                              ▼
+┌─────────────────┐          ┌─────────────────┐
+│ open_gopro_ble  │          │  legacy_gopro   │
+│  (OpenGoPro     │          │  (Hero4 Wi-Fi   │
+│   BLE protocol, │          │   HTTP/UDP,     │
+│   GATT handles, │          │   keepalive,    │
+│   status poll,  │          │   NVS persist)  │
+│   keep-alive)   │          └────────┬────────┘
+└────────┬────────┘                   │ station events
+         │ BLE callbacks              ▼
+         ▼                   ┌─────────────────┐
+┌─────────────────┐          │  wifi_manager   │
+│    ble_core     │          │  (Soft-AP,      │
+│  (NimBLE stack, │          │   HTTP server,  │
+│   scan, connect,│          │   embedded UI)  │
+│   bond store)   │          └─────────────────┘
 └─────────────────┘
 ```
 
@@ -163,9 +158,10 @@ The flag is RAM-only and never stored in NVS.
 |-----------|---------|
 | `ble_core` | NimBLE stack wrapper. Owns scan, connect, encrypt, GATT write, and bond management. Camera-agnostic. |
 | `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). The camera is considered ready as soon as CCCD subscriptions complete — no polling loop is needed. `GetHardwareInfo` is sent automatically after every GATT setup to populate the camera's model name (e.g. `"HERO12 Black"`) in `camera_slot_info_t`. A two-phase preset flow runs on every connection to switch the camera to Video mode: Phase 1 sends `RequestGetPresetStatus` (Protobuf, GP-0076); Phase 2 parses the `NotifyPresetStatus` response on GP-0077 and sends `Load Preset` (TLV 0x40, GP-0072) for the first Video-group preset found. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
-| `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. Owns the RAM-only `automatic_camera_control` flag that gates CAN-driven recording. |
+| `legacy_gopro` | Legacy GoPro (Hero4) Wi-Fi driver. Cameras connect to the controller's Soft-AP and are discovered via `/api/legacy/discovered`. When the user adds a camera, the component probes it over HTTP, registers it with `camera_manager`, and saves its MAC and IP to NVS for automatic reconnection on future boots. Shutter commands are sent as a single UDP broadcast to `255.255.255.255:8484` for simultaneous start across all cameras. Keepalives (ASCII RC-remote format) and recording-status polls run every 2 seconds per connected camera. Provides a `camera_driver_t` vtable to `camera_manager`. |
+| `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. Owns the RAM-only `automatic_camera_control` flag that gates CAN-driven recording. Supports multiple driver types via the `camera_driver_t` vtable — both `open_gopro_ble` and `legacy_gopro` register themselves here. |
 | `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` (isLogging) and `0x602` (UTC timestamp) frames; broadcasts `0x601` camera status at 5 Hz. Exposes `can_manager_get_utc_ms()` for on-demand UTC retrieval with monotonic-clock extrapolation. Thread-safe. |
-| `wifi_manager` | Soft-AP + HTTP server. Serves the embedded web UI and all `/api/*` endpoints. |
+| `wifi_manager` | Soft-AP + HTTP server. Serves the embedded web UI and all `/api/*` endpoints, including the `/api/legacy/*` sub-tree for managing Hero4 cameras. Owns the connected-station table and notifies `legacy_gopro` of L2 association and DHCP events. |
 
 ---
 
@@ -256,9 +252,17 @@ All user-configurable values are defined as compile-time constants in the releva
 |-------|--------|-------------|
 | `CAMERA_MAX_SLOTS` | `CONFIG_BT_NIMBLE_MAX_BONDS` | Maximum paired cameras. Tied to NimBLE bond store limit. Increase by raising `BT_NIMBLE_MAX_BONDS` in `sdkconfig.defaults`. |
 
+### Legacy GoPro Wi-Fi (`components/legacy_gopro/include/legacy_gopro_internal.h`)
+
+| Macro | Default | Description |
+|-------|---------|-------------|
+| `LEGACY_MAX_CAMERAS` | `4` | Maximum Hero4 cameras managed simultaneously. |
+
+UDP port numbers and keepalive/shutter packet formats are compile-time constants in `legacy_gopro_internal.h`. They match the Hero4 RC-remote protocol and should not need to be changed.
+
 ### Wi-Fi (`components/wifi_manager/wifi_manager.c`)
 
-The AP IP address (`10.71.79.1`) and channel (`1`) are compile-time constants in `wifi_manager.c`. The SSID is generated at runtime from the last 3 bytes of the AP MAC: `HERO-RC-XXXXXX`.
+The AP IP address (`10.71.79.1`) and channel are compile-time constants in `wifi_manager.c`. The SSID is generated at runtime from the last 3 bytes of the AP MAC: `HERO-RC-XXXXXX`. The DHCP pool is `10.71.79.2–10.71.79.50`; cameras request their previously-assigned address via DHCP option 50, so addresses are naturally stable across reconnects.
 
 ---
 
@@ -278,6 +282,26 @@ Cameras are paired via the built-in web interface. You do **not** need to use th
 Paired cameras are stored in NVS and reconnect automatically every time the controller boots — you only need to pair once.
 
 To remove a camera, tap **+ Add / Manage Cameras** to open the modal and tap the **✕** button next to the camera in the **Paired Cameras** list. The camera is immediately disconnected and its pairing is erased. It will need to be re-paired before it can reconnect.
+
+---
+
+## First-Run: Adding Legacy Wi-Fi Cameras (Hero4)
+
+Older GoPros (e.g. Hero4) that do not support BLE connect to the controller's Soft-AP and are managed via the web UI's **Legacy Cameras** section. No BLE pairing is required.
+
+1. Power on the controller and connect your phone or laptop to `HERO-RC-XXXXXX`.
+2. Open `http://10.71.79.1` in a browser.
+3. Power on the Hero4 and put it in **RC Mode** (Connections → RC). The camera broadcasts its own Wi-Fi AP with an SSID matching `HERO4...` — the controller's AP will take precedence once the camera associates.
+4. Wait a few seconds for the camera to connect to the controller's Soft-AP and obtain a DHCP address.
+5. In the web UI, scroll to the **Legacy Cameras** section and tap **Refresh**. The camera's MAC and IP address will appear in the **Discovered** list.
+6. Tap **Add** next to the camera. The controller probes the device via HTTP to confirm it is a Hero4. This takes up to 15 seconds.
+7. On success, the camera disappears from the Discovered list and appears in the **Camera Status** section with status **Not recording**. If it remains in the Discovered list after 15 seconds, the probe failed (wrong device or network issue).
+
+The camera's MAC and last-known IP are saved to NVS. On subsequent boots, if the camera connects to the AP and the probe succeeds at the saved IP, it is automatically promoted to managed status — no user action required.
+
+To remove a legacy camera, tap the **✕** button in the Camera Status section (or use `POST /api/legacy/remove`). If the camera remains physically connected to the AP, it will reappear in the Discovered list.
+
+> **Note:** The Hero4 RC-remote protocol expects keepalive packets every 2 seconds. If the controller is powered off or reboots, the Hero4 may begin recording on its own — this is normal Hero4 behaviour and is not controllable from the firmware side.
 
 ---
 
@@ -367,6 +391,22 @@ The script broadcasts a 64-bit millisecond Unix epoch timestamp at 25 Hz on CAN 
 - Ensure your device is connected to `HERO-RC-XXXXXX`, not another network.
 - Try `http://10.71.79.1` directly rather than using mDNS.
 
+**Hero4 does not appear in Discovered list**
+- Confirm the Hero4 is in RC Mode (Connections → RC) — this is the mode that makes it connect to an external AP as a station rather than hosting its own AP.
+- Verify the camera is associated: check the serial log for `WIFI_EVENT_AP_STACONNECTED` events.
+- The camera appears in Discovered only after obtaining a DHCP address. Check for `IP_EVENT_ASSIGNED_IP_TO_CLIENT` in the serial log. If no DHCP event fires, the camera may be using a static IP — refresh the list and check if a zero-IP entry is blocking it.
+- The requester's own IP is excluded from the Discovered list, so the phone or laptop loading the UI will not appear even if it is connected to the same AP.
+
+**Hero4 appears in Discovered but Add fails (camera stays in list after 15 s)**
+- The HTTP probe (`GET /gp/gpControl/status`) timed out or received an unexpected response. Check that the IP shown in the Discovered list matches what the camera actually has (DHCP races can cause a brief mismatch).
+- Look for `[legacy_gopro] probe failed` or `[legacy_gopro] HTTP error` in the serial log.
+- Confirm the Hero4 firmware is up to date — very old firmware revisions may not respond to `gpControl` commands.
+
+**Hero4 recording does not start / stop with RaceCapture**
+- Confirm **Automatic Control** is enabled in the web UI.
+- Look for `[legacy_gopro] UDP shutter ON/OFF` in the serial log to confirm the command was sent.
+- The shutter command is a UDP broadcast to `255.255.255.255:8484`. If the camera is not responding, verify keepalives are working: look for `[legacy_gopro] keepalive →` log lines every 2 seconds. Keepalive failure usually means the camera is no longer connected to the AP.
+
 ---
 
 ## Project Structure
@@ -399,4 +439,17 @@ esp32_gopro_canbus_controller/
 │   ├── can_manager/            # CAN bus (TWAI) driver wrapper
 │   │   ├── include/can_manager.h
 │   │   └── can_manager.c
-│   └── wifi_
+│   ├── legacy_gopro/           # Hero4 Wi-Fi HTTP/UDP control driver
+│   │   ├── include/
+│   │   │   ├── legacy_gopro.h          # Public API
+│   │   │   └── legacy_gopro_internal.h # Shared state (not public)
+│   │   ├── legacy_gopro.c      # State machine, NVS, FreeRTOS task, public API
+│   │   └── control.c           # UDP shutter/keepalive/status, HTTP date-time
+│   └── wifi_manager/           # Soft-AP, HTTP server, embedded web UI
+│       ├── include/wifi_manager.h
+│       ├── wifi_manager.c
+│       └── www/
+│           └── index.html      # Single-page management application (embedded in flash)
+├── racecapture_utc_broadcast.lua   # RaceCapture Lua script — broadcasts GPS UTC on 0x602
+├── README.md
+└── API.md

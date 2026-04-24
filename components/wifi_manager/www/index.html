@@ -27,6 +27,7 @@
             position: sticky;
             top: 0;
             z-index: 50;
+            position: relative;
         }
         #page-header h1 {
             font-size: 1.15rem;
@@ -35,6 +36,44 @@
             color: #222;
             margin: 0;
         }
+        #settings-btn {
+            position: absolute;
+            top: 50%; right: 16px;
+            transform: translateY(-50%);
+            background: none; border: none;
+            padding: 6px; cursor: pointer;
+            color: #888; line-height: 0;
+            border-radius: 6px;
+        }
+        #settings-btn:hover { color: #333; background: #f0f0f0; }
+
+        /* ---- Settings modal (slides down from top) ---- */
+        #settings-overlay {
+            position: fixed; inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            z-index: 200;
+            display: flex; align-items: flex-start; justify-content: center;
+        }
+        #settings-overlay.hidden { display: none; }
+        .settings-modal {
+            background: #fff;
+            border-radius: 0 0 12px 12px;
+            width: 100%; max-width: 480px;
+            padding: 0 0 1.5em;
+        }
+        #reset-btn {
+            display: block;
+            width: calc(100% - 32px);
+            margin: 16px 16px 0;
+            border: none; border-radius: 8px;
+            font-size: 0.88rem; font-weight: 700;
+            padding: 14px 18px; min-height: 48px;
+            cursor: pointer;
+            background: #e74c3c; color: #fff;
+            text-align: center;
+        }
+        #reset-btn:hover { background: #c0392b; }
+        #reset-btn:disabled { opacity: 0.5; cursor: default; }
         #status { color: #555; margin: 0.5em 0 1em; min-height: 1.2em; }
 
         /* ---- Camera Status section ---- */
@@ -121,6 +160,24 @@
         .cam-shutter-btn:disabled { background: #e0e0e0; color: #bbb; cursor: default; }
 
         #cam-status-empty { color: #888; font-size: 0.9rem; padding: 1em 14px; display: block; }
+
+        /* ---- Loading spinner (shown before first camera poll resolves) ---- */
+        #cam-status-loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 1.5em 14px;
+        }
+        .spinner {
+            width: 28px; height: 28px;
+            border: 3px solid #e0e0e0;
+            border-top-color: #2980b9;
+            border-radius: 50%;
+            animation: spin 0.75s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
 
         /* ---- Fixed bottom bar ---- */
         #manage-bar {
@@ -381,6 +438,13 @@
 <body>
     <div id="page-header">
         <h1>GoPro CAN-BUS Controller</h1>
+        <button id="settings-btn" onclick="openSettings()" aria-label="Settings">
+            <!-- gear icon -->
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+        </button>
     </div>
 
     <div id="rc-status-section">
@@ -425,11 +489,24 @@
             <button id="stop-btn"  onclick="sendShutter(false)">Stop All</button>
         </div>
 
-        <div id="cam-status-list"><span id="cam-status-empty">No cameras paired.</span></div>
+        <div id="cam-status-list"><div id="cam-status-loading"><div class="spinner"></div></div></div>
     </div>
 
     <div id="manage-bar">
         <button id="manage-btn" onclick="openModal()">+ Add / Manage Cameras</button>
+    </div>
+
+    <!-- ============================================================
+         Settings Modal (top sheet)
+    ============================================================ -->
+    <div id="settings-overlay" class="hidden">
+        <div class="settings-modal">
+            <div class="modal-header">
+                <span class="modal-title">Settings</span>
+                <button class="modal-done-btn" onclick="closeSettings()">Done</button>
+            </div>
+            <button id="reset-btn" onclick="confirmFactoryReset()">Reset Defaults</button>
+        </div>
     </div>
 
     <!-- ============================================================
@@ -476,10 +553,58 @@
     </div>
 
     <script>
+        /* ---- Settings modal ---- */
+
+        function openSettings() {
+            document.getElementById('settings-overlay').classList.remove('hidden');
+        }
+
+        function closeSettings() {
+            document.getElementById('settings-overlay').classList.add('hidden');
+        }
+
+        document.getElementById('settings-overlay').addEventListener('click', function (e) {
+            if (e.target === this) { closeSettings(); }
+        });
+
+        function confirmFactoryReset() {
+            if (!confirm('Restore Defaults?\n\nThis will erase all paired cameras and settings, then restart the controller. This cannot be undone.')) {
+                return;
+            }
+            var btn = document.getElementById('reset-btn');
+            btn.disabled = true;
+            btn.textContent = 'Resetting\u2026';
+
+            fetch('/api/factory-reset', { method: 'POST' })
+                .then(function (r) { return r.json(); })
+                .then(scheduleResetRefresh)
+                .catch(scheduleResetRefresh); /* ESP32 may reboot before response arrives — treat as success */
+        }
+
+        function scheduleResetRefresh() {
+            var btn = document.getElementById('reset-btn');
+            var dots = '.';
+            var ticks = 0;
+
+            function tick() {
+                if (btn) { btn.textContent = 'Rebooting' + dots; }
+                if (ticks >= 5) {
+                    location.reload();
+                    return;
+                }
+                ticks++;
+                dots = dots + '.';
+                setTimeout(tick, 1000);
+            }
+            tick();
+        }
+
         var pollTimer              = null;
         var countdownTimer         = null;
         var scanning               = false;
         var modalPairedRefreshTimer = null;
+        var cameraStatusLoaded     = false;  /* true after first successful /api/paired-cameras response */
+        var shutterLocked          = {};     /* slot → true while the 5 s post-command lockout is active */
         /* Mirrors the firmware's auto-control flag.  true = firmware boot default.
          * Updated on every /api/auto-control poll and on manual toggle. */
         var autoControlEnabled = true;
@@ -773,6 +898,18 @@
             fetch('/api/paired-cameras')
                 .then(function (r) { return r.json(); })
                 .then(function (cameras) {
+                    cameraStatusLoaded = true;
+
+                    /* Early-unlock: if a camera already reached its expected state,
+                     * clear the 5 s hold so the button re-enables on this render. */
+                    cameras.forEach(function (cam) {
+                        var lock = shutterLocked[cam.slot];
+                        if (lock && cam.status === lock.expectedStatus) {
+                            clearTimeout(lock.timer);
+                            delete shutterLocked[cam.slot];
+                        }
+                    });
+
                     var list = document.getElementById('cam-status-list');
                     if (cameras.length === 0) {
                         list.innerHTML = '<span id="cam-status-empty">No cameras paired.</span>';
@@ -807,11 +944,13 @@
                         if (!autoControlEnabled && cam.status === 'not_recording') {
                             btn = '<button id="cam-shutter-' + cam.slot + '"'
                                 + ' class="cam-shutter-btn cam-shutter-start"'
+                                + (shutterLocked[cam.slot] ? ' disabled' : '')
                                 + ' onclick="setCameraRecording(' + cam.slot + ',true)">'
                                 + 'Record</button>';
                         } else if (!autoControlEnabled && cam.status === 'recording') {
                             btn = '<button id="cam-shutter-' + cam.slot + '"'
                                 + ' class="cam-shutter-btn cam-shutter-stop"'
+                                + (shutterLocked[cam.slot] ? ' disabled' : '')
                                 + ' onclick="setCameraRecording(' + cam.slot + ',false)">'
                                 + 'Stop</button>';
                         }
@@ -832,7 +971,14 @@
                     });
                     list.innerHTML = html;
                 })
-                .catch(function () {});
+                .catch(function () {
+                    /* On error, stop showing the spinner so the user isn't left hanging */
+                    if (!cameraStatusLoaded) {
+                        cameraStatusLoaded = true;
+                        var list = document.getElementById('cam-status-list');
+                        list.innerHTML = '<span id="cam-status-empty">No cameras paired.</span>';
+                    }
+                });
         }
 
         refreshCameraStatus();
@@ -1042,10 +1188,15 @@
         /* ---- Per-camera shutter toggle ---- */
 
         function setCameraRecording(slot, on) {
-            /* Disable immediately — stays disabled until the next refreshCameraStatus()
-             * re-renders the list, which naturally produces a fresh enabled button. */
+            /* Disable immediately.  Hold for up to 5 s so a missed/slow camera
+             * doesn't flip the button back too early.  If refreshCameraStatus()
+             * sees the camera reach the expected state before the timer fires it
+             * will clear the lock immediately. */
             var btn = document.getElementById('cam-shutter-' + slot);
             if (btn) { btn.disabled = true; }
+            var expectedStatus = on ? 'recording' : 'not_recording';
+            var timer = setTimeout(function () { delete shutterLocked[slot]; }, 5000);
+            shutterLocked[slot] = { expectedStatus: expectedStatus, timer: timer };
 
             fetch('/api/shutter', {
                 method:  'POST',

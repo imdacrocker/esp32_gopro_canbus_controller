@@ -1,3 +1,29 @@
+/**
+ * @file notify.c
+ * @brief OpenGoPro ATT notification router.
+ *
+ * All incoming ATT notifications from connected cameras arrive here via
+ * ble_core's on_notify_rx callback.  The router determines which characteristic
+ * sent the notification by comparing the attribute handle against the per-camera
+ * handle table, then dispatches to the appropriate handler:
+ *
+ *  GP-0073 (cmd_resp_notify)   → gopro_query_handle_cmd_response()   (query.c)
+ *    Handles: SetShutter (0x01), SetDateTime (0x0D), Load Preset (0x40),
+ *             GetHardwareInfo (0x3C) responses.
+ *
+ *  GP-0075 (settings_resp_notify) → logged / ignored (keep-alive ACKs)
+ *
+ *  GP-0077 (query_resp_notify)  → gopro_presets_handle_*() (presets.c) or
+ *                                  gopro_query_handle_query_response() (query.c)
+ *    Routing on GP-0077 is based on GPBS frame type and Feature ID:
+ *    - Continuation fragment (frame_type ≥ 2): always to presets.c fragment handler.
+ *    - First fragment (frame_type = 1, Feature 0xF5): presets.c reassembly start.
+ *    - Single packet (frame_type = 0, Feature 0xF5, Action 0xF2): presets.c handler.
+ *    - Single packet (frame_type = 0, Feature 0x3C): query.c hw_info response.
+ *
+ *  GP-0092 (net_mgmt_resp_notify) → logged / not currently used.
+ */
+
 #include "open_gopro_ble_internal.h"
 
 #include <string.h>
