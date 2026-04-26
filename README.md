@@ -109,7 +109,6 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 3. `can_manager_get_utc_ms()` extrapolates the stored epoch forward using elapsed monotonic time, so callers always get a current estimate regardless of when the last CAN frame arrived.
 4. After CCCD subscriptions complete, `gatt.c` hands off to `readiness.c`, which polls `GetHardwareInfo` until the camera returns status 0. Once the camera is ready, `readiness.c` runs the post-ready sequence:
    - `control_send_set_date_time()` — sets the camera's clock (see paths below).
-   - `control_send_pairing_complete()` — dismissed the camera's pairing screen (first pairing only).
    - `gopro_presets_request_video()` — Phase 1 of the Video preset flow.
    The `GetHardwareInfo` response also carries the camera's model name, firmware version, and serial number; the model name is stored via `camera_manager_set_model_name()` and is available through `camera_slot_info_t.model_name` for display in the web UI.
 

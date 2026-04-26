@@ -122,62 +122,6 @@ camera_recording_status_t control_get_recording_status(void *ctx)
 }
 
 /* -------------------------------------------------------------------------
- * Pairing complete — sent once after initial pairing to dismiss the camera UI
- * ------------------------------------------------------------------------- */
-
-/*
- * RequestPairingFinish packet — written to GP-0091 (net_mgmt_cmd_write).
- *
- * GPBS framing for a short Network Management command:
- *   Byte 0: 0x04  — GPBS single-packet length (4 bytes follow)
- *   Byte 1: 0x03  — Feature ID (Network Management)
- *   Byte 2: 0x01  — Action ID  (Set Pairing State / RequestPairingFinish)
- *
- * Protobuf payload for RequestPairingFinish { pairing_state = COMPLETED(2) }:
- *   Byte 3: 0x08  — field 1, wiretype 0 (varint)
- *   Byte 4: 0x02  — EnumPairingState.PAIRING_STATE_COMPLETED
- *
- * The response arrives on GP-0092 (net_mgmt_resp_notify) as ResponseGeneric.
- * This is fire-and-forget; the response is not awaited.
- *
- * IMPORTANT: this function uses ble_gattc_write_no_rsp_flat() directly (not
- * the ble_core event-queue path) so the PDU is submitted to the BLE
- * controller immediately.  It must therefore only be called from the NimBLE
- * host task — i.e. from within a GATT callback such as start_cccd_subscriptions().
- * This guarantees the pairing-finish PDU reaches the camera before the first
- * CCCD write, preventing the camera from resetting CCCD state mid-subscription.
- */
-static const uint8_t k_pairing_complete_pkt[] = { 0x04, 0x03, 0x01, 0x08, 0x02 };
-
-void control_send_pairing_complete(uint16_t conn_handle)
-{
-    int slot = camera_manager_find_by_handle(conn_handle);
-    if (slot < 0) {
-        ESP_LOGW(TAG, "pairing_complete: no slot for handle %d", conn_handle);
-        return;
-    }
-
-    gopro_ble_ctx_t *ctx = (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
-    if (!ctx || ctx->gatt.net_mgmt_cmd_write == 0) {
-        ESP_LOGW(TAG, "pairing_complete: net_mgmt_cmd_write not available for slot %d", slot);
-        return;
-    }
-
-    /* Use write_no_rsp_flat directly so the ATT PDU is queued to the BLE
-     * controller synchronously, before the caller proceeds to write CCCDs. */
-    int rc = ble_gattc_write_no_rsp_flat(conn_handle, ctx->gatt.net_mgmt_cmd_write,
-                                          k_pairing_complete_pkt,
-                                          sizeof(k_pairing_complete_pkt));
-    if (rc != 0) {
-        ESP_LOGW(TAG, "slot %d: RequestPairingFinish write failed (rc=%d)", slot, rc);
-    } else {
-        ESP_LOGI(TAG, "slot %d: RequestPairingFinish sent (pairing screen dismissed)", slot);
-    }
-
-    ctx->is_first_pairing = false;
-}
-
-/* -------------------------------------------------------------------------
  * Set Date/Time — sent once per connection after GATT setup completes
  * ------------------------------------------------------------------------- */
 

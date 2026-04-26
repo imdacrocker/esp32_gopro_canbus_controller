@@ -865,7 +865,7 @@ If UTC is not yet available when `control_send_set_date_time()` is called (e.g. 
 
 **Video Preset Loading (two-phase flow)**
 
-Initiated automatically by `readiness.c` when the readiness poll succeeds (status 0 from `GetHardwareInfo`), on every connection (first pairing and all reconnections), alongside `SetDateTime` and `RequestPairingFinish`.
+Initiated automatically by `readiness.c` when the readiness poll succeeds (status 0 from `GetHardwareInfo`), on every connection, alongside `SetDateTime`.
 
 *Phase 1 — `gopro_presets_request_video()` (`presets.c`)*
 
@@ -919,7 +919,7 @@ This makes it possible to determine whether the camera actually accepted the rec
 
 The response arrives on `cmd_resp_notify` (GP-0073). `notify.c` routes this characteristic's notifications before the camera-ready gate (so responses arrive even before `camera_manager_set_camera_ready()` has been called). `gopro_query_handle_cmd_response()` extracts the status byte from the response and forwards it to `gopro_readiness_handle_hw_info_status()` in `readiness.c`:
 
-- **Status `0x00` (success):** camera is ready. `readiness.c` calls `gopro_on_camera_ready()`, which sets the camera-ready flag, sends `SetDateTime`, sends `RequestPairingFinish` (first pairing only), and requests the Video preset.
+- **Status `0x00` (success):** camera is ready. `readiness.c` calls `gopro_on_camera_ready()`, which sets the camera-ready flag, sends `SetDateTime`, and requests the Video preset.
 - **Status `0x02` (camera busy / not ready):** `readiness.c` increments the retry counter and re-sends after 3 seconds.
 - **Any other non-zero status:** treated the same as `0x02` — retry.
 - **Timeout (no response within 3 s):** the `esp_timer` one-shot fires `readiness_timeout_cb()`, which re-sends the command and rearms the timer.

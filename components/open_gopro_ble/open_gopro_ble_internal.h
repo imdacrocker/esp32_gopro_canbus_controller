@@ -14,10 +14,6 @@ typedef struct {
     uint16_t                  conn_handle;
     gopro_gatt_handles_t      gatt;
     camera_recording_status_t recording_status;
-    /** True only on the very first pairing of this camera (slot was unknown
-     *  when gopro_on_encrypted_cb fired).  Cleared after RequestPairingFinish
-     *  is sent in control_send_pairing_complete(). */
-    bool                      is_first_pairing;
     /** True while the readiness poll (GetHardwareInfo loop) is in progress.
      *  Set by gopro_start_readiness_poll(); cleared when camera becomes ready
      *  or the retry limit is reached. */
@@ -47,7 +43,7 @@ typedef struct {
      *  after GetHardwareInfo succeeds.  Set by gopro_on_camera_ready();
      *  cleared when the ResponseGeneric arrives on cmd_resp_notify or when
      *  the timeout fires.  While this flag is set the rest of the connection
-     *  sequence (SetDateTime, PairingFinish, VideoPreset) is held back. */
+     *  sequence (SetDateTime, VideoPreset) is held back. */
     bool                      camera_control_pending;
     /** One-shot timer for the SetCameraControlStatus response timeout.
      *  NULL until first send.  Stopped on response; deleted on disconnect. */
@@ -134,14 +130,6 @@ void gopro_query_free(uint16_t conn_handle);
  * open_gopro_control_start_timers()  Start the status-poll and keep-alive
  *                                    timers.  Called once from
  *                                    open_gopro_ble_init() in driver.c.
- *
- * control_send_pairing_complete()    Send RequestPairingFinish to dismiss the
- *                                    camera's pairing screen.  Must be called
- *                                    only on first-time pairing, after GATT
- *                                    char discovery (net_mgmt_cmd_write must
- *                                    be populated) but before CCCD subscriptions
- *                                    start.  Fire-and-forget; response on
- *                                    GP-0092 is not awaited.
  * ------------------------------------------------------------------------- */
 
 esp_err_t control_start_recording(void *ctx);
@@ -149,7 +137,6 @@ esp_err_t control_stop_recording(void *ctx);
 camera_recording_status_t control_get_recording_status(void *ctx);
 
 void open_gopro_control_start_timers(void);
-void control_send_pairing_complete(uint16_t conn_handle);
 
 /**
  * Send SetCameraControlStatus (EXTERNAL) to GP-0072.

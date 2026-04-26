@@ -62,13 +62,6 @@ void gopro_on_encrypted_cb(uint16_t conn_handle, const ble_addr_t *addr)
             return;
         }
 
-        /* Mark as first-time pairing so control_send_pairing_complete() fires
-         * later in the GATT flow (after char discovery, before CCCD setup). */
-        gopro_ble_ctx_t *new_ctx = (gopro_ble_ctx_t *)driver_ctx;
-        if (new_ctx) {
-            new_ctx->is_first_pairing = true;
-        }
-
         camera_manager_save_slot(slot);
         ESP_LOGI(TAG, "Registered new camera in slot %d (%s)", slot, name);
     }
