@@ -55,7 +55,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "nvs_flash.h"
-#include "nvs.h"
 #include "open_gopro_ble.h"
 #include "camera_manager.h"
 #include "ble_core.h"
@@ -147,60 +146,6 @@ int wifi_manager_get_connected_stations(wifi_mgr_sta_info_t *out, int max_count)
  * beacon is on air. */
 static EventGroupHandle_t s_ap_event_group = NULL;
 
-/* ============================================================
- * Persistent Device Settings
- *
- * Stored in NVS namespace "settings".  Loaded once at init;
- * reset to defaults by factory-reset (nvs_flash_erase).
- * ============================================================ */
-
-/* UTC offset in whole hours (-12 … +14).  Default: -8 (US Pacific Standard).
- * Written by POST /api/settings/timezone; read by api_utc_handler to produce
- * an offset-adjusted epoch_ms for both web display and camera time-setting. */
-static int8_t s_tz_offset_hours = -8;
-
-#define SETTINGS_NVS_NS  "settings"
-#define SETTINGS_TZ_KEY  "tz_offset"
-
-static void load_settings(void)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(SETTINGS_NVS_NS, NVS_READONLY, &handle);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "Settings namespace absent — using defaults (tz=%d h)", (int)s_tz_offset_hours);
-        return;
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "load_settings: nvs_open failed: %s", esp_err_to_name(err));
-        return;
-    }
-    int8_t offset;
-    err = nvs_get_i8(handle, SETTINGS_TZ_KEY, &offset);
-    if (err == ESP_OK) {
-        s_tz_offset_hours = offset;
-    }
-    nvs_close(handle);
-    ESP_LOGI(TAG, "Settings loaded: tz_offset_hours=%d", (int)s_tz_offset_hours);
-}
-
-static esp_err_t save_tz_offset(int8_t offset)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(SETTINGS_NVS_NS, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "save_tz_offset: nvs_open failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    err = nvs_set_i8(handle, SETTINGS_TZ_KEY, offset);
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    nvs_close(handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "save_tz_offset: write failed: %s", esp_err_to_name(err));
-    }
-    return err;
-}
 
 /* Symbols injected by the build system from www/index.html */
 extern const char index_html_start[] asm("_binary_index_html_start");
@@ -620,11 +565,10 @@ static esp_err_t api_utc_handler(httpd_req_t *req)
 
     char buf[64];
     if (valid) {
-        /* Shift the epoch by the stored timezone offset so callers (web UI,
-         * camera time-setting) receive local time rather than raw UTC.
-         * Casting to int64_t for the subtraction prevents unsigned underflow
-         * when the offset is negative. */
-        int64_t offset_ms  = (int64_t)s_tz_offset_hours * 3600LL * 1000LL;
+        /* Shift the epoch by the stored timezone offset so the web UI receives
+         * local time rather than raw UTC.  Casting through int64_t prevents
+         * unsigned underflow when the offset is negative. */
+        int64_t offset_ms  = (int64_t)can_manager_get_tz_offset_hours() * 3600LL * 1000LL;
         uint64_t local_ms  = (uint64_t)((int64_t)epoch_ms + offset_ms);
         snprintf(buf, sizeof(buf), "{\"valid\":true,\"epoch_ms\":%llu}", local_ms);
     } else {
@@ -648,7 +592,7 @@ static const httpd_uri_t api_utc_uri = {
 static esp_err_t api_settings_tz_get_handler(httpd_req_t *req)
 {
     char buf[32];
-    snprintf(buf, sizeof(buf), "{\"tz_offset_hours\":%d}", (int)s_tz_offset_hours);
+    snprintf(buf, sizeof(buf), "{\"tz_offset_hours\":%d}", (int)can_manager_get_tz_offset_hours());
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
@@ -689,12 +633,12 @@ static esp_err_t api_settings_tz_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    s_tz_offset_hours = (int8_t)offset;
-    save_tz_offset(s_tz_offset_hours);
-    ESP_LOGI(TAG, "Timezone offset updated to %d h", (int)s_tz_offset_hours);
+    /* Delegate storage and persistence to can_manager, which is the
+     * authoritative holder of the timezone offset across all components. */
+    can_manager_set_tz_offset((int8_t)offset);
 
     char buf[32];
-    snprintf(buf, sizeof(buf), "{\"tz_offset_hours\":%d}", (int)s_tz_offset_hours);
+    snprintf(buf, sizeof(buf), "{\"tz_offset_hours\":%d}", (int)can_manager_get_tz_offset_hours());
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
@@ -1116,11 +1060,6 @@ static void start_http_server(void)
 
 void wifi_manager_init(void)
 {
-    /* Load persisted device settings from NVS before anything else so that
-     * s_tz_offset_hours is correct before the HTTP server handles its first
-     * /api/utc request. */
-    load_settings();
-
     s_ap_event_group = xEventGroupCreate();
     configASSERT(s_ap_event_group);
 

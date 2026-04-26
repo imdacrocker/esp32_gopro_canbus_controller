@@ -27,6 +27,9 @@ This document covers all three API layers of the ESP32 GoPro CAN Bus Controller:
 | `POST` | `/api/legacy/add` | Probe and add a Hero4 as a managed camera |
 | `POST` | `/api/legacy/remove` | Remove a managed legacy camera |
 | `POST` | `/api/factory-reset` | Erase all NVS data and reboot |
+| `POST` | `/api/reboot` | Reboot without erasing NVS |
+| `GET` | `/api/settings/timezone` | Read the stored UTC timezone offset |
+| `POST` | `/api/settings/timezone` | Set and persist the UTC timezone offset |
 
 ---
 
@@ -305,12 +308,14 @@ Returns the current RaceCapture logging state as last reported on CAN ID `0x600`
 
 ### `GET /api/utc`
 
-Returns the current best-estimate UTC derived from the RaceCapture GPS clock broadcast on CAN ID `0x602`. The ESP32 extrapolates forward from the last received frame using its monotonic timer (`esp_timer_get_time`), so sub-second accuracy is maintained between CAN frames.
+Returns the current best-estimate time derived from the RaceCapture GPS clock broadcast on CAN ID `0x602`, adjusted by the stored timezone offset. The ESP32 extrapolates forward from the last received frame using its monotonic timer (`esp_timer_get_time`), so sub-second accuracy is maintained between CAN frames.
+
+> **Important:** `epoch_ms` is **not** raw UTC. The firmware adds the stored timezone offset (see `GET /api/settings/timezone`) before returning the value, so `epoch_ms` represents local time in milliseconds. The web UI treats it as such — it uses JavaScript's `Date.prototype.getUTC*()` methods (which interpret the value literally) to display local date and time. If you need raw UTC, subtract `tz_offset_hours × 3 600 000` from the returned value.
 
 **Response — GPS lock acquired:**
 
 ```json
-{ "valid": true, "epoch_ms": 1744727527412 }
+{ "valid": true, "epoch_ms": 1744698727412 }
 ```
 
 **Response — GPS lock not yet acquired:**
@@ -322,7 +327,7 @@ Returns the current best-estimate UTC derived from the RaceCapture GPS clock bro
 | Field | Type | Description |
 |-------|------|-------------|
 | `valid` | boolean | `true` if a valid `0x602` frame has been received (year > 2020). |
-| `epoch_ms` | integer | Milliseconds since Unix epoch (only present when `valid` is `true`). |
+| `epoch_ms` | integer | Current local time as a millisecond-precision Unix-style epoch (UTC + timezone offset). Only present when `valid` is `true`. |
 
 ---
 
@@ -480,7 +485,7 @@ Removes a managed legacy camera. Unregisters the camera from `camera_manager`, f
 
 ### `POST /api/factory-reset`
 
-Erases all NVS partitions (paired cameras, legacy camera records, all stored settings) and reboots the ESP32. **This is irreversible.** All paired BLE cameras and managed legacy cameras must be re-added after a factory reset.
+Erases all NVS partitions (paired cameras, legacy camera records, timezone offset, and all other stored settings) and reboots the ESP32. **This is irreversible.** All paired BLE cameras and managed legacy cameras must be re-added after a factory reset, and the timezone offset resets to the firmware default (UTC−8).
 
 The HTTP response is flushed before the erase begins so the caller receives a confirmation before the device goes offline.
 
@@ -493,6 +498,75 @@ The HTTP response is flushed before the erase begins so the caller receives a co
 ```
 
 The device will be unreachable for approximately 5–10 seconds while it restarts and the AP reinitialises.
+
+---
+
+### `POST /api/reboot`
+
+Reboots the ESP32 without erasing NVS. Paired cameras, legacy camera records, timezone offset, and all other stored settings are preserved.
+
+The HTTP response is flushed before the restart so the caller receives a confirmation before the device goes offline.
+
+**Request body:** none
+
+**Response** (received before the device reboots):
+
+```json
+{ "status": "rebooting" }
+```
+
+The device will be unreachable for approximately 5–10 seconds while it restarts and the AP reinitialises.
+
+---
+
+### `GET /api/settings/timezone`
+
+Returns the currently stored UTC timezone offset.
+
+**Response**
+
+```json
+{ "tz_offset_hours": -8 }
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tz_offset_hours` | integer | UTC offset in whole hours, range `[-12, 14]`. Default: `−8` (US Pacific Standard Time). |
+
+---
+
+### `POST /api/settings/timezone`
+
+Sets and persists the UTC timezone offset. The new value is stored in NVS (namespace `"settings"`, key `"tz_offset"`) and survives reboots. A factory reset restores the default of `−8`.
+
+The offset is applied in two places:
+
+- **`GET /api/utc`** — the returned `epoch_ms` is shifted by the offset so the web UI can display local date and time directly.
+- **Camera `SetDateTime` commands** — both BLE cameras (OpenGoPro `SetDateTime` TLV 0x0D) and legacy Wi-Fi cameras (Hero4 `gpControl` date_time URL) receive local time rather than raw UTC, so video file timestamps reflect the local time zone.
+
+**Request body** (`Content-Type: application/json`):
+
+```json
+{ "tz_offset_hours": -5 }
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tz_offset_hours` | integer | Yes | UTC offset in whole hours. Must be in `[-12, 14]`. |
+
+**Response** — reflects the value that was applied:
+
+```json
+{ "tz_offset_hours": -5 }
+```
+
+**Error responses**
+
+| HTTP status | Body | Cause |
+|-------------|------|-------|
+| 400 | `Empty body` | Request body was missing. |
+| 400 | `Missing tz_offset_hours` | JSON field `"tz_offset_hours"` was not found. |
+| 400 | `tz_offset_hours out of range [-12,14]` | Value was outside the valid range. |
 
 ---
 

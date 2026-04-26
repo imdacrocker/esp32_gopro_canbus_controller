@@ -41,6 +41,8 @@
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 #include "hal/twai_types.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "can_manager";
 
@@ -93,6 +95,58 @@ static SemaphoreHandle_t s_utc_mutex   = NULL;
 static volatile bool     s_utc_valid   = false;  /* true once first good frame received */
 static uint64_t          s_utc_ms      = 0;       /* epoch ms from last 0x602 frame      */
 static int64_t           s_utc_rx_tick = 0;       /* esp_timer_get_time() at last RX (µs)*/
+
+/* ============================================================
+ * Timezone offset — stored in NVS, applied when setting camera clocks
+ *
+ * Kept here (rather than wifi_manager) so that open_gopro_ble and
+ * legacy_gopro can read the value without creating a circular
+ * component dependency on wifi_manager.
+ *
+ * NVS namespace: "settings"   key: "tz_offset"   type: int8_t
+ * Default: -8 (UTC-8 / US Pacific Standard Time).
+ * Reset: nvs_flash_erase() (factory reset) restores the default.
+ * ============================================================ */
+
+#define TZ_NVS_NS   "settings"
+#define TZ_NVS_KEY  "tz_offset"
+
+static int8_t s_tz_offset_hours = -8;
+
+static void tz_load_from_nvs(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TZ_NVS_NS, NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "TZ settings namespace absent — using default (%d h)", (int)s_tz_offset_hours);
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "tz_load_from_nvs: nvs_open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    int8_t offset;
+    err = nvs_get_i8(h, TZ_NVS_KEY, &offset);
+    if (err == ESP_OK) { s_tz_offset_hours = offset; }
+    nvs_close(h);
+    ESP_LOGI(TAG, "TZ offset loaded from NVS: %d h", (int)s_tz_offset_hours);
+}
+
+static void tz_save_to_nvs(int8_t offset)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TZ_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "tz_save_to_nvs: nvs_open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_i8(h, TZ_NVS_KEY, offset);
+    if (err == ESP_OK) { err = nvs_commit(h); }
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "tz_save_to_nvs: write failed: %s", esp_err_to_name(err));
+    }
+}
 
 /* ============================================================
  * ISR Callbacks
@@ -473,9 +527,27 @@ bool can_manager_get_utc_ms(uint64_t *epoch_ms_out)
     return true;
 }
 
+void can_manager_set_tz_offset(int8_t hours)
+{
+    /* Clamp to the valid IANA UTC offset range. */
+    if (hours < -12) { hours = -12; }
+    if (hours >  14) { hours =  14; }
+    s_tz_offset_hours = hours;
+    tz_save_to_nvs(hours);
+    ESP_LOGI(TAG, "TZ offset set to %d h", (int)hours);
+}
+
+int8_t can_manager_get_tz_offset_hours(void)
+{
+    return s_tz_offset_hours;
+}
+
 esp_err_t can_manager_init(void)
 {
     esp_err_t ret;
+
+    /* Load persisted timezone offset before any camera-clock operations. */
+    tz_load_from_nvs();
 
     /* Camera states default to 0 (UNDEFINED) via static initialisation.
      * Explicitly set here for clarity in case of a future re-init path. */

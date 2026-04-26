@@ -179,6 +179,11 @@ esp_err_t control_send_set_date_time(uint16_t conn_handle)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Apply the stored timezone offset so cameras receive local time rather
+     * than raw UTC.  Cast through int64_t to handle negative offsets safely. */
+    int64_t tz_ms = (int64_t)can_manager_get_tz_offset_hours() * 3600LL * 1000LL;
+    epoch_ms = (uint64_t)((int64_t)epoch_ms + tz_ms);
+
     /* Break epoch into calendar fields. */
     time_t    t = (time_t)(epoch_ms / 1000);
     struct tm ti;
@@ -200,8 +205,9 @@ esp_err_t control_send_set_date_time(uint16_t conn_handle)
         month, day, hour, minute, second
     };
 
-    ESP_LOGI(TAG, "slot %d: SetDateTime → %04d-%02d-%02d %02d:%02d:%02d UTC",
-             slot, year, month, day, hour, minute, second);
+    ESP_LOGI(TAG, "slot %d: SetDateTime → %04d-%02d-%02d %02d:%02d:%02d local (UTC%+d)",
+             slot, year, month, day, hour, minute, second,
+             (int)can_manager_get_tz_offset_hours());
 
     esp_err_t err = ble_core_gatt_write(conn_handle, gctx->gatt.cmd_write,
                                         pkt, sizeof(pkt));

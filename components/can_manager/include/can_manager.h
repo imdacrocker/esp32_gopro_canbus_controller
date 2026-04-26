@@ -260,6 +260,31 @@ bool can_manager_get_utc_ms(uint64_t *epoch_ms_out);
  */
 esp_err_t can_manager_set_camera_state(uint8_t camera_idx, camera_state_t state);
 
+/**
+ * @brief Set and persist the timezone UTC offset used for camera time-setting.
+ *
+ * The offset is applied whenever a SetDateTime command is sent to any camera
+ * (BLE or legacy Wi-Fi), so cameras receive local time rather than raw UTC.
+ * The value is stored in NVS (namespace "settings", key "tz_offset") and
+ * survives reboots.  A factory reset (nvs_flash_erase) restores the default.
+ *
+ * Thread-safe: may be called from any task.
+ *
+ * @param hours  UTC offset in whole hours, range [-12, 14].
+ *               Clamped to that range if out of bounds.
+ */
+void can_manager_set_tz_offset(int8_t hours);
+
+/**
+ * @brief Return the currently stored timezone UTC offset in whole hours.
+ *
+ * Default value on first boot (no NVS entry): -8 (US Pacific Standard Time).
+ * Thread-safe: may be called from any task.
+ *
+ * @return UTC offset in hours, range [-12, 14].
+ */
+int8_t can_manager_get_tz_offset_hours(void);
+
 #ifdef __cplusplus
 }
 #endif
