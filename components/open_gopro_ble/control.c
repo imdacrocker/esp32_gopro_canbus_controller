@@ -266,7 +266,7 @@ esp_err_t control_send_camera_control(uint16_t conn_handle)
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "slot %d: SetCameraControlStatus → EXTERNAL (claiming BLE control)",
+    ESP_LOGI(TAG, "slot %d: Sending SetCameraControlStatus → EXTERNAL (claiming BLE control)",
              slot);
     esp_err_t err = ble_core_gatt_write(conn_handle, gctx->gatt.cmd_write,
                                         k_set_camera_control_pkt,

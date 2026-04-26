@@ -62,7 +62,7 @@ typedef struct {
     char              name[CAMERA_NAME_LEN];
     char              model_name[CAMERA_MODEL_NAME_LEN]; /**< Populated from GetHardwareInfo after GATT is ready. */
     ble_addr_t        mac_address;
-    bool              is_configured;
+    //bool              is_configured;
     camera_type_t     type;
     uint16_t          bt_handle;
     bool              camera_ready;

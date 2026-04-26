@@ -313,8 +313,16 @@ void gopro_readiness_handle_camera_control_acked(uint16_t conn_handle, uint8_t r
     gctx->camera_control_pending = false;
 
     if (result == 0x00) {
-        ESP_LOGI(TAG, "slot %d: SetCameraControlStatus → SUCCESS "
-                 "(camera is under external control)", slot);
+        ESP_LOGI(TAG, "slot %d: SetCameraControlStatus → CAMERA_IDLE ", slot);
+    } else if (result == 0x02) {
+        ESP_LOGI(TAG, "slot %d: SetCameraControlStatus → CAMERA_EXTERNAL_CONTROL "
+                 " — proceeding anyway", slot);
+    } else if (result == 0x01) {
+        ESP_LOGW(TAG, "slot %d: SetCameraControlStatus → CAMERA_CONTROL "
+                 "(camera under its own control) — proceeding anyway", slot);
+    } else if (result == 0x03) {
+        ESP_LOGW(TAG, "slot %d: SetCameraControlStatus → CAMERA_COF_SETUP "
+                 "(Camera As a Hub / Cloud Offload setup screen) — proceeding anyway", slot);
     } else if (result == 0xFF) {
         ESP_LOGW(TAG, "slot %d: SetCameraControlStatus response malformed "
                  "(result unparseable) — proceeding anyway", slot);

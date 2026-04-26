@@ -44,12 +44,13 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg);
  * -------------------------------------------------------------------------- */
 void start_scan(void)
 {
+    ESP_LOGI(TAG,"At least one known camera is disconnected - Initiating background scan");
     struct ble_gap_disc_params disc_params = {
         .itvl              = 0,
         .window            = 0,
-        .filter_policy     = 0,
+        .filter_policy     = BLE_HCI_SCAN_FILT_USE_WL, // BLE_HCI_SCAN_FILT_USE_WL,  BLE_HCI_SCAN_FILT_NO_WL,
         .limited           = 0,
-        .passive           = 1,
+        .passive           = BLE_HCI_SCAN_TYPE_PASSIVE,
         /* Deduplicate so the host task is not called for every advertisement
          * from an already-seen device.  The filter resets each scan interval,
          * so cameras that come back online are still detected. */
@@ -232,12 +233,12 @@ static int scan_event_cb(struct ble_gap_event *event, void *arg)
     ble_gap_disc_cancel();
 
     int rc2 = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &event->disc.addr,
-                              BLE_HS_FOREVER, NULL,
+                              20000, NULL,
                               connection_event_cb, NULL);
     if (rc2 != 0) {
         ESP_LOGE(TAG, "ble_gap_connect failed: %d", rc2);
         s_connecting = false;
-        start_scan();
+        start_scan_if_needed();
     }
 
     return 0;

@@ -54,61 +54,61 @@ int        s_pending_idx            = 0;
  * camera's rate-limit timer expire.
  * ------------------------------------------------------------------------- */
 
-#define RECONNECT_BACKOFF_US   (5 * 1000 * 1000)   /* 5 seconds */
+// #define RECONNECT_BACKOFF_US   (5 * 1000 * 1000)   /* 5 seconds */
 
-static ble_addr_t           s_backoff_addr;
-static bool                 s_backoff_pending = false;
-static esp_timer_handle_t   s_reconnect_timer = NULL;
-static struct ble_npl_event s_reconnect_event;
+// static ble_addr_t           s_backoff_addr;
+// static bool                 s_backoff_pending = false;
+// static esp_timer_handle_t   s_reconnect_timer = NULL;
+// static struct ble_npl_event s_reconnect_event;
 
-static void reconnect_event_cb(struct ble_npl_event *ev)
-{
-    if (!s_backoff_pending) return;
-    s_backoff_pending = false;
+// static void reconnect_event_cb(struct ble_npl_event *ev)
+// {
+//     if (!s_backoff_pending) return;
+//     s_backoff_pending = false;
 
-    const uint8_t *a = s_backoff_addr.val;
-    ESP_LOGI(TAG, "Backoff elapsed — reconnecting to %02X:%02X:%02X:%02X:%02X:%02X",
-             a[5], a[4], a[3], a[2], a[1], a[0]);
+//     const uint8_t *a = s_backoff_addr.val;
+//     ESP_LOGI(TAG, "Backoff elapsed — reconnecting to %02X:%02X:%02X:%02X:%02X:%02X",
+//              a[5], a[4], a[3], a[2], a[1], a[0]);
 
-    int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &s_backoff_addr,
-                             BLE_HS_FOREVER, NULL, connection_event_cb, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Backoff reconnect failed: %d — scanning", rc);
-        start_scan();
-    }
-}
+//     int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &s_backoff_addr,
+//                              BLE_HS_FOREVER, NULL, connection_event_cb, NULL);
+//     if (rc != 0) {
+//         ESP_LOGE(TAG, "Backoff reconnect failed: %d — scanning", rc);
+//         start_scan();
+//     }
+// }
 
-static void reconnect_timer_cb(void *arg)
-{
-    /* Timer fires from a high-priority esp_timer task — must not call NimBLE
-     * APIs directly.  Post an event to the NimBLE host queue instead. */
-    ble_npl_event_init(&s_reconnect_event, reconnect_event_cb, NULL);
-    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_reconnect_event);
-}
+// static void reconnect_timer_cb(void *arg)
+// {
+//     /* Timer fires from a high-priority esp_timer task — must not call NimBLE
+//      * APIs directly.  Post an event to the NimBLE host queue instead. */
+//     ble_npl_event_init(&s_reconnect_event, reconnect_event_cb, NULL);
+//     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_reconnect_event);
+// }
 
-static void schedule_backoff_reconnect(const ble_addr_t *addr)
-{
-    s_backoff_addr    = *addr;
-    s_backoff_pending = true;
+// static void schedule_backoff_reconnect(const ble_addr_t *addr)
+// {
+//     s_backoff_addr    = *addr;
+//     s_backoff_pending = true;
 
-    if (s_reconnect_timer == NULL) {
-        const esp_timer_create_args_t args = {
-            .callback  = reconnect_timer_cb,
-            .arg       = NULL,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name      = "ble_reconnect_backoff",
-        };
-        esp_timer_create(&args, &s_reconnect_timer);
-    } else {
-        esp_timer_stop(s_reconnect_timer);  /* restart if already armed */
-    }
+//     if (s_reconnect_timer == NULL) {
+//         const esp_timer_create_args_t args = {
+//             .callback  = reconnect_timer_cb,
+//             .arg       = NULL,
+//             .dispatch_method = ESP_TIMER_TASK,
+//             .name      = "ble_reconnect_backoff",
+//         };
+//         esp_timer_create(&args, &s_reconnect_timer);
+//     } else {
+//         esp_timer_stop(s_reconnect_timer);  /* restart if already armed */
+//     }
 
-    const uint8_t *a = addr->val;
-    ESP_LOGI(TAG, "Scheduling reconnect to %02X:%02X:%02X:%02X:%02X:%02X in %d s",
-             a[5], a[4], a[3], a[2], a[1], a[0],
-             (int)(RECONNECT_BACKOFF_US / 1000000));
-    esp_timer_start_once(s_reconnect_timer, RECONNECT_BACKOFF_US);
-}
+//     const uint8_t *a = addr->val;
+//     ESP_LOGI(TAG, "Scheduling reconnect to %02X:%02X:%02X:%02X:%02X:%02X in %d s",
+//              a[5], a[4], a[3], a[2], a[1], a[0],
+//              (int)(RECONNECT_BACKOFF_US / 1000000));
+//     esp_timer_start_once(s_reconnect_timer, RECONNECT_BACKOFF_US);
+// }
 
 /* Tracks which address last had an ENC_CHANGE failure so the disconnect
  * handler knows to use the backoff path rather than an immediate reconnect. */
@@ -317,23 +317,23 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
                 g_ble_core_cbs.on_connected(handle, &desc.peer_id_addr);
             }
 
-            /* Initiate security (re-uses saved keys for known cameras, or
-             * performs first-time pairing for new ones). */
-            struct ble_store_key_sec key;
-            struct ble_store_value_sec sec;
-            memset(&key, 0, sizeof(key));
-            key.peer_addr = desc.peer_id_addr;
-            bool bonded = (ble_store_read_peer_sec(&key, &sec) == 0);
-            if (!bonded) {
-                key.peer_addr = desc.peer_ota_addr;
-                bonded = (ble_store_read_peer_sec(&key, &sec) == 0);
-            }
+            // /* Initiate security (re-uses saved keys for known cameras, or
+            //  * performs first-time pairing for new ones). */
+            // struct ble_store_key_sec key;
+            // struct ble_store_value_sec sec;
+            // memset(&key, 0, sizeof(key));
+            // key.peer_addr = desc.peer_id_addr;
+            // bool bonded = (ble_store_read_peer_sec(&key, &sec) == 0);
+            // if (!bonded) {
+            //     key.peer_addr = desc.peer_ota_addr;
+            //     bonded = (ble_store_read_peer_sec(&key, &sec) == 0);
+            // }
 
-            if (bonded) {
-                ESP_LOGI(TAG, "Known camera — restoring encryption with saved keys");
-            } else {
-                ESP_LOGI(TAG, "New camera — initiating first-time pairing");
-            }
+            // if (bonded) {
+            //     ESP_LOGI(TAG, "Known camera — restoring encryption with saved keys");
+            // } else {
+            //     ESP_LOGI(TAG, "New camera — initiating first-time pairing");
+            // }
 
             int sec_rc = ble_gap_security_initiate(handle);
             if (sec_rc != 0) {
@@ -347,7 +347,8 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
          * Once the chain is exhausted, reconnect_next() becomes a no-op
          * start_scan(). */
         s_connecting = false;
-        reconnect_next();
+        // reconnect_next();
+        //start_scan_if_needed();
         break;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
@@ -430,46 +431,48 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
 
         s_connecting = false;
 
-        /* Only reconnect if this address is still known to the higher layer
-         * (e.g. it was not removed via a bond reset).  is_known_addr is
-         * implemented by camera_manager_is_known_addr() but kept here as a
-         * callback so ble_core stays camera-agnostic. */
-        if (g_ble_core_cbs.is_known_addr && !g_ble_core_cbs.is_known_addr(peer)) {
-            const uint8_t *a = peer->val;
-            ESP_LOGI(TAG, "Disconnected peer %02X:%02X:%02X:%02X:%02X:%02X is no longer "
-                     "known — skipping reconnect", a[5], a[4], a[3], a[2], a[1], a[0]);
-            start_scan_if_needed();
-            break;
-        }
+        start_scan_if_needed();
 
-        /* Cancel any active scan — ble_gap_connect() returns BLE_HS_EBUSY
-         * if a scan is already running. */
-        ble_gap_disc_cancel();
+        // /* Only reconnect if this address is still known to the higher layer
+        //  * (e.g. it was not removed via a bond reset).  is_known_addr is
+        //  * implemented by camera_manager_is_known_addr() but kept here as a
+        //  * callback so ble_core stays camera-agnostic. */
+        // if (g_ble_core_cbs.is_known_addr && !g_ble_core_cbs.is_known_addr(peer)) {
+        //     const uint8_t *a = peer->val;
+        //     ESP_LOGI(TAG, "Disconnected peer %02X:%02X:%02X:%02X:%02X:%02X is no longer "
+        //              "known — skipping reconnect", a[5], a[4], a[3], a[2], a[1], a[0]);
+        //     start_scan_if_needed();
+        //     break;
+        // }
 
-        const uint8_t *a = peer->val;
+        // /* Cancel any active scan — ble_gap_connect() returns BLE_HS_EBUSY
+        //  * if a scan is already running. */
+        // ble_gap_disc_cancel();
 
-        /* If this disconnect follows an ENC_CHANGE failure for the same peer,
-         * use a back-off reconnect so the camera's "Repeated Attempts" SM
-         * rate-limit timer has time to expire before we try fresh pairing. */
-        if (s_enc_failed &&
-            memcmp(&s_enc_failed_addr, peer, sizeof(ble_addr_t)) == 0) {
-            s_enc_failed = false;
-            schedule_backoff_reconnect(peer);
-            break;
-        }
+        // const uint8_t *a = peer->val;
 
-        /* Attempt direct reconnect — BLE_HS_FOREVER: the controller stays in
-         * initiating state until the peer starts advertising, however long
-         * that takes. */
-        ESP_LOGI(TAG, "Attempting reconnect to %02X:%02X:%02X:%02X:%02X:%02X",
-                 a[5], a[4], a[3], a[2], a[1], a[0]);
+        // /* If this disconnect follows an ENC_CHANGE failure for the same peer,
+        //  * use a back-off reconnect so the camera's "Repeated Attempts" SM
+        //  * rate-limit timer has time to expire before we try fresh pairing. */
+        // if (s_enc_failed &&
+        //     memcmp(&s_enc_failed_addr, peer, sizeof(ble_addr_t)) == 0) {
+        //     s_enc_failed = false;
+        //     schedule_backoff_reconnect(peer);
+        //     break;
+        // }
 
-        int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, peer,
-                                 BLE_HS_FOREVER, NULL, connection_event_cb, NULL);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "Post-disconnect reconnect failed: %d — scanning", rc);
-            start_scan();
-        }
+        // /* Attempt direct reconnect — BLE_HS_FOREVER: the controller stays in
+        //  * initiating state until the peer starts advertising, however long
+        //  * that takes. */
+        // ESP_LOGI(TAG, "Attempting reconnect to %02X:%02X:%02X:%02X:%02X:%02X",
+        //          a[5], a[4], a[3], a[2], a[1], a[0]);
+
+        // int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, peer,
+        //                          BLE_HS_FOREVER, NULL, connection_event_cb, NULL);
+        // if (rc != 0) {
+        //     ESP_LOGE(TAG, "Post-disconnect reconnect failed: %d — scanning", rc);
+        //     start_scan();
+        // }
         break;
     }
 
