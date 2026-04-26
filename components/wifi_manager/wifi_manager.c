@@ -29,6 +29,8 @@
  *  POST /api/legacy/add           → probe and add a Hero4 camera
  *  POST /api/legacy/remove        → remove a managed legacy camera
  *  POST /api/factory-reset        → erase NVS and reboot
+ *  GET  /api/settings/timezone   → read stored UTC offset (whole hours)
+ *  POST /api/settings/timezone   → set and persist UTC offset
  *
  * Station table
  * -------------
@@ -53,6 +55,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "open_gopro_ble.h"
 #include "camera_manager.h"
 #include "ble_core.h"
@@ -143,6 +146,61 @@ int wifi_manager_get_connected_stations(wifi_mgr_sta_info_t *out, int max_count)
  * (e.g. ble_core_init) do not start radio-intensive work until the AP
  * beacon is on air. */
 static EventGroupHandle_t s_ap_event_group = NULL;
+
+/* ============================================================
+ * Persistent Device Settings
+ *
+ * Stored in NVS namespace "settings".  Loaded once at init;
+ * reset to defaults by factory-reset (nvs_flash_erase).
+ * ============================================================ */
+
+/* UTC offset in whole hours (-12 … +14).  Default: -8 (US Pacific Standard).
+ * Written by POST /api/settings/timezone; read by api_utc_handler to produce
+ * an offset-adjusted epoch_ms for both web display and camera time-setting. */
+static int8_t s_tz_offset_hours = -8;
+
+#define SETTINGS_NVS_NS  "settings"
+#define SETTINGS_TZ_KEY  "tz_offset"
+
+static void load_settings(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(SETTINGS_NVS_NS, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "Settings namespace absent — using defaults (tz=%d h)", (int)s_tz_offset_hours);
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "load_settings: nvs_open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    int8_t offset;
+    err = nvs_get_i8(handle, SETTINGS_TZ_KEY, &offset);
+    if (err == ESP_OK) {
+        s_tz_offset_hours = offset;
+    }
+    nvs_close(handle);
+    ESP_LOGI(TAG, "Settings loaded: tz_offset_hours=%d", (int)s_tz_offset_hours);
+}
+
+static esp_err_t save_tz_offset(int8_t offset)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(SETTINGS_NVS_NS, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save_tz_offset: nvs_open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = nvs_set_i8(handle, SETTINGS_TZ_KEY, offset);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save_tz_offset: write failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
 
 /* Symbols injected by the build system from www/index.html */
 extern const char index_html_start[] asm("_binary_index_html_start");
@@ -562,7 +620,13 @@ static esp_err_t api_utc_handler(httpd_req_t *req)
 
     char buf[64];
     if (valid) {
-        snprintf(buf, sizeof(buf), "{\"valid\":true,\"epoch_ms\":%llu}", epoch_ms);
+        /* Shift the epoch by the stored timezone offset so callers (web UI,
+         * camera time-setting) receive local time rather than raw UTC.
+         * Casting to int64_t for the subtraction prevents unsigned underflow
+         * when the offset is negative. */
+        int64_t offset_ms  = (int64_t)s_tz_offset_hours * 3600LL * 1000LL;
+        uint64_t local_ms  = (uint64_t)((int64_t)epoch_ms + offset_ms);
+        snprintf(buf, sizeof(buf), "{\"valid\":true,\"epoch_ms\":%llu}", local_ms);
     } else {
         snprintf(buf, sizeof(buf), "{\"valid\":false}");
     }
@@ -575,6 +639,71 @@ static const httpd_uri_t api_utc_uri = {
     .uri     = "/api/utc",
     .method  = HTTP_GET,
     .handler = api_utc_handler,
+};
+
+/* GET /api/settings/timezone — return the stored UTC offset
+ *
+ * Returns: {"tz_offset_hours": N}   where N is an integer in [-12, 14]
+ */
+static esp_err_t api_settings_tz_get_handler(httpd_req_t *req)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "{\"tz_offset_hours\":%d}", (int)s_tz_offset_hours);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_settings_tz_get_uri = {
+    .uri     = "/api/settings/timezone",
+    .method  = HTTP_GET,
+    .handler = api_settings_tz_get_handler,
+};
+
+/* POST /api/settings/timezone — set and persist the UTC offset
+ *
+ * Body: {"tz_offset_hours": N}   N must be in [-12, 14]
+ *
+ * Returns the new value: {"tz_offset_hours": N}
+ */
+static esp_err_t api_settings_tz_post_handler(httpd_req_t *req)
+{
+    char body[64] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
+        return ESP_FAIL;
+    }
+
+    char *p = strstr(body, "\"tz_offset_hours\":");
+    if (!p) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing tz_offset_hours");
+        return ESP_FAIL;
+    }
+    p += 18; /* skip past "tz_offset_hours": */
+    while (*p == ' ') p++;
+
+    int offset = atoi(p);
+    if (offset < -12 || offset > 14) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "tz_offset_hours out of range [-12,14]");
+        return ESP_FAIL;
+    }
+
+    s_tz_offset_hours = (int8_t)offset;
+    save_tz_offset(s_tz_offset_hours);
+    ESP_LOGI(TAG, "Timezone offset updated to %d h", (int)s_tz_offset_hours);
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "{\"tz_offset_hours\":%d}", (int)s_tz_offset_hours);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static const httpd_uri_t api_settings_tz_post_uri = {
+    .uri     = "/api/settings/timezone",
+    .method  = HTTP_POST,
+    .handler = api_settings_tz_post_handler,
 };
 
 /* GET /api/auto-control — return the current automatic_camera_control flag
@@ -916,13 +1045,41 @@ static const httpd_uri_t api_factory_reset_uri = {
 };
 
 /* ============================================================
+ * Reboot
+ * ============================================================ */
+
+/* POST /api/reboot
+ * Reboots the ESP32 without erasing NVS.
+ * The response is flushed before the restart so the caller receives it. */
+static esp_err_t api_reboot_handler(httpd_req_t *req)
+{
+    ESP_LOGW(TAG, "Reboot requested via HTTP");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
+
+    /* Give the TCP stack time to flush the response before we restart */
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    esp_restart();
+
+    return ESP_OK; /* never reached */
+}
+
+static const httpd_uri_t api_reboot_uri = {
+    .uri     = "/api/reboot",
+    .method  = HTTP_POST,
+    .handler = api_reboot_handler,
+};
+
+/* ============================================================
  * HTTP Server
  * ============================================================ */
 
 static void start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 19;  /* 13 original + 3 legacy + 1 factory-reset + 2 headroom */
+    config.max_uri_handlers = 22;  /* 13 original + 3 legacy + 1 factory-reset + 1 reboot + 2 timezone + 2 headroom */
     config.max_open_sockets = 4;
     httpd_handle_t server = NULL;
 
@@ -944,6 +1101,9 @@ static void start_http_server(void)
         httpd_register_uri_handler(server, &api_legacy_add_uri);
         httpd_register_uri_handler(server, &api_legacy_remove_uri);
         httpd_register_uri_handler(server, &api_factory_reset_uri);
+        httpd_register_uri_handler(server, &api_reboot_uri);
+        httpd_register_uri_handler(server, &api_settings_tz_get_uri);
+        httpd_register_uri_handler(server, &api_settings_tz_post_uri);
         ESP_LOGI(TAG, "HTTP server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTP server");
@@ -956,6 +1116,11 @@ static void start_http_server(void)
 
 void wifi_manager_init(void)
 {
+    /* Load persisted device settings from NVS before anything else so that
+     * s_tz_offset_hours is correct before the HTTP server handles its first
+     * /api/utc request. */
+    load_settings();
+
     s_ap_event_group = xEventGroupCreate();
     configASSERT(s_ap_event_group);
 

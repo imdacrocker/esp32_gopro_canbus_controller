@@ -61,6 +61,19 @@
             width: 100%; max-width: 480px;
             padding: 0 0 1.5em;
         }
+        #reboot-btn {
+            display: block;
+            width: calc(100% - 32px);
+            margin: 16px 16px 0;
+            border: none; border-radius: 8px;
+            font-size: 0.88rem; font-weight: 700;
+            padding: 14px 18px; min-height: 48px;
+            cursor: pointer;
+            background: #e67e22; color: #fff;
+            text-align: center;
+        }
+        #reboot-btn:hover { background: #ca6f1e; }
+        #reboot-btn:disabled { opacity: 0.5; cursor: default; }
         #reset-btn {
             display: block;
             width: calc(100% - 32px);
@@ -242,7 +255,32 @@
         .rc-logging     { color: #27ae60; }
         .rc-not-logging { color: #f39c12; }
         .rc-unknown     { color: #e74c3c; }
-        #utc-display { font-size: 0.95rem; color: #555; font-family: monospace; font-weight: 600; }
+        /* UTC / local time — two-line layout */
+        #utc-display { font-family: monospace; font-weight: 600; line-height: 1.4; }
+        #utc-date-line { font-size: 0.72rem; color: #888; }
+        #utc-time-line { font-size: 0.88rem; color: #555; }
+
+        /* ---- Settings sections ---- */
+        .settings-section { padding: 0 16px; margin: 16px 0 0; }
+        .settings-section-title {
+            font-size: 0.65rem; font-weight: 700;
+            letter-spacing: 0.1em; text-transform: uppercase;
+            color: #999; margin-bottom: 10px;
+        }
+        .settings-row {
+            display: flex; align-items: center;
+            justify-content: space-between;
+            background: #fafafa; border: 1px solid #eee;
+            border-radius: 8px; padding: 12px 14px;
+        }
+        .settings-row-label { font-size: 0.9rem; font-weight: 600; color: #222; }
+        .settings-select {
+            font-size: 0.85rem;
+            padding: 6px 10px;
+            border: 1px solid #ddd; border-radius: 6px;
+            background: #fff; color: #222;
+            min-width: 110px;
+        }
 
         /* ---- Auto-control section ---- */
         #auto-control-section {
@@ -455,8 +493,11 @@
                 <div id="rc-logging-pill" class="rc-value rc-unknown">Unknown</div>
             </div>
             <div class="rc-cell">
-                <div class="rc-label">Last Received UTC</div>
-                <div id="utc-display" class="rc-value">--:--:--</div>
+                <div class="rc-label">RC Date/Time (Local)</div>
+                <div id="utc-display" class="rc-value">
+                    <div id="utc-date-line">--</div>
+                    <div id="utc-time-line">--:--:--</div>
+                </div>
             </div>
         </div>
     </div>
@@ -505,6 +546,19 @@
                 <span class="modal-title">Settings</span>
                 <button class="modal-done-btn" onclick="closeSettings()">Done</button>
             </div>
+
+            <!-- Section 1: Device -->
+            <div class="settings-section">
+                <div class="settings-section-title">Device</div>
+                <div class="settings-row">
+                    <span class="settings-row-label">Time Zone</span>
+                    <select id="tz-select" class="settings-select" onchange="saveTimezone(this.value)">
+                        <!-- populated by buildTimezoneDropdown() on page load -->
+                    </select>
+                </div>
+            </div>
+
+            <button id="reboot-btn" onclick="confirmReboot()">Reboot</button>
             <button id="reset-btn" onclick="confirmFactoryReset()">Reset Defaults</button>
         </div>
     </div>
@@ -557,6 +611,7 @@
 
         function openSettings() {
             document.getElementById('settings-overlay').classList.remove('hidden');
+            loadTimezone();
         }
 
         function closeSettings() {
@@ -566,6 +621,38 @@
         document.getElementById('settings-overlay').addEventListener('click', function (e) {
             if (e.target === this) { closeSettings(); }
         });
+
+        function confirmReboot() {
+            if (!confirm('Reboot Controller?\n\nThe device will restart. Paired cameras and settings will be preserved.')) {
+                return;
+            }
+            var btn = document.getElementById('reboot-btn');
+            btn.disabled = true;
+            btn.textContent = 'Rebooting…';
+
+            fetch('/api/reboot', { method: 'POST' })
+                .then(function (r) { return r.json(); })
+                .then(scheduleRebootRefresh)
+                .catch(scheduleRebootRefresh); /* ESP32 may reboot before response arrives — treat as success */
+        }
+
+        function scheduleRebootRefresh() {
+            var btn = document.getElementById('reboot-btn');
+            var dots = '.';
+            var ticks = 0;
+
+            function tick() {
+                if (btn) { btn.textContent = 'Rebooting' + dots; }
+                if (ticks >= 5) {
+                    location.reload();
+                    return;
+                }
+                ticks++;
+                dots = dots + '.';
+                setTimeout(tick, 1000);
+            }
+            tick();
+        }
 
         function confirmFactoryReset() {
             if (!confirm('Restore Defaults?\n\nThis will erase all paired cameras and settings, then restart the controller. This cannot be undone.')) {
@@ -984,6 +1071,9 @@
         refreshCameraStatus();
         setInterval(refreshCameraStatus, 3000);
 
+        /* Build the timezone dropdown once so it is ready when the user opens Settings. */
+        buildTimezoneDropdown();
+
         /* ---- RC logging state + UTC + auto-control (polled together) ---- */
 
         var RC_LOGGING_LABELS = {
@@ -1006,15 +1096,23 @@
             fetch('/api/utc')
                 .then(function (r) { return r.json(); })
                 .then(function (data) {
-                    var utcEl = document.getElementById('utc-display');
+                    var dateLine = document.getElementById('utc-date-line');
+                    var timeLine = document.getElementById('utc-time-line');
                     if (data.valid) {
-                        var d = new Date(data.epoch_ms);
-                        var h = String(d.getUTCHours()).padStart(2, '0');
-                        var m = String(d.getUTCMinutes()).padStart(2, '0');
-                        var s = String(d.getUTCSeconds()).padStart(2, '0');
-                        utcEl.textContent = h + ':' + m + ':' + s;
+                        /* epoch_ms already has the timezone offset applied by the
+                         * firmware, so getUTC* gives the correct local values. */
+                        var d     = new Date(data.epoch_ms);
+                        var year  = d.getUTCFullYear();
+                        var month = String(d.getUTCMonth() + 1).padStart(2, '0');
+                        var day   = String(d.getUTCDate()).padStart(2, '0');
+                        var hh    = String(d.getUTCHours()).padStart(2, '0');
+                        var mm    = String(d.getUTCMinutes()).padStart(2, '0');
+                        var ss    = String(d.getUTCSeconds()).padStart(2, '0');
+                        dateLine.textContent = year + '-' + month + '-' + day;
+                        timeLine.textContent = hh + ':' + mm + ':' + ss;
                     } else {
-                        utcEl.textContent = 'No GPS';
+                        dateLine.textContent = 'No GPS';
+                        timeLine.textContent = '';
                     }
                 })
                 .catch(function () {});
@@ -1214,6 +1312,42 @@
                 }
             })
             .catch(function () { setStatus('Error sending shutter command.'); });
+        }
+
+        /* ---- Timezone dropdown ---- */
+
+        /* Build the <select> options once on page load (UTC-12 … UTC+14, whole hours). */
+        function buildTimezoneDropdown() {
+            var sel = document.getElementById('tz-select');
+            sel.innerHTML = '';
+            for (var offset = -12; offset <= 14; offset++) {
+                var opt = document.createElement('option');
+                opt.value = offset;
+                opt.textContent = offset === 0 ? 'UTC' :
+                                  offset  > 0  ? 'UTC+' + offset :
+                                                 'UTC' + offset;
+                sel.appendChild(opt);
+            }
+        }
+
+        /* Fetch the stored offset from the firmware and reflect it in the dropdown. */
+        function loadTimezone() {
+            fetch('/api/settings/timezone')
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    document.getElementById('tz-select').value = data.tz_offset_hours;
+                })
+                .catch(function () {});
+        }
+
+        /* POST the newly selected offset to the firmware for NVS storage. */
+        function saveTimezone(value) {
+            fetch('/api/settings/timezone', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ tz_offset_hours: parseInt(value, 10) })
+            })
+            .catch(function () {});
         }
 
         /* ---- Shutter (start / stop recording — all cameras) ---- */
