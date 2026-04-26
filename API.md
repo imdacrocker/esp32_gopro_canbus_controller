@@ -206,7 +206,7 @@ Returns all configured camera slots with their current live status.
 | Value | Meaning |
 |-------|---------|
 | `"disconnected"` | Camera is paired but no active BLE connection. |
-| `"not_recording"` | Connected and GATT-ready, but not currently recording. |
+| `"not_recording"` | Connected and camera-ready, but not currently recording. |
 | `"recording"` | Connected and actively recording. |
 
 ---
@@ -244,7 +244,7 @@ Removes a single paired camera. Clears the camera slot from NVS and RAM, termina
 
 ### `POST /api/shutter`
 
-Manually sends a start or stop recording command to all currently connected, GATT-ready cameras.
+Manually sends a start or stop recording command to all currently connected, camera-ready cameras.
 
 This command **does** update the desired recording state tracked by `camera_manager`. If a camera is currently disconnected and reconnects later, the tick timer will automatically retry the command to bring it into the desired state. Sending `{"on": false}` clears the desired state, preventing the tick timer from re-enabling recording even if CAN previously set it.
 
@@ -755,7 +755,7 @@ Initialise the OpenGoPro BLE component. Registers the `camera_driver_t` vtable w
 ```c
 void open_gopro_ble_sync_time_all(void);
 ```
-Send a SetDateTime command to every camera slot that is currently GATT-ready. Called from `main.c`'s `can_utc_acquired_cb_t` handler to cover cameras that were already connected when GPS lock was first established. Slots that are not GATT-ready are skipped silently. Safe to call from any task.
+Send a SetDateTime command to every camera slot that is currently camera-ready. Called from `main.c`'s `can_utc_acquired_cb_t` handler to cover cameras that were already connected when GPS lock was first established. Slots that are not camera-ready are skipped silently. Safe to call from any task.
 
 ---
 
@@ -808,7 +808,7 @@ The OpenGoPro spec requires a Keep Alive packet to be sent every 3 seconds after
 - **Characteristic:** GP-0074 (`settings_write` handle)
 - **Packet:** `{ 0x03, 0x5B, 0x01, 0x42 }` — TLV encoding: `[length=3][setting_id=0x5B][param_len=1][value=0x42]`
 - **Fire-and-forget:** the camera's ACK response on GP-0075 is intentionally ignored. BLE disconnect handling covers connection loss.
-- **Gating:** the timer fires every 3 seconds and iterates all camera slots. It only sends to slots where `camera_manager_is_gatt_ready()` returns true — no explicit start/stop per connection is required.
+- **Gating:** the timer fires every 3 seconds and iterates all camera slots. It only sends to slots where `camera_manager_is_camera_ready()` returns true — no explicit start/stop per connection is required.
 
 #### Duplicate-send guard (`control.c` / `notify.c`)
 
@@ -833,14 +833,14 @@ The driver tracks a per-camera `start_cmd_pending` boolean in `gopro_ble_ctx_t` 
 
 #### On-demand queries (`query.c`)
 
-Hardware info and other query commands can be issued at any time after the slot is `gatt_ready`. This is implemented in `query.c` and is not part of the public API.
+Hardware info and other query commands can be issued at any time after the slot is camera-ready. This is implemented in `query.c` and is not part of the public API.
 
 **`SetDateTime` (cmd 0x0D)**
 
 Sets the camera's clock to the current UTC. Sent via one of two paths depending on which is available first — the camera connection or the UTC:
 
-- **Camera connects after UTC is available:** `gatt.c` calls `control_send_set_date_time()` directly when all CCCD subscriptions complete, on every connection (first pairing and all reconnections).
-- **UTC arrives while cameras are already connected:** `can_manager` fires the `can_utc_acquired_cb_t` callback exactly once. `main.c` responds by calling `open_gopro_ble_sync_time_all()`, which iterates all GATT-ready slots and calls `control_send_set_date_time()` for each.
+- **Camera connects after UTC is available:** `readiness.c` calls `control_send_set_date_time()` directly when the readiness poll succeeds (status 0 returned from `GetHardwareInfo`), on every connection (first pairing and all reconnections).
+- **UTC arrives while cameras are already connected:** `can_manager` fires the `can_utc_acquired_cb_t` callback exactly once. `main.c` responds by calling `open_gopro_ble_sync_time_all()`, which iterates all camera-ready slots and calls `control_send_set_date_time()` for each.
 
 In both cases, `control_send_set_date_time()` reads the current UTC from `can_manager_get_utc_ms()`, converts it to calendar fields via `gmtime_r`, and writes the following TLV command to GP-0072 (`cmd_write`):
 
@@ -865,7 +865,7 @@ If UTC is not yet available when `control_send_set_date_time()` is called (e.g. 
 
 **Video Preset Loading (two-phase flow)**
 
-Initiated automatically by `gatt.c` immediately after all CCCD subscriptions complete, on every connection (first pairing and all reconnections), alongside `SetDateTime` and `GetHardwareInfo`.
+Initiated automatically by `readiness.c` when the readiness poll succeeds (status 0 from `GetHardwareInfo`), on every connection (first pairing and all reconnections), alongside `SetDateTime` and `RequestPairingFinish`.
 
 *Phase 1 — `gopro_presets_request_video()` (`presets.c`)*
 
@@ -913,17 +913,25 @@ After every `control_start_recording()` or `control_stop_recording()` call, the 
 
 This makes it possible to determine whether the camera actually accepted the recording command, rather than only seeing the outgoing write in the log.
 
-**`GetHardwareInfo` (cmd 0x3C)**
+**`GetHardwareInfo` (cmd 0x3C) — readiness poll**
 
-`gopro_query_send_hw_info(conn_handle)` is called automatically by `gatt.c` immediately after all CCCD subscriptions complete (alongside `control_send_set_date_time()`). It can also be called on demand at any time the slot is `gatt_ready`.
+`gopro_query_send_hw_info(conn_handle)` is called automatically by `readiness.c` as the core of the readiness poll loop. `gatt.c` hands off to `readiness.c` once all CCCD subscriptions are complete; `readiness.c` then sends `GetHardwareInfo` and waits up to 3 seconds for a response.
 
-The response arrives asynchronously on `cmd_resp_notify` (GP-0073) and is routed to `gopro_query_handle_cmd_response()` by `notify.c`. On success, the parsed fields (model number, model name, firmware version, serial number, AP SSID, AP MAC address) are logged at INFO level, and the **model name** is written into the camera slot via `camera_manager_set_model_name()`. It is then available through `camera_slot_info_t.model_name` for display in the web UI or any other consumer.
+The response arrives on `cmd_resp_notify` (GP-0073). `notify.c` routes this characteristic's notifications before the camera-ready gate (so responses arrive even before `camera_manager_set_camera_ready()` has been called). `gopro_query_handle_cmd_response()` extracts the status byte from the response and forwards it to `gopro_readiness_handle_hw_info_status()` in `readiness.c`:
+
+- **Status `0x00` (success):** camera is ready. `readiness.c` calls `gopro_on_camera_ready()`, which sets the camera-ready flag, sends `SetDateTime`, sends `RequestPairingFinish` (first pairing only), and requests the Video preset.
+- **Status `0x02` (camera busy / not ready):** `readiness.c` increments the retry counter and re-sends after 3 seconds.
+- **Any other non-zero status:** treated the same as `0x02` — retry.
+- **Timeout (no response within 3 s):** the `esp_timer` one-shot fires `readiness_timeout_cb()`, which re-sends the command and rearms the timer.
+- **Retry limit (10 retries, ~30 s total):** `ble_gap_terminate()` is called to drop the connection cleanly. The bond is preserved; BLE auto-reconnect will retry on the next advertisement.
+
+On a status-0 response, `query.c` also falls through to parse the full response payload. The parsed fields (model number, model name, firmware version, serial number, AP SSID, AP MAC address) are logged at INFO level, and the **model name** is written into the camera slot via `camera_manager_set_model_name()`. It is then available through `camera_slot_info_t.model_name` for display in the web UI.
 
 The model name is **not** persisted to NVS — it is RAM-only and repopulated on every connection.
 
-**GPBS fragmentation:** `GetHardwareInfoRsp` is approximately 91 bytes. The camera sends this as multiple ATT notifications using GPBS (General Purpose Byte Stream) application-layer fragmentation, regardless of the negotiated ATT MTU. `query.c` handles GPBS reassembly transparently via a per-connection context buffer.
+**GPBS fragmentation:** `GetHardwareInfoRsp` is approximately 91 bytes. The camera sends this as multiple ATT notifications using GPBS (General Purpose Byte Stream) application-layer fragmentation, regardless of the negotiated ATT MTU. `query.c` handles GPBS reassembly transparently via a per-connection context buffer. During reassembly, the readiness poll waits for the final continuation fragment before inspecting the status byte.
 
-**`gatt_ready` timing:** `camera_manager_set_gatt_ready()` is called immediately when all CCCD subscriptions complete (`gatt.c`). This matches the approach used in the OpenGoPro C# reference implementation — no polling loop is required. The keep-alive and status-poll timers begin sending to the slot on their next scheduled fire.
+**`camera_ready` timing:** `camera_manager_set_camera_ready(slot, true)` is called by `readiness.c` only after the camera returns status 0. This is later than the previous approach (which set the flag immediately on CCCD completion) and ensures that keep-alive, status poll, and recording commands are not sent to a camera that has not yet finished its internal initialisation. The keep-alive and status-poll timers begin sending to the slot on their next scheduled fire after the flag is set.
 
 **ATT MTU:** `gatt.c` negotiates the maximum ATT MTU (`BLE_ATT_MTU_MAX` = 527 in ESP-IDF v6.0) immediately before GATT service discovery. The negotiated MTU is logged at INFO level. GPBS-level fragmentation still occurs because it is controlled by the camera firmware, not the ATT layer.
 
@@ -1045,15 +1053,15 @@ Return the number of configured slots and the number with an active BLE connecti
 ```c
 void camera_manager_on_connected(int slot, uint16_t conn_handle);
 void camera_manager_on_disconnected(uint16_t conn_handle);
-void camera_manager_set_gatt_ready(int slot, bool ready);
+void camera_manager_set_camera_ready(int slot, bool ready);
 ```
-Called by `open_gopro_ble` to update slot state on BLE lifecycle events. Each fires the state-change callback immediately.
+Called by `open_gopro_ble` to update slot state on BLE lifecycle events. Each fires the state-change callback immediately. `camera_manager_set_camera_ready()` is called by `readiness.c` after the `GetHardwareInfo` readiness poll confirms status 0.
 
 ---
 
 ```c
 uint16_t camera_manager_get_handle(int slot);
-bool     camera_manager_is_gatt_ready(int slot);
+bool     camera_manager_is_camera_ready(int slot);
 void    *camera_manager_get_driver_ctx(int slot);
 ```
 Slot accessors used by `open_gopro_ble` to route GATT operations to the correct per-camera context.
@@ -1070,7 +1078,7 @@ Store the camera's model name string (e.g. `"HERO12 Black"`) in the given slot. 
 ```c
 void camera_manager_set_desired_recording(bool recording);
 ```
-Set the target recording state for all slots. When `desired = true`, the 2-second tick timer calls `start_recording` on any connected, GATT-ready camera that is not currently recording. Whether that call actually dispatches a BLE command depends on the driver — the GoPro BLE driver gates on an internal `start_cmd_pending` flag so that the command is only re-sent after the camera has previously confirmed a RECORDING state and then gone idle (recovery path), not while the initial command is still in flight.
+Set the target recording state for all slots. When `desired = true`, the 2-second tick timer calls `start_recording` on any connected, camera-ready camera that is not currently recording. Whether that call actually dispatches a BLE command depends on the driver — the GoPro BLE driver gates on an internal `start_cmd_pending` flag so that the command is only re-sent after the camera has previously confirmed a RECORDING state and then gone idle (recovery path), not while the initial command is still in flight.
 
 ---
 
@@ -1078,14 +1086,14 @@ Set the target recording state for all slots. When `desired = true`, the 2-secon
 int camera_manager_start_recording_all(void);
 int camera_manager_stop_recording_all(void);
 ```
-Immediately dispatch a start/stop command to all connected, GATT-ready cameras. Returns the number of cameras that received the command.
+Immediately dispatch a start/stop command to all connected, camera-ready cameras. Returns the number of cameras that received the command.
 
 ---
 
 ```c
 int camera_manager_set_recording_slot(int slot, bool on);
 ```
-Start or stop recording on a single camera slot. Sets `desired_recording` for that slot only (so the 2-second tick timer will retry if the slot is not immediately ready), then dispatches the command immediately if the slot is connected and GATT-ready. Returns `1` if the command was dispatched, `0` if the slot was not ready (desired state is still updated).
+Start or stop recording on a single camera slot. Sets `desired_recording` for that slot only (so the 2-second tick timer will retry if the slot is not immediately ready), then dispatches the command immediately if the slot is connected and camera-ready. Returns `1` if the command was dispatched, `0` if the slot was not ready (desired state is still updated).
 
 Note: a subsequent call to `camera_manager_set_desired_recording()` or the `_all` variants will overwrite `desired_recording` for all slots, including any per-slot state set here.
 
@@ -1213,7 +1221,7 @@ Register a callback fired when the RaceCapture `isLogging` value in `0x600` fram
 ```c
 esp_err_t can_manager_register_utc_acquired_callback(can_utc_acquired_cb_t cb, void *user_ctx);
 ```
-Register a callback fired exactly once when the first valid UTC timestamp is received on `0x602`. Intended for setting the date/time on cameras that are already GATT-ready at the moment GPS lock is first established. Register before `can_manager_init()` to avoid missing the event. Returns `ESP_ERR_INVALID_ARG` if `cb` is `NULL`.
+Register a callback fired exactly once when the first valid UTC timestamp is received on `0x602`. Intended for setting the date/time on cameras that are already camera-ready at the moment GPS lock is first established. Register before `can_manager_init()` to avoid missing the event. Returns `ESP_ERR_INVALID_ARG` if `cb` is `NULL`.
 
 ---
 

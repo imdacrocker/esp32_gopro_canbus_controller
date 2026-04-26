@@ -94,7 +94,7 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 
 1. RaceCapture sends a `0x600` CAN frame with `isLogging = 1`.
 2. `can_manager` detects the state change and calls the registered logging callback.
-3. `app_main`'s callback sets the desired recording state on `camera_manager` and immediately dispatches a start command to all GATT-ready cameras.
+3. `app_main`'s callback sets the desired recording state on `camera_manager` and immediately dispatches a start command to all camera-ready cameras.
 4. `open_gopro_ble` sends the OpenGoPro `shutter start` TLV over BLE to each camera and logs the outgoing command.
 5. The camera responds with an acknowledgement on `cmd_resp_notify` (GP-0073). `open_gopro_ble` logs whether the camera accepted or rejected the command.
 6. `open_gopro_ble`'s status poll timer queries each camera for `encoding_active` every 5 seconds and updates the recording status in the driver context. A separate keep-alive command is sent to every connected camera every 3 seconds to prevent the camera from auto-sleeping.
@@ -107,13 +107,15 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 1. A Lua script on the RaceCapture reads GPS-derived UTC from `getDateTime()` and broadcasts it at 25 Hz on CAN ID `0x602` once GPS lock is acquired. The payload is a 64-bit millisecond Unix epoch timestamp, little-endian, in all 8 bytes.
 2. `can_manager` receives each `0x602` frame and records the epoch value alongside the ESP32 monotonic timestamp (`esp_timer_get_time()`) at the moment of receipt. The first valid frame (year > 2020) is logged at INFO level with a human-readable UTC string.
 3. `can_manager_get_utc_ms()` extrapolates the stored epoch forward using elapsed monotonic time, so callers always get a current estimate regardless of when the last CAN frame arrived.
-4. When GATT setup completes (all CCCD subscriptions done), `gatt.c` issues two commands in sequence:
+4. After CCCD subscriptions complete, `gatt.c` hands off to `readiness.c`, which polls `GetHardwareInfo` until the camera returns status 0. Once the camera is ready, `readiness.c` runs the post-ready sequence:
    - `control_send_set_date_time()` — sets the camera's clock (see paths below).
-   - `gopro_query_send_hw_info()` — requests the camera's model name, firmware version, and serial number. The response is parsed asynchronously and the model name is stored in the camera slot via `camera_manager_set_model_name()`, making it available through `camera_slot_info_t.model_name` for display in the web UI.
+   - `control_send_pairing_complete()` — dismissed the camera's pairing screen (first pairing only).
+   - `gopro_presets_request_video()` — Phase 1 of the Video preset flow.
+   The `GetHardwareInfo` response also carries the camera's model name, firmware version, and serial number; the model name is stored via `camera_manager_set_model_name()` and is available through `camera_slot_info_t.model_name` for display in the web UI.
 
    SetDateTime specifically is sent via one of two paths depending on timing:
-   - **Camera connects after UTC is available:** `gatt.c` calls `control_send_set_date_time()` directly when GATT setup completes.
-   - **Camera is already connected when UTC first arrives:** `can_manager` fires a one-shot `can_utc_acquired_cb_t` callback. `main.c` handles it by calling `open_gopro_ble_sync_time_all()`, which iterates all GATT-ready slots and calls `control_send_set_date_time()` for each.
+   - **Camera connects after UTC is available:** `readiness.c` calls `control_send_set_date_time()` directly when the readiness poll succeeds.
+   - **Camera is already connected when UTC first arrives:** `can_manager` fires a one-shot `can_utc_acquired_cb_t` callback. `main.c` handles it by calling `open_gopro_ble_sync_time_all()`, which iterates all camera-ready slots and calls `control_send_set_date_time()` for each.
 5. In both cases, `control_send_set_date_time()` fetches the current UTC from `can_manager_get_utc_ms()`, converts it to calendar fields, and writes a SetDateTime TLV command (ID `0x0D`) to GP-0072 (`cmd_write`).
 6. The camera responds on GP-0073 (`cmd_resp_notify`). `query.c` logs whether the camera accepted or rejected the command.
 
@@ -123,8 +125,8 @@ The board includes 120 Ω termination resistors enabled by default via solder-ju
 
 1. User disables Automatic Control via the toggle, then taps **▶ Start Recording** / **⏹ Stop Recording** (all cameras) or the per-camera toggle button on an individual camera row.
 2. `wifi_manager` receives `POST /api/shutter`. For all-camera actions, `"on"` is the only field. For a per-camera action the request also includes `"slot"` with the 0-based camera slot index.
-3. **All-camera path:** `camera_manager_set_desired_recording()` updates the desired state for every slot, then `camera_manager_start/stop_recording_all()` dispatches the command to every connected, GATT-ready camera immediately.
-   **Per-camera path:** `camera_manager_set_recording_slot(slot, on)` updates `desired_recording` for that slot only and dispatches the command to that camera if it is connected and GATT-ready.
+3. **All-camera path:** `camera_manager_set_desired_recording()` updates the desired state for every slot, then `camera_manager_start/stop_recording_all()` dispatches the command to every connected, camera-ready camera immediately.
+   **Per-camera path:** `camera_manager_set_recording_slot(slot, on)` updates `desired_recording` for that slot only and dispatches the command to that camera if it is connected and camera-ready.
 4. After a per-camera command is sent, the button is disabled immediately in the UI. It re-enables on the next `/api/paired-cameras` poll (every 3 seconds) once the camera reports its new state.
 5. The tick timer continues retrying for any camera not yet in the desired state, and applies the command to cameras that reconnect later.
 
@@ -157,7 +159,7 @@ The flag is RAM-only and never stored in NVS.
 | Component | Purpose |
 |-----------|---------|
 | `ble_core` | NimBLE stack wrapper. Owns scan, connect, encrypt, GATT write, and bond management. Camera-agnostic. |
-| `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). The camera is considered ready as soon as CCCD subscriptions complete — no polling loop is needed. `GetHardwareInfo` is sent automatically after every GATT setup to populate the camera's model name (e.g. `"HERO12 Black"`) in `camera_slot_info_t`. A two-phase preset flow runs on every connection to switch the camera to Video mode: Phase 1 sends `RequestGetPresetStatus` (Protobuf, GP-0076); Phase 2 parses the `NotifyPresetStatus` response on GP-0077 and sends `Load Preset` (TLV 0x40, GP-0072) for the first Video-group preset found. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
+| `open_gopro_ble` | OpenGoPro BLE driver. Implements the OpenGoPro BLE protocol (service UUID 0xFEA6, TLV command encoding). After CCCD subscriptions complete, the driver polls `GetHardwareInfo` until the camera returns status 0 (ready) before marking the slot camera-ready and issuing further commands — this readiness poll loop is required by the OpenGoPro specification. `GetHardwareInfo` also populates the camera's model name (e.g. `"HERO12 Black"`) in `camera_slot_info_t`. A two-phase preset flow runs on every connection to switch the camera to Video mode: Phase 1 sends `RequestGetPresetStatus` (Protobuf, GP-0076); Phase 2 parses the `NotifyPresetStatus` response on GP-0077 and sends `Load Preset` (TLV 0x40, GP-0072) for the first Video-group preset found. Sends a keep-alive packet every 3 seconds (per OpenGoPro spec) to prevent auto-sleep. Provides a `camera_driver_t` vtable to `camera_manager`. |
 | `legacy_gopro` | Legacy GoPro (Hero4) Wi-Fi driver. Cameras connect to the controller's Soft-AP and are discovered via `/api/legacy/discovered`. When the user adds a camera, the component probes it over HTTP, registers it with `camera_manager`, and saves its MAC and IP to NVS for automatic reconnection on future boots. Shutter commands are sent as a single UDP broadcast to `255.255.255.255:8484` for simultaneous start across all cameras. Keepalives (ASCII RC-remote format) and recording-status polls run every 2 seconds per connected camera. Provides a `camera_driver_t` vtable to `camera_manager`. |
 | `camera_manager` | Camera slot state machine. Persists camera records to NVS. Runs the 2-second tick timer that retries recording commands and publishes state changes. Owns the RAM-only `automatic_camera_control` flag that gates CAN-driven recording. Supports multiple driver types via the `camera_driver_t` vtable — both `open_gopro_ble` and `legacy_gopro` register themselves here. |
 | `can_manager` | ESP-IDF v6.0 TWAI driver wrapper. Receives `0x600` (isLogging) and `0x602` (UTC timestamp) frames; broadcasts `0x601` camera status at 5 Hz. Exposes `can_manager_get_utc_ms()` for on-demand UTC retrieval with monotonic-clock extrapolation. Thread-safe. |
@@ -379,10 +381,10 @@ The script broadcasts a 64-bit millisecond Unix epoch timestamp at 25 Hz on CAN 
 - Confirm the `0x600` frame is being transmitted by RaceCapture (use the serial monitor to watch for `0x600 RX` log lines from `can_manager`).
 - Confirm the command is reaching the camera: look for `conn=X cmd_write=0xXXXX: sending Start Recording` in the serial log from `open_gopro_ble`.
 - Confirm the camera accepted the command: look for `SetShutter command accepted by camera` immediately after. A `SetShutter command rejected` warning with a non-zero status code means the camera is refusing the command (wrong mode, not in video mode, etc.).
-- If no `sending Start Recording` line appears, check that cameras are GATT-ready: look for `gatt_ready` log lines after the camera connects.
+- If no `sending Start Recording` line appears, check that cameras are camera-ready: look for `camera_ready` log lines after the camera connects. If you see repeated `readiness poll retry` lines instead, the camera is not reporting status 0 from `GetHardwareInfo` — check for BLE connectivity or firmware issues on the camera side.
 
 **Recording does not start from the web UI**
-- The web UI shutter button requires at least one camera in `gatt_ready` state. Check `/api/paired-cameras` — the status must be `not_recording` or `recording`, not `disconnected`.
+- The web UI shutter button requires at least one camera in `camera_ready` state. Check `/api/paired-cameras` — the status must be `not_recording` or `recording`, not `disconnected`.
 - Look for `conn=X cmd_write=0xXXXX: sending Start Recording` in the log to confirm the command was dispatched.
 - If the command is sent but the camera ignores it, check `SetShutter command accepted/rejected` in the log.
 
@@ -428,9 +430,10 @@ esp32_gopro_canbus_controller/
 │   │   ├── driver.c            # camera_driver_t vtable, context alloc, discovery list, init
 │   │   ├── gatt.c              # GATT service discovery, MTU negotiation, CCCD subscription
 │   │   ├── notify.c            # GATT notification handler (recording status, preset responses, command responses)
+│   │   ├── pairing.c           # Connected/encrypted/disconnected callbacks
 │   │   ├── presets.c           # Two-phase Video preset loading (RequestGetPresetStatus → Load Preset 0x40)
 │   │   ├── query.c             # On-demand query commands (GetHardwareInfo 0x3C, Load Preset 0x40 response, GPBS reassembly)
-│   │   └── pairing.c           # Connected/encrypted/disconnected callbacks
+│   │   └── readiness.c         # GetHardwareInfo readiness poll loop (retries until status 0, then fires post-ready sequence)
 │   ├── camera_manager/         # Camera slot state machine
 │   │   ├── include/
 │   │   │   ├── camera_manager.h

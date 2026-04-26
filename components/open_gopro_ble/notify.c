@@ -216,14 +216,16 @@ void gopro_on_notify_rx_cb(uint16_t conn_handle, uint16_t attr_handle,
         return;
     }
 
-    /* All other notifications are only valid once the camera is fully ready. */
-    if (!camera_manager_is_gatt_ready(slot)) return;
-
+    /* Command responses (GP-0073) must be received even before the camera is
+     * fully ready, because GetHardwareInfo responses arrive during the readiness
+     * poll and must be routed to query.c to advance the poll state machine. */
     if (attr_handle == ctx->gatt.cmd_resp_notify) {
-        /* Route command responses to the query handler (e.g. GetHardwareInfo). */
         gopro_query_handle_cmd_response(conn_handle, data, len);
         return;
     }
+
+    /* All remaining notifications are only valid once the camera is ready. */
+    if (!camera_manager_is_camera_ready(slot)) return;
 
     if (attr_handle == ctx->gatt.query_resp_notify) {
         handle_query_response(conn_handle, slot, data, len);

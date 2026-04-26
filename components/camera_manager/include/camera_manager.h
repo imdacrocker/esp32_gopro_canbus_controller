@@ -82,10 +82,10 @@ void camera_manager_on_connected(int slot, uint16_t conn_handle);
  *  Fires the state-change callback immediately. */
 void camera_manager_on_disconnected(uint16_t conn_handle);
 
-/** Mark a slot as GATT-ready (all CCCD subscriptions complete) or not.
+/** Mark a slot as camera-ready (GetHardwareInfo readiness poll confirmed) or not.
  *  When set to true, the keep-alive and status-poll timers begin sending to
  *  this slot on their next scheduled fire.  Fires the state-change callback. */
-void camera_manager_set_gatt_ready(int slot, bool ready);
+void camera_manager_set_camera_ready(int slot, bool ready);
 
 /** Register a newly paired BLE camera.  Returns the assigned slot index, or
  *  -1 if all slots are full.  Idempotent — returns the existing slot if addr
@@ -100,8 +100,8 @@ int  camera_manager_find_by_handle(uint16_t conn_handle);
 /** Return the BLE connection handle for a slot, or BLE_HS_CONN_HANDLE_NONE if not connected. */
 uint16_t camera_manager_get_handle(int slot);
 
-/** Return true if the slot is GATT-ready (all CCCD subscriptions complete). */
-bool camera_manager_is_gatt_ready(int slot);
+/** Return true if the slot is camera-ready (GetHardwareInfo readiness poll confirmed). */
+bool camera_manager_is_camera_ready(int slot);
 
 /** Return the per-camera driver context pointer for a slot (opaque to camera_manager). */
 void *camera_manager_get_driver_ctx(int slot);
@@ -231,7 +231,7 @@ bool camera_manager_get_auto_control(void);
  * @brief Callback fired when a camera slot's derived status changes.
  *
  * Invoked from camera_manager_tick() (every 2 s) and immediately from
- * on_connected / on_disconnected / set_gatt_ready so that the CAN status
+ * on_connected / on_disconnected / set_camera_ready so that the CAN status
  * broadcast stays current without polling.
  *
  * @param slot    Camera slot index (0-based).

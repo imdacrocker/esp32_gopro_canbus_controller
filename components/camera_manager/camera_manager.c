@@ -65,7 +65,7 @@ typedef struct {
     bool              is_configured;
     camera_type_t     type;
     uint16_t          bt_handle;
-    bool              gatt_ready;
+    bool              camera_ready;
     bool              desired_recording;
     const camera_driver_t *driver;
     void             *driver_ctx;
@@ -119,7 +119,7 @@ static bool slot_is_operationally_ready(const camera_slot_t *slot)
     if (slot->type == CAMERA_TYPE_LEGACY_WIFI) {
         return slot->wifi_connected;
     }
-    return (slot->bt_handle != BLE_HS_CONN_HANDLE_NONE) && slot->gatt_ready;
+    return (slot->bt_handle != BLE_HS_CONN_HANDLE_NONE) && slot->camera_ready;
 }
 
 /**
@@ -148,8 +148,8 @@ static int compute_slot_status(int i)
     if (slot->bt_handle == BLE_HS_CONN_HANDLE_NONE) {
         return CAMERA_STATUS_DISCONNECTED;
     }
-    if (!slot->driver || !slot->gatt_ready) {
-        /* Connected at the BLE level but GATT not yet set up. */
+    if (!slot->driver || !slot->camera_ready) {
+        /* Connected at the BLE level but camera not yet ready. */
         return CAMERA_STATUS_CONNECTED;
     }
     camera_recording_status_t rec =
@@ -423,7 +423,7 @@ void camera_manager_on_disconnected(uint16_t conn_handle)
     for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
         if (s_slots[i].bt_handle == conn_handle) {
             s_slots[i].bt_handle = BLE_HS_CONN_HANDLE_NONE;
-            s_slots[i].gatt_ready = false;
+            s_slots[i].camera_ready = false;
             ESP_LOGI(TAG, "slot %d disconnected", i);
             notify_slot_state(i);
             return;
@@ -431,11 +431,11 @@ void camera_manager_on_disconnected(uint16_t conn_handle)
     }
 }
 
-void camera_manager_set_gatt_ready(int slot, bool ready)
+void camera_manager_set_camera_ready(int slot, bool ready)
 {
     if (slot < 0 || slot >= CAMERA_MAX_SLOTS) return;
-    s_slots[slot].gatt_ready = ready;
-    ESP_LOGI(TAG, "slot %d gatt_ready = %s", slot, ready ? "true" : "false");
+    s_slots[slot].camera_ready = ready;
+    ESP_LOGI(TAG, "slot %d camera_ready = %s", slot, ready ? "true" : "false");
     notify_slot_state(slot);
 }
 
@@ -471,7 +471,7 @@ int camera_manager_register_new(const ble_addr_t *addr, const char *name,
     s_slots[slot].driver = driver;
     s_slots[slot].driver_ctx = driver_ctx;
     s_slots[slot].bt_handle = BLE_HS_CONN_HANDLE_NONE;
-    s_slots[slot].gatt_ready = false;
+    s_slots[slot].camera_ready = false;
 
     ESP_LOGI(TAG, "slot %d registered: %s", slot, s_slots[slot].name);
     return slot;
@@ -494,10 +494,10 @@ uint16_t camera_manager_get_handle(int slot)
     return s_slots[slot].bt_handle;
 }
 
-bool camera_manager_is_gatt_ready(int slot)
+bool camera_manager_is_camera_ready(int slot)
 {
     if (slot < 0 || slot >= CAMERA_MAX_SLOTS) return false;
-    return s_slots[slot].gatt_ready;
+    return s_slots[slot].camera_ready;
 }
 
 void *camera_manager_get_driver_ctx(int slot)
@@ -540,7 +540,7 @@ camera_slot_info_t camera_manager_get_slot_info(int slot)
         /* BLE path */
         if (s_slots[slot].bt_handle == BLE_HS_CONN_HANDLE_NONE) {
             info.status = CAMERA_STATUS_DISCONNECTED;
-        } else if (s_slots[slot].driver && s_slots[slot].gatt_ready) {
+        } else if (s_slots[slot].driver && s_slots[slot].camera_ready) {
             camera_recording_status_t rec_status =
                 s_slots[slot].driver->get_recording_status(s_slots[slot].driver_ctx);
             info.status = (rec_status == CAMERA_RECORDING_ACTIVE)
@@ -665,7 +665,7 @@ int camera_manager_register_wifi_camera(const uint8_t mac[6], const char *name,
     s_slots[slot].driver         = driver;
     s_slots[slot].driver_ctx     = driver_ctx;
     s_slots[slot].bt_handle      = BLE_HS_CONN_HANDLE_NONE;
-    s_slots[slot].gatt_ready     = false;
+    s_slots[slot].camera_ready   = false;
     s_slots[slot].wifi_connected = false;
     s_slots[slot].ip_addr        = 0;
 

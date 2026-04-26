@@ -93,6 +93,11 @@ void gopro_on_encrypted_cb(uint16_t conn_handle, const ble_addr_t *addr)
 
 void gopro_on_disconnected_cb(uint16_t conn_handle, const ble_addr_t *addr, int reason)
 {
+    /* Cancel the readiness poll timer FIRST — before we touch the driver
+     * context — so the timer callback cannot fire on a stale conn_handle.
+     * gopro_readiness_cancel() is a no-op if no poll was in progress. */
+    gopro_readiness_cancel(conn_handle);
+
     /* Clear driver context BEFORE camera_manager clears bt_handle, so we can
      * still look up the slot by handle. */
     int slot = camera_manager_find_by_handle(conn_handle);

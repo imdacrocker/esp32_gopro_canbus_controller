@@ -173,7 +173,7 @@ void open_gopro_ble_init(void)
 
     /* Start the status-poll timer (5 s) and keep-alive timer (3 s).
      * Both iterate all camera slots on each fire and operate only on
-     * slots where camera_manager_is_gatt_ready() returns true. */
+     * slots where camera_manager_is_camera_ready() returns true. */
     open_gopro_control_start_timers();
 
     ESP_LOGI(TAG, "OpenGoPro BLE initialized");

@@ -8,7 +8,7 @@
  *  - Manages the connected-station table (MAC → IP mapping).
  *  - Routes WIFI_EVENT_AP_STACONNECTED / IP_EVENT_ASSIGNED_IP_TO_CLIENT /
  *    WIFI_EVENT_AP_STADISCONNECTED events to legacy_gopro for Hero4 tracking.
- *  - Hosts the ESP-IDF HTTP server with all /api/* handlers.
+ *  - Hosts the ESP-IDF HTTP server with all api handlers.
  *  - Serves the embedded web UI (index.html) from flash.
  *
  * HTTP endpoint summary (see API.md for full documentation):

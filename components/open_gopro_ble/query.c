@@ -332,10 +332,17 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
         }
 
         /* All fragments received: rx_buf layout is [cmd_id][status][payload...] */
-        if (slot >= 0 && ctx->rx_filled >= 2 && ctx->rx_buf[0] == CMD_GET_HW_INFO &&
-            ctx->rx_buf[1] == HW_INFO_STATUS_SUCCESS) {
-            parse_and_log_hw_info(slot, &ctx->rx_buf[2],
-                                  (uint16_t)(ctx->rx_filled - 2));
+        if (slot >= 0 && ctx->rx_filled >= 2 && ctx->rx_buf[0] == CMD_GET_HW_INFO) {
+            uint8_t hw_status = ctx->rx_buf[1];
+            gopro_ble_ctx_t *rctx =
+                (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
+            if (rctx && rctx->readiness_polling) {
+                gopro_readiness_handle_hw_info_status(conn_handle, hw_status);
+            }
+            if (hw_status == HW_INFO_STATUS_SUCCESS) {
+                parse_and_log_hw_info(slot, &ctx->rx_buf[2],
+                                      (uint16_t)(ctx->rx_filled - 2));
+            }
         }
         free_ctx(conn_handle);
         return;
@@ -356,6 +363,33 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
 
     uint8_t cmd_id = data[payload_off];
     uint8_t status = data[payload_off + 1];
+
+    /* -----------------------------------------------------------------------
+     * Protobuf command responses — Feature ID in the cmd_id byte position.
+     *
+     * Unlike TLV responses ([cmd_id][status][payload...]), Protobuf responses
+     * are framed as [Feature ID][Action ID][protobuf payload].  Feature IDs
+     * are in the 0xF0–0xFF range and do not overlap with TLV command IDs.
+     * ----------------------------------------------------------------------- */
+    if (cmd_id == 0xF1) {
+        /* status holds the Action ID for Protobuf responses, not a TLV result. */
+        uint8_t action_id = status;
+        if (action_id == 0xE9) {
+            /* SetCameraControlStatus ResponseGeneric (Feature 0xF1, Action 0xE9).
+             * Protobuf payload: { result: N } encoded as tag=0x08 + varint N.
+             * N=0 (RESULT_SUCCESS), non-zero = error.  0xFF = parse failure. */
+            uint8_t pb_result = 0xFF;   /* default: malformed / absent */
+            int     pb_off    = payload_off + 2;
+            if (len >= (uint16_t)(pb_off + 2) && data[pb_off] == 0x08) {
+                pb_result = data[pb_off + 1];
+            }
+            gopro_readiness_handle_camera_control_acked(conn_handle, pb_result);
+        } else {
+            ESP_LOGD(TAG, "query slot %d: unhandled Protobuf cmd response "
+                     "feat=0xF1 action=0x%02x", slot, action_id);
+        }
+        return;
+    }
 
     /* Handle shutter (SetShutter) command response: cmd_id=0x01 */
     if (cmd_id == 0x01) {
@@ -399,7 +433,20 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
         return;
     }
 
-    if (status != HW_INFO_STATUS_SUCCESS) {
+    /* If the readiness poll is active, route the status to readiness.c.
+     * On status 0 readiness.c marks the camera ready and completes the
+     * connection sequence; on any other status it schedules a retry.
+     * Either way we must not start reassembly for a non-zero status, since
+     * the camera-not-ready response is always short (never fragmented). */
+    gopro_ble_ctx_t *gctx = (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
+    if (gctx && gctx->readiness_polling) {
+        gopro_readiness_handle_hw_info_status(conn_handle, status);
+        if (status != HW_INFO_STATUS_SUCCESS) {
+            return;  /* readiness.c will retry; do not start reassembly */
+        }
+        /* status == 0: camera is ready — fall through to parse the payload
+         * so the model name is populated in camera_manager. */
+    } else if (status != HW_INFO_STATUS_SUCCESS) {
         ESP_LOGW(TAG, "query slot %d: GetHardwareInfo status=0x%02x", slot, status);
         return;
     }
@@ -437,7 +484,9 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
     ESP_LOGD(TAG, "query: hw_info reassembly started %u/%u bytes",
              (unsigned)ctx->rx_filled, (unsigned)ctx->rx_total);
 
-    /* Edge case: entire response arrived in first packet. */
+    /* Edge case: entire response arrived in the first packet.
+     * Readiness routing was already handled above (we only reach here with
+     * status 0), so just parse and log. */
     if (ctx->rx_filled >= ctx->rx_total) {
         if (slot >= 0 && ctx->rx_filled >= 2 &&
             ctx->rx_buf[0] == CMD_GET_HW_INFO &&

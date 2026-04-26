@@ -20,10 +20,10 @@
  *
  *     Per the OpenGoPro specification the best practice is to start sending
  *     Keep Alive messages every 3.0 seconds after a connection is established.
- *     We start after gatt_ready — i.e. after CCCD subscriptions complete —
- *     because:
+ *     We start after camera_ready — i.e. after the readiness poll confirms the
+ *     camera is operational — because:
  *       1. We have confirmed that settings_write is a valid GATT handle.
- *       2. Using a single global timer that checks gatt_ready is simpler and
+ *       2. Using a single global timer that checks camera_ready is simpler and
  *          mirrors the existing status-poll pattern.
  *
  *     The response from the camera arrives on GP-0075 (Settings Response) and
@@ -138,8 +138,14 @@ camera_recording_status_t control_get_recording_status(void *ctx)
  *   Byte 4: 0x02  — EnumPairingState.PAIRING_STATE_COMPLETED
  *
  * The response arrives on GP-0092 (net_mgmt_resp_notify) as ResponseGeneric.
- * Because this is sent before CCCD subscriptions are in place, the response
- * notification is not received — this is intentional (fire-and-forget).
+ * This is fire-and-forget; the response is not awaited.
+ *
+ * IMPORTANT: this function uses ble_gattc_write_no_rsp_flat() directly (not
+ * the ble_core event-queue path) so the PDU is submitted to the BLE
+ * controller immediately.  It must therefore only be called from the NimBLE
+ * host task — i.e. from within a GATT callback such as start_cccd_subscriptions().
+ * This guarantees the pairing-finish PDU reaches the camera before the first
+ * CCCD write, preventing the camera from resetting CCCD state mid-subscription.
  */
 static const uint8_t k_pairing_complete_pkt[] = { 0x04, 0x03, 0x01, 0x08, 0x02 };
 
@@ -157,12 +163,13 @@ void control_send_pairing_complete(uint16_t conn_handle)
         return;
     }
 
-    esp_err_t err = ble_core_gatt_write(conn_handle, ctx->gatt.net_mgmt_cmd_write,
-                                        k_pairing_complete_pkt,
-                                        sizeof(k_pairing_complete_pkt));
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "slot %d: RequestPairingFinish write failed (%s)",
-                 slot, esp_err_to_name(err));
+    /* Use write_no_rsp_flat directly so the ATT PDU is queued to the BLE
+     * controller synchronously, before the caller proceeds to write CCCDs. */
+    int rc = ble_gattc_write_no_rsp_flat(conn_handle, ctx->gatt.net_mgmt_cmd_write,
+                                          k_pairing_complete_pkt,
+                                          sizeof(k_pairing_complete_pkt));
+    if (rc != 0) {
+        ESP_LOGW(TAG, "slot %d: RequestPairingFinish write failed (rc=%d)", slot, rc);
     } else {
         ESP_LOGI(TAG, "slot %d: RequestPairingFinish sent (pairing screen dismissed)", slot);
     }
@@ -261,10 +268,70 @@ esp_err_t control_send_set_date_time(uint16_t conn_handle)
     return err;
 }
 
+/* -------------------------------------------------------------------------
+ * Set Camera Control Status — sent once after GetHardwareInfo succeeds
+ * ------------------------------------------------------------------------- */
+
+/*
+ * RequestSetCameraControlStatus packet — written to GP-0072 (Command characteristic).
+ *
+ * Per the OpenGoPro specification, sending this command with
+ * CAMERA_CONTROL_STATUS_EXTERNAL (2) tells the camera that an external
+ * controller (us) is claiming control.  The camera immediately exits any
+ * contextual menu and returns to the idle screen.  This is required before
+ * the camera will reliably accept recording commands from a BLE client.
+ *
+ * Note: any physical button press on the camera will cause it to reclaim
+ * control.  If persistent external control is needed it must be re-asserted,
+ * but for record-trigger use this one-time handshake at connect time is
+ * sufficient.
+ *
+ * GPBS Protobuf framing for a short Command:
+ *   Byte 0: 0x04  GPBS single-packet length (4 bytes follow)
+ *   Byte 1: 0xF1  Feature ID  (Camera Control)
+ *   Byte 2: 0x69  Action ID   (RequestSetCameraControlStatus)
+ *
+ * Protobuf payload for
+ *   RequestSetCameraControlStatus { camera_control_status = EXTERNAL (2) }:
+ *   Byte 3: 0x08  protobuf field 1, wiretype 0 (varint)
+ *   Byte 4: 0x02  EnumCameraControlStatus.CAMERA_CONTROL_STATUS_EXTERNAL
+ *
+ * Response arrives on GP-0073 (cmd_resp_notify) as ResponseGeneric
+ * (Feature ID 0xF1, Action ID 0xE9) and is dispatched by query.c to
+ * gopro_readiness_handle_camera_control_acked() in readiness.c.
+ */
+static const uint8_t k_set_camera_control_pkt[] = { 0x04, 0xF1, 0x69, 0x08, 0x02 };
+
+esp_err_t control_send_camera_control(uint16_t conn_handle)
+{
+    int slot = camera_manager_find_by_handle(conn_handle);
+    if (slot < 0) {
+        ESP_LOGW(TAG, "camera_control: no slot for handle %d", conn_handle);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    gopro_ble_ctx_t *gctx = (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
+    if (!gctx || gctx->gatt.cmd_write == 0) {
+        ESP_LOGW(TAG, "slot %d: camera_control: cmd_write not available", slot);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "slot %d: SetCameraControlStatus → EXTERNAL (claiming BLE control)",
+             slot);
+    esp_err_t err = ble_core_gatt_write(conn_handle, gctx->gatt.cmd_write,
+                                        k_set_camera_control_pkt,
+                                        sizeof(k_set_camera_control_pkt));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "slot %d: SetCameraControlStatus write failed (%s)",
+                 slot, esp_err_to_name(err));
+    }
+    return err;
+}
+
 void open_gopro_ble_sync_time_all(void)
 {
     for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
-        if (!camera_manager_is_gatt_ready(i)) {
+        if (!camera_manager_is_camera_ready(i)) {
             continue;
         }
 
@@ -290,7 +357,7 @@ static const uint8_t k_status_query_pkt[] = { 0x02, 0x13, 0x08 };
 static void status_poll_timer_cb(void *arg)
 {
     for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
-        if (!camera_manager_is_gatt_ready(i)) continue;
+        if (!camera_manager_is_camera_ready(i)) continue;
 
         uint16_t conn_h = camera_manager_get_handle(i);
         if (conn_h == BLE_HS_CONN_HANDLE_NONE) continue;
@@ -328,7 +395,7 @@ static const uint8_t k_keep_alive_pkt[] = { 0x03, 0x5B, 0x01, 0x42 };
 static void keep_alive_timer_cb(void *arg)
 {
     for (int i = 0; i < CAMERA_MAX_SLOTS; i++) {
-        if (!camera_manager_is_gatt_ready(i)) continue;
+        if (!camera_manager_is_camera_ready(i)) continue;
 
         uint16_t conn_h = camera_manager_get_handle(i);
         if (conn_h == BLE_HS_CONN_HANDLE_NONE) continue;

@@ -2,11 +2,18 @@
  * @file ble_gatt_write.c
  * @brief ATT Write Without Response helper.
  *
- * Wraps ble_gattc_write_no_rsp() with an os_mbuf allocation and a consistent
- * error-logging pattern.  All OpenGoPro command writes use ATT Write Without
- * Response (ATT opcode 0x52) so there is no per-write ACK — delivery is
- * best-effort at the ATT layer; the application layer (GPBS response on
- * cmd_resp_notify) provides the acknowledgement.
+ * Wraps ble_gattc_write_no_rsp_flat() with a small software queue and a
+ * consistent error-logging pattern.  All OpenGoPro command, settings, and
+ * query characteristic writes use ATT Write Without Response (ATT opcode
+ * 0x52) per the OpenGoPro BLE specification.  There is no ATT-level
+ * acknowledgement; delivery confirmation comes from the application-layer
+ * GPBS notification on the corresponding response characteristic
+ * (cmd_resp_notify, settings_resp_notify, or query_resp_notify).
+ *
+ * Because Write Without Response does not occupy a NimBLE GATT procedure
+ * slot, multiple writes may be dispatched back-to-back without hitting
+ * BLE_HS_EALREADY.  The queue here guards against bursting too many writes
+ * into the NimBLE host before it has a chance to drain them.
  */
 
 #include "ble_core.h"
@@ -36,29 +43,18 @@ static int s_queue_tail = 0;
 static int s_queue_count = 0;
 static portMUX_TYPE s_queue_lock = portMUX_INITIALIZER_UNLOCKED;
 
-static int gatt_write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
-                         struct ble_gatt_attr *attr, void *arg)
-{
-    if (error->status != 0) {
-        ESP_LOGW(TAG, "GATT write error on handle %d: status=%d",
-                 conn_handle, error->status);
-    } else {
-        ESP_LOGD(TAG, "GATT write ack — handle %d attr 0x%04x",
-                 conn_handle, attr ? attr->handle : 0);
-    }
-    return 0;
-}
-
 static void gatt_write_event_cb(struct ble_npl_event *ev)
 {
     gatt_write_entry_t *entry = (gatt_write_entry_t *)ble_npl_event_get_arg(ev);
 
-    int rc = ble_gattc_write_flat(entry->conn_handle, entry->attr_handle,
-                                  entry->data, entry->len,
-                                  gatt_write_cb, NULL);
+    int rc = ble_gattc_write_no_rsp_flat(entry->conn_handle, entry->attr_handle,
+                                          entry->data, entry->len);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gattc_write_flat failed: rc=%d (conn=%d attr=0x%04x)",
+        ESP_LOGE(TAG, "ble_gattc_write_no_rsp_flat failed: rc=%d (conn=%d attr=0x%04x)",
                  rc, entry->conn_handle, entry->attr_handle);
+    } else {
+        ESP_LOGD(TAG, "GATT write sent — conn %d attr 0x%04x",
+                 entry->conn_handle, entry->attr_handle);
     }
 
     /* Advance queue pointer */

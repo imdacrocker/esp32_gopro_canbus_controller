@@ -7,9 +7,15 @@
  *  2. Discovers all OpenGoPro GATT services and characteristics (GP-0072 through
  *     GP-0092) using ble_gattc_disc_all_svcs / ble_gattc_disc_all_chrs.
  *  3. Subscribes to all notification/indication CCCDs.
- *  4. On completion, calls camera_manager_set_gatt_ready(slot, true) and triggers:
+ *  4. Before writing the first CCCD, sends RequestPairingFinish on first-ever
+ *     pairing so the camera dismisses its pairing UI BEFORE notification
+ *     subscriptions are active.  (The camera resets CCCD state when it
+ *     processes this command; sending it after any CCCD write silently drops
+ *     all subsequent notifications.)
+ *  5. On completion, calls gopro_start_readiness_poll() which continuously polls
+ *     GetHardwareInfo until the camera returns status 0.  Once ready,
+ *     readiness.c sets camera_ready and runs the post-ready sequence:
  *       - control_send_set_date_time()   (if UTC is available)
- *       - gopro_query_send_hw_info()     (populates model name in camera_manager)
  *       - gopro_presets_request_video()  (Phase 1 of the Video preset flow)
  *
  * OpenGoPro UUIDs discovered
@@ -178,45 +184,22 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
             cccd_write_cb(conn_handle, &fake_err, NULL, NULL);
         }
     } else {
-        /* All subscriptions done — push handles into driver context, mark the
-         * camera ready, and (on first-time pairing) send RequestPairingFinish
-         * to dismiss the camera's pairing screen.
+        /* All subscriptions done — hand off to the readiness poll.
+         * GATT handles were already committed into the driver context at the
+         * start of start_cccd_subscriptions().
          *
-         * gatt_ready is set immediately here.  The C# OpenGoPro reference
-         * implementation does the same: it considers the camera usable as soon
-         * as CCCD setup completes.  No GetHardwareInfo readiness poll is needed
-         * during connect; call gopro_query_send_hw_info() on demand instead. */
+         * Per the OpenGoPro specification we must not send any commands until
+         * GetHardwareInfo returns status 0; readiness.c owns that loop and
+         * calls complete_connection_sequence() once the camera confirms it is
+         * operational. */
         int slot = camera_manager_find_by_handle(conn_handle);
         if (slot >= 0) {
-            void *driver_ctx = camera_manager_get_driver_ctx(slot);
-            gopro_driver_set_gatt_handles(driver_ctx, &ctx->handles);
-
-            gopro_ble_ctx_t *gctx = (gopro_ble_ctx_t *)driver_ctx;
-            if (gctx && gctx->is_first_pairing) {
-                ESP_LOGI(TAG, "slot %d: sending RequestPairingFinish "
-                         "(all CCCDs subscribed — response will be visible)", slot);
-                control_send_pairing_complete(conn_handle);
-            }
-
             free_gatt_disc_ctx(conn_handle);
-            camera_manager_set_gatt_ready(slot, true);
-            ESP_LOGI(TAG, "GATT setup complete — slot %d ready (%d notification(s))",
-                     slot, ctx->notify_count);
 
-            /* Set the camera's clock to the current UTC on every connection
-             * (first pairing and all reconnections). */
-            control_send_set_date_time(conn_handle);
+            ESP_LOGI(TAG, "GATT setup complete — slot %d, %d notification(s), "
+                     "starting readiness poll", slot, ctx->notify_count);
 
-            /* Read hardware info (model name, firmware, serial) so it can be
-             * displayed on the web page.  The response arrives asynchronously
-             * on cmd_resp_notify and is stored via camera_manager_set_model_name(). */
-            gopro_query_send_hw_info(conn_handle);
-
-            /* Set the camera to Video mode on every connection (first pairing
-             * and all reconnections).  Phase 1 sends RequestGetPresetStatus;
-             * phase 2 (Load Preset) fires asynchronously when the response
-             * arrives on GP-0077. */
-            gopro_presets_request_video(conn_handle);
+            gopro_start_readiness_poll(conn_handle);
         } else {
             ESP_LOGW(TAG, "GATT setup complete but camera slot not found (handle %d)",
                      conn_handle);
@@ -229,18 +212,37 @@ static int cccd_write_cb(uint16_t conn_handle, const struct ble_gatt_error *erro
 
 static void start_cccd_subscriptions(gatt_disc_ctx_t *ctx)
 {
+    /* Commit GATT handles into the driver context NOW — before any CCCD
+     * writes — so that control_send_pairing_complete() can access
+     * net_mgmt_cmd_write.  (The handle commit previously happened at the
+     * tail of the CCCD chain in cccd_write_cb, but that was too late for
+     * first-pairing ordering.) */
+    int              slot = camera_manager_find_by_handle(ctx->conn_handle);
+    gopro_ble_ctx_t *gctx = NULL;
+    if (slot >= 0) {
+        void *driver_ctx = camera_manager_get_driver_ctx(slot);
+        gopro_driver_set_gatt_handles(driver_ctx, &ctx->handles);
+        gctx = (gopro_ble_ctx_t *)driver_ctx;
+    }
+
     if (ctx->notify_count == 0) {
         ESP_LOGW(TAG, "No notifiable characteristics found for handle %d",
                  ctx->conn_handle);
-        /* Still push any write/read handles we discovered */
-        int slot = camera_manager_find_by_handle(ctx->conn_handle);
-        if (slot >= 0) {
-            void *driver_ctx = camera_manager_get_driver_ctx(slot);
-            gopro_driver_set_gatt_handles(driver_ctx, &ctx->handles);
-        }
         free_gatt_disc_ctx(ctx->conn_handle);
         return;
     }
+
+    /* On first pairing, send RequestPairingFinish BEFORE subscribing to any
+     * CCCD.  The camera resets its CCCD state when it processes this command,
+     * so the PDU must reach the camera before any CCCD Write With Response.
+     *
+     * control_send_pairing_complete() calls ble_gattc_write_no_rsp_flat()
+     * directly, which submits the ATT Write Without Response PDU to the BLE
+     * controller synchronously.  The link layer then transmits it in order,
+     * ahead of the first ble_gattc_write_flat() CCCD write below. */
+    // if (gctx && gctx->is_first_pairing) {
+    //     control_send_pairing_complete(ctx->conn_handle);
+    // }
 
     ESP_LOGI(TAG, "Subscribing to %d characteristic(s)...", ctx->notify_count);
     ctx->notify_idx = 0;

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "esp_timer.h"
 #include "open_gopro_ble.h"
 #include "camera_driver.h"
 
@@ -17,6 +18,17 @@ typedef struct {
      *  when gopro_on_encrypted_cb fired).  Cleared after RequestPairingFinish
      *  is sent in control_send_pairing_complete(). */
     bool                      is_first_pairing;
+    /** True while the readiness poll (GetHardwareInfo loop) is in progress.
+     *  Set by gopro_start_readiness_poll(); cleared when camera becomes ready
+     *  or the retry limit is reached. */
+    bool                      readiness_polling;
+    /** Number of GetHardwareInfo retries sent so far in the current poll. */
+    uint8_t                   readiness_retry_count;
+    /** One-shot esp_timer used to re-send GetHardwareInfo if no response
+     *  arrives within the timeout window.  NULL until the first poll starts.
+     *  Cancelled and deleted by gopro_readiness_cancel() on disconnect. */
+    esp_timer_handle_t        readiness_timer;
+
     /**
      * Set to true the moment a SetShutter(start) command is dispatched.
      * Cleared by handle_query_response() when the status poll confirms the
@@ -30,6 +42,16 @@ typedef struct {
      * not by retrying the command immediately.
      */
     bool                      start_cmd_pending;
+
+    /** True while waiting for the SetCameraControlStatus (EXTERNAL) response
+     *  after GetHardwareInfo succeeds.  Set by gopro_on_camera_ready();
+     *  cleared when the ResponseGeneric arrives on cmd_resp_notify or when
+     *  the timeout fires.  While this flag is set the rest of the connection
+     *  sequence (SetDateTime, PairingFinish, VideoPreset) is held back. */
+    bool                      camera_control_pending;
+    /** One-shot timer for the SetCameraControlStatus response timeout.
+     *  NULL until first send.  Stopped on response; deleted on disconnect. */
+    esp_timer_handle_t        camera_control_timer;
 } gopro_ble_ctx_t;
 
 /* -------------------------------------------------------------------------
@@ -40,6 +62,40 @@ typedef struct {
  *  Called by gatt.c when discovery completes. */
 void gopro_driver_set_gatt_handles(void *driver_ctx,
                                     const gopro_gatt_handles_t *handles);
+
+/* -------------------------------------------------------------------------
+ * readiness.c — camera BLE readiness poll
+ *
+ * gopro_start_readiness_poll()
+ *   Called by gatt.c once GATT handles are committed.  Sends the first
+ *   GetHardwareInfo command, sets readiness_polling = true, and arms a
+ *   3-second one-shot timeout timer.
+ *
+ * gopro_readiness_handle_hw_info_status()
+ *   Called by query.c every time a GetHardwareInfo response arrives while
+ *   readiness_polling is true.  On status 0 it marks the camera ready and
+ *   completes the connection sequence; on any non-zero status it retries.
+ *   On retry-limit exhaustion it calls ble_gap_terminate().
+ *
+ * gopro_readiness_cancel()
+ *   Called by pairing.c on disconnect to cancel and delete any in-flight
+ *   timeout timer, preventing a stale callback.
+ * ------------------------------------------------------------------------- */
+
+void gopro_start_readiness_poll(uint16_t conn_handle);
+void gopro_readiness_handle_hw_info_status(uint16_t conn_handle, uint8_t status);
+void gopro_readiness_cancel(uint16_t conn_handle);
+
+/**
+ * Called by query.c when the SetCameraControlStatus ResponseGeneric arrives
+ * on GP-0073.  @p result is the Protobuf EnumResultGeneric value extracted
+ * from the payload (0 = success, non-zero = error, 0xFF = parse failure).
+ * Cancels the timeout timer and advances the connection sequence regardless
+ * of the result code — a rejection or parse failure is logged as a warning
+ * but does not prevent recording.
+ */
+void gopro_readiness_handle_camera_control_acked(uint16_t conn_handle,
+                                                  uint8_t result);
 
 /* -------------------------------------------------------------------------
  * gatt.c — GATT discovery lifecycle
@@ -94,6 +150,21 @@ camera_recording_status_t control_get_recording_status(void *ctx);
 
 void open_gopro_control_start_timers(void);
 void control_send_pairing_complete(uint16_t conn_handle);
+
+/**
+ * Send SetCameraControlStatus (EXTERNAL) to GP-0072.
+ *
+ * Protobuf command: Feature 0xF1, Action 0x69,
+ * RequestSetCameraControlStatus { camera_control_status = EXTERNAL (2) }.
+ *
+ * The response (ResponseGeneric, Feature 0xF1, Action 0xE9) arrives on
+ * GP-0073 and is routed by query.c to
+ * gopro_readiness_handle_camera_control_acked().
+ *
+ * Callers should gate the connection sequence continuation on that callback
+ * rather than proceeding immediately after this call returns.
+ */
+esp_err_t control_send_camera_control(uint16_t conn_handle);
 
 /**
  * Send a SetDateTime command (0x0D) to the camera on GP-0072.
