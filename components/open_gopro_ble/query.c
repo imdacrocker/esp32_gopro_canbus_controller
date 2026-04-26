@@ -13,6 +13,25 @@
  *   ATT notifications at the GPBS application layer regardless of the negotiated
  *   ATT MTU.  A lightweight per-connection reassembly buffer handles this.
  *
+ * Readiness sequencing — IMPORTANT:
+ *   During the readiness poll, gopro_readiness_handle_hw_info_status() must
+ *   only be called AFTER the full GetHardwareInfo payload has been parsed and
+ *   logged.  That function ultimately fires SetCameraControlStatus; sending
+ *   that command while the camera is still transmitting GetHardwareInfo
+ *   continuation fragments causes the camera to reject it (result=0x01).
+ *
+ *   For single-packet responses (frame_type 0x00) this is naturally satisfied
+ *   because the entire payload is present in one notification.
+ *
+ *   For fragmented responses (frame_type 0x01, which is the typical case for
+ *   the HERO13 and similar cameras):
+ *     - The start-packet handler stops the readiness timer immediately (to
+ *       prevent it firing during reassembly) but does NOT call the readiness
+ *       callback yet.
+ *     - The continuation completion handler calls parse_and_log_hw_info()
+ *       first, then gopro_readiness_handle_hw_info_status() — preserving the
+ *       correct parse-before-signal ordering.
+ *
  * Usage:
  *   Call gopro_query_send_hw_info(conn_handle) whenever you want hardware info.
  *   The response will arrive asynchronously on cmd_resp_notify; notify.c routes
@@ -331,17 +350,21 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
             return;     /* Still waiting for more fragments. */
         }
 
-        /* All fragments received: rx_buf layout is [cmd_id][status][payload...] */
+        /* All fragments received: rx_buf layout is [cmd_id][status][payload...].
+         * Parse and log the hardware info FIRST so model name is stored in
+         * camera_manager before gopro_readiness_handle_hw_info_status fires
+         * SetCameraControlStatus.  Sending SetCameraControlStatus while the
+         * camera is still mid-transaction causes it to reject the command. */
         if (slot >= 0 && ctx->rx_filled >= 2 && ctx->rx_buf[0] == CMD_GET_HW_INFO) {
             uint8_t hw_status = ctx->rx_buf[1];
+            if (hw_status == HW_INFO_STATUS_SUCCESS) {
+                parse_and_log_hw_info(slot, &ctx->rx_buf[2],
+                                      (uint16_t)(ctx->rx_filled - 2));
+            }
             gopro_ble_ctx_t *rctx =
                 (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
             if (rctx && rctx->readiness_polling) {
                 gopro_readiness_handle_hw_info_status(conn_handle, hw_status);
-            }
-            if (hw_status == HW_INFO_STATUS_SUCCESS) {
-                parse_and_log_hw_info(slot, &ctx->rx_buf[2],
-                                      (uint16_t)(ctx->rx_filled - 2));
             }
         }
         free_ctx(conn_handle);
@@ -437,15 +460,36 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
      * On status 0 readiness.c marks the camera ready and completes the
      * connection sequence; on any other status it schedules a retry.
      * Either way we must not start reassembly for a non-zero status, since
-     * the camera-not-ready response is always short (never fragmented). */
+     * the camera-not-ready response is always short (never fragmented).
+     *
+     * IMPORTANT: for a fragmented success response (frame_type 0x01, status 0)
+     * we must NOT fire gopro_readiness_handle_hw_info_status here.  The camera
+     * is still transmitting the payload continuation fragments; issuing
+     * SetCameraControlStatus before that exchange finishes causes the camera to
+     * reject it (result=0x01).  Instead we stop the readiness timer immediately
+     * (so it cannot fire during the ~50 ms reassembly window) and defer the
+     * readiness callback to the reassembly completion path below, which already
+     * calls gopro_readiness_handle_hw_info_status once all fragments arrive. */
     gopro_ble_ctx_t *gctx = (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
     if (gctx && gctx->readiness_polling) {
-        gopro_readiness_handle_hw_info_status(conn_handle, status);
         if (status != HW_INFO_STATUS_SUCCESS) {
+            /* Not-ready response — always single-packet; signal and bail. */
+            gopro_readiness_handle_hw_info_status(conn_handle, status);
             return;  /* readiness.c will retry; do not start reassembly */
         }
-        /* status == 0: camera is ready — fall through to parse the payload
-         * so the model name is populated in camera_manager. */
+        if (frame_type == 0x00) {
+            /* Single-packet success — full payload present, safe to signal now. */
+            gopro_readiness_handle_hw_info_status(conn_handle, status);
+        } else {
+            /* Fragmented success (frame_type 0x01) — stop the readiness timer so
+             * it cannot fire while we collect continuation fragments, then let
+             * the reassembly completion path signal readiness once fully assembled. */
+            if (gctx->readiness_timer != NULL) {
+                esp_timer_stop(gctx->readiness_timer);   /* no-op if not running */
+            }
+        }
+        /* status == 0: camera is ready (or will be after reassembly) —
+         * fall through to parse the payload so the model name is populated. */
     } else if (status != HW_INFO_STATUS_SUCCESS) {
         ESP_LOGW(TAG, "query slot %d: GetHardwareInfo status=0x%02x", slot, status);
         return;
@@ -484,15 +528,22 @@ void gopro_query_handle_cmd_response(uint16_t conn_handle,
     ESP_LOGD(TAG, "query: hw_info reassembly started %u/%u bytes",
              (unsigned)ctx->rx_filled, (unsigned)ctx->rx_total);
 
-    /* Edge case: entire response arrived in the first packet.
-     * Readiness routing was already handled above (we only reach here with
-     * status 0), so just parse and log. */
+    /* Edge case: entire response arrived in a single extended-header packet
+     * (frame_type 0x01 but rx_filled already equals rx_total).  Readiness
+     * was deferred above for the fragmented case, so signal it now that the
+     * full payload is available, then parse and log. */
     if (ctx->rx_filled >= ctx->rx_total) {
         if (slot >= 0 && ctx->rx_filled >= 2 &&
             ctx->rx_buf[0] == CMD_GET_HW_INFO &&
             ctx->rx_buf[1] == HW_INFO_STATUS_SUCCESS) {
             parse_and_log_hw_info(slot, &ctx->rx_buf[2],
                                   (uint16_t)(ctx->rx_filled - 2));
+            gopro_ble_ctx_t *rctx =
+                (gopro_ble_ctx_t *)camera_manager_get_driver_ctx(slot);
+            if (rctx && rctx->readiness_polling) {
+                gopro_readiness_handle_hw_info_status(conn_handle,
+                                                      HW_INFO_STATUS_SUCCESS);
+            }
         }
         free_ctx(conn_handle);
     }

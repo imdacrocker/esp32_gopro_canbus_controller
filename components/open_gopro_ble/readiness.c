@@ -16,7 +16,14 @@
  *  2. If a response arrives before the timer fires:
  *       - Status 0x00 (success): camera is ready.  Timer is cancelled, the
  *         camera_ready flag is set, and gopro_on_camera_ready() runs the
- *         post-ready sequence (SetDateTime, RequestGetPresetStatus).
+ *         post-ready sequence (SetCameraControlStatus, SetDateTime,
+ *         RequestGetPresetStatus).
+ *         NOTE: gopro_readiness_handle_hw_info_status() must only be called
+ *         after the full GetHardwareInfo payload has been parsed by query.c.
+ *         For fragmented responses the timer is stopped early in the
+ *         start-packet handler, and the callback is deferred until the
+ *         reassembly completion handler has finished parse_and_log_hw_info().
+ *         See query.c "Readiness sequencing" for the full explanation.
  *       - Any non-zero status (camera not yet ready): timer is cancelled,
  *         retry counter is incremented.  If under the limit another
  *         GetHardwareInfo is sent and the timer is re-armed; otherwise

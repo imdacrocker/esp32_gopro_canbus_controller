@@ -10,7 +10,13 @@
  *
  *  BLE_GAP_EVENT_ENCRYPT_CHANGE:
  *    On successful encryption, fires on_encrypted so GATT discovery can begin.
- *    Failed encryption is logged at WARN; the connection is not dropped.
+ *    On failure, distinguishes between transient errors (BLE_HS_ETIMEOUT,
+ *    BLE_HS_ENOTCONN, etc. — camera was off or unreachable) and genuine key
+ *    mismatches (authentication/encryption failures).  Only the latter deletes
+ *    the bond; transient failures preserve the LTK and use the back-off
+ *    reconnect path so the camera's SM rate-limit timer can expire cleanly.
+ *    BLE_GAP_EVENT_REPEAT_PAIRING handles the symmetric case where the peer
+ *    initiates pairing while we still have a stored bond.
  *
  *  BLE_GAP_EVENT_CONNECT (failure) / BLE_GAP_EVENT_DISCONNECT:
  *    Fires on_disconnected.  If the peer address is known (is_known_addr returns
@@ -356,25 +362,44 @@ int connection_event_cb(struct ble_gap_event *event, void *arg)
                 }
             }
         } else {
-            ESP_LOGE(TAG, "Pairing/encryption failed — status: %d",
-                     event->enc_change.status);
+            int enc_status = event->enc_change.status;
+            ESP_LOGE(TAG, "Pairing/encryption failed — status: %d", enc_status);
 
-            /* The stored LTK is stale (camera was reset, re-paired elsewhere,
-             * or firmware-updated).  Delete the bond now so the next reconnect
-             * attempt performs a fresh SMP pairing instead of re-trying the
-             * same dead key.  Without this the ESP32 loops forever: connect →
-             * fail ENC_CHANGE → disconnect → reconnect → same stale LTK → …
+            /* Not all ENC_CHANGE failures mean the stored LTK is stale.
              *
-             * Also set s_enc_failed so the upcoming DISCONNECT event uses a
-             * back-off reconnect rather than an immediate one, giving the
-             * camera's BLE_SM_ERR_REPEATED rate-limit timer time to clear. */
+             * Transient failures (camera powered off mid-handshake, connection
+             * dropped before the procedure completed) leave both sides with
+             * valid, matching keys.  Deleting the bond in these cases causes the
+             * next reconnect to attempt fresh SMP pairing while the camera still
+             * considers itself bonded — the camera then rejects the pairing
+             * request, producing BLE_HS_ENOTCONN on the following ENC_CHANGE,
+             * and the two sides diverge permanently until the user re-pairs.
+             *
+             * Only delete the bond when the status indicates a genuine key or
+             * authentication mismatch.  Transient errors just get the back-off
+             * reconnect so the camera has time to come back up cleanly.
+             *
+             * BLE_GAP_EVENT_REPEAT_PAIRING handles the symmetric case: if the
+             * camera still has a bond but we don't, NimBLE fires REPEAT_PAIRING
+             * so we delete there and retry. */
+            bool is_transient = (enc_status == BLE_HS_ETIMEOUT     ||
+                                 enc_status == BLE_HS_ETIMEOUT_HCI ||
+                                 enc_status == BLE_HS_ENOTCONN     ||
+                                 enc_status == BLE_HS_ECONTROLLER);
+
             struct ble_gap_conn_desc fail_desc;
             if (ble_gap_conn_find(event->enc_change.conn_handle, &fail_desc) == 0) {
                 const uint8_t *a = fail_desc.peer_id_addr.val;
-                ESP_LOGW(TAG, "Deleting stale bond for %02X:%02X:%02X:%02X:%02X:%02X — "
-                         "will re-pair on next connection",
-                         a[5], a[4], a[3], a[2], a[1], a[0]);
-                ble_store_util_delete_peer(&fail_desc.peer_id_addr);
+                if (is_transient) {
+                    ESP_LOGW(TAG, "Transient encryption failure (status %d) for "
+                             "%02X:%02X:%02X:%02X:%02X:%02X — bond preserved, will retry",
+                             enc_status, a[5], a[4], a[3], a[2], a[1], a[0]);
+                } else {
+                    ESP_LOGW(TAG, "Deleting stale bond for %02X:%02X:%02X:%02X:%02X:%02X — "
+                             "will re-pair on next connection",
+                             a[5], a[4], a[3], a[2], a[1], a[0]);
+                    ble_store_util_delete_peer(&fail_desc.peer_id_addr);
+                }
                 s_enc_failed_addr = fail_desc.peer_id_addr;
                 s_enc_failed      = true;
             }
